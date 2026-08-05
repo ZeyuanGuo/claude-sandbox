@@ -38,10 +38,10 @@ curl --fail --silent --show-error \
 
 ### 2. 取得固定代码
 
-从私有仓库克隆后切到明确的 release tag 或 commit，不使用会移动的分支名作为部署依据：
+从发布仓库克隆后切到明确的 release tag 或 commit，不使用会移动的分支名作为部署依据：
 
 ```bash
-git clone <PRIVATE_REPOSITORY_URL> "$HOME/claude-sandbox"
+git clone https://github.com/ZeyuanGuo/claude-sandbox.git "$HOME/claude-sandbox"
 cd "$HOME/claude-sandbox"
 git checkout <RELEASE_TAG_OR_COMMIT>
 git status --short
