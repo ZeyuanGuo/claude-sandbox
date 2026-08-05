@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Host-local state and secrets never belong in the repository.
+host.local.yaml
+*.secret.yaml
+.local/
+audit/
+state/
+

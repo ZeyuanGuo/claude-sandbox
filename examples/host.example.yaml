@@ -1,0 +1,78 @@
+schema_version: 1
+instance: main
+
+target:
+  name: alice
+  uid: 1000
+  gid: 1000
+  home: /home/alice
+
+docker:
+  socket: /var/run/docker.sock
+
+gpu:
+  mode: all
+
+paths:
+  persistent_home: ~/.local/share/controlled-dev-machine/home
+  state: ~/.local/state/controlled-dev-machine/runtime
+  audit: ~/.local/state/controlled-dev-machine/audit
+
+storage:
+  root:
+    min_free_gib: 50
+    min_free_percent: 5
+  audit:
+    min_free_gib: 200
+    min_free_percent: 10
+  pcap_limit_gib: 100
+  plaintext_limit_gib: 50
+  structured_limit_gib: 10
+
+upstream:
+  kind: http
+  host: 127.0.0.1
+  port: 11440
+  # 必填：固定出口填写实际公网 IP/32；地址池必须由供应商明确保证。
+  expected_exit_cidr:
+  # 只用于记录父代理配置来源；控制器不会启动或解析它。
+  config_path:
+
+# 可选：每次 init 从本机读取这些文本配置，生成受控副本。
+# Claude 提示词会与沙箱网络约束合并；shell 和 Git 配置中的代理会被清除。
+# default_conda_env 是本机选择，不应在通用代码中写死。
+profile:
+  # IANA 时区；按本机出口环境填写，发布默认不携带地域信息。
+  timezone: UTC
+  claude_instructions:
+  bashrc:
+  login_profile:
+  gitconfig:
+  tmux_config:
+  conda_root:
+  default_conda_env:
+
+mounts: []
+# 按本机实际存在的路径添加项目、配置和环境，容器路径尽量保持一致。例如：
+# mounts:
+#   - host_path: ~/project
+#     container_path: /home/alice/project
+#     access: rw
+#   - host_path: ~/.claude/skills
+#     container_path: /home/alice/.claude/skills
+#     access: ro
+#   - host_path: ~/.claude/agents
+#     container_path: /home/alice/.claude/agents
+#     access: ro
+#   - host_path: ~/.config/git
+#     container_path: /home/alice/.config/git
+#     access: rw
+#   - host_path: ~/.ssh
+#     container_path: /home/alice/.ssh
+#     access: ro
+#   - host_path: ~/.condarc
+#     container_path: /home/alice/.condarc
+#     access: ro
+#   - host_path: ~/miniconda3
+#     container_path: /home/alice/miniconda3
+#     access: rw

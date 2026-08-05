@@ -1,0 +1,170 @@
+schema_version: 1
+policy_id: daily-public-web
+revision: 1
+mode: daily
+created_at: "2026-07-29T07:30:00Z"
+parent_digest: ff93b68351ff32b42cf8472306af82cc88aaaf0ebf714f3130aa4fa96bd4cce9
+web_default: allow_audited_public
+rules:
+  - id: block-google-doh
+    priority: 1
+    action: block
+    purpose: "阻断目标程序绕过内部 DNS 直接使用公共 DoH"
+    domain_kind: suffix
+    domain: dns.google
+    schemes: [http, https]
+    ports: [80, 443]
+    methods: ["*"]
+    path_prefixes: [/]
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: known-public-doh-service
+
+  - id: block-cloudflare-doh
+    priority: 2
+    action: block
+    purpose: "阻断目标程序绕过内部 DNS 直接使用公共 DoH"
+    domain_kind: suffix
+    domain: cloudflare-dns.com
+    schemes: [http, https]
+    ports: [80, 443]
+    methods: ["*"]
+    path_prefixes: [/]
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: known-public-doh-service
+
+  - id: block-quad9-doh
+    priority: 3
+    action: block
+    purpose: "阻断目标程序绕过内部 DNS 直接使用公共 DoH"
+    domain_kind: suffix
+    domain: dns.quad9.net
+    schemes: [http, https]
+    ports: [80, 443]
+    methods: ["*"]
+    path_prefixes: [/]
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: known-public-doh-service
+
+  - id: block-opendns-doh
+    priority: 4
+    action: block
+    purpose: "阻断目标程序绕过内部 DNS 直接使用公共 DoH"
+    domain_kind: suffix
+    domain: doh.opendns.com
+    schemes: [http, https]
+    ports: [80, 443]
+    methods: ["*"]
+    path_prefixes: [/]
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: known-public-doh-service
+
+  - id: block-nextdns-doh
+    priority: 5
+    action: block
+    purpose: "阻断目标程序绕过内部 DNS 直接使用公共 DoH"
+    domain_kind: suffix
+    domain: dns.nextdns.io
+    schemes: [http, https]
+    ports: [80, 443]
+    methods: ["*"]
+    path_prefixes: [/]
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: known-public-doh-service
+
+  - id: block-adguard-doh
+    priority: 6
+    action: block
+    purpose: "阻断目标程序绕过内部 DNS 直接使用公共 DoH"
+    domain_kind: suffix
+    domain: dns.adguard-dns.com
+    schemes: [http, https]
+    ports: [80, 443]
+    methods: ["*"]
+    path_prefixes: [/]
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: known-public-doh-service
+
+  - id: claude-webfetch-domain-check
+    priority: 20
+    action: allow
+    purpose: "WebFetch 读取网页前的官方域名检查"
+    domain_kind: exact
+    domain: api.anthropic.com
+    schemes: [https]
+    ports: [443]
+    methods: [GET]
+    path_prefixes: ["/api/web/domain_info?domain="]
+    path_match: prefix
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: claude-webfetch-observation
+
+  - id: claude-api-startup-hello
+    priority: 30
+    action: allow
+    purpose: "Claude Code 交互启动时的官方零正文请求"
+    domain_kind: exact
+    domain: api.anthropic.com
+    schemes: [https]
+    ports: [443]
+    methods: [GET]
+    path_prefixes: [/api/hello]
+    path_match: exact
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: claude-startup-observation
+
+  - id: claude-platform-startup-hello
+    priority: 40
+    action: allow
+    purpose: "Claude Code 交互启动时的官方零正文请求"
+    domain_kind: exact
+    domain: platform.claude.com
+    schemes: [https]
+    ports: [443]
+    methods: [GET]
+    path_prefixes: [/v1/oauth/hello]
+    path_match: exact
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: claude-startup-observation
+
+  - id: closed-gate-canary-review
+    priority: 100
+    action: review
+    purpose: "本地封闭门禁专用；不会连接公网"
+    domain_kind: exact
+    domain: canary.test
+    schemes: [http, https]
+    ports: [80, 443]
+    methods: ["*"]
+    path_prefixes: [/]
+    content_types: []
+    body_max_bytes: 1048576
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: local-closed-gate

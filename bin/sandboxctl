@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+
+CDM_PYTHON=${CDM_PYTHON:-/usr/bin/python3}
+if [ ! -x "$CDM_PYTHON" ]; then
+    echo "错误: 找不到控制器 Python: $CDM_PYTHON" >&2
+    exit 2
+fi
+if ! "$CDM_PYTHON" -c 'import sys, yaml; raise SystemExit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+    echo "错误: 控制器需要 Python 3.11+ 和 PyYAML: $CDM_PYTHON" >&2
+    exit 2
+fi
+
+exec "$CDM_PYTHON" -m controlled_dev_machine "$@"

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "sandbox-fixture": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        ".claude/fixtures/mcp_server.py"
+      ],
+      "env": {}
+    }
+  }
+}

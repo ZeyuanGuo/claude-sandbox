@@ -1,0 +1,49 @@
+/*
+ * Target-cgroup connect, datagram-send, and exec audit.
+ *
+ * The controller supplies the numeric cgroup id as $1. The output is a
+ * deliberately simple, append-only record format; sockaddr bytes are kept
+ * because a failed call may never create a packet capture.
+ */
+
+tracepoint:syscalls:sys_enter_execve /cgroup == (uint64)$1/ {
+  printf("CDM_EXEC|%llu|%d|%d|%s|%s\n", nsecs, pid, tid, comm, str(args->filename));
+}
+
+tracepoint:syscalls:sys_enter_connect /cgroup == (uint64)$1/ {
+  $length = args->addrlen;
+  if ($length > 128) {
+    $length = 128;
+  }
+  printf("CDM_CONNECT_BEGIN|%llu|%d|%d|%s|%d|%rh\n",
+    nsecs, pid, tid, comm, args->fd, buf(args->uservaddr, $length));
+}
+
+tracepoint:syscalls:sys_exit_connect /cgroup == (uint64)$1/ {
+  printf("CDM_CONNECT_END|%llu|%d|%d|%s|%d\n",
+    nsecs, pid, tid, comm, args->ret);
+}
+
+tracepoint:syscalls:sys_enter_sendto /cgroup == (uint64)$1/ {
+  $length = args->addr_len;
+  if ($length > 128) {
+    $length = 128;
+  }
+  printf("CDM_SENDTO_BEGIN|%llu|%d|%d|%s|%d|%d|%rh\n",
+    nsecs, pid, tid, comm, args->fd, args->len, buf(args->addr, $length));
+}
+
+tracepoint:syscalls:sys_exit_sendto /cgroup == (uint64)$1/ {
+  printf("CDM_SENDTO_END|%llu|%d|%d|%s|%d\n",
+    nsecs, pid, tid, comm, args->ret);
+}
+
+tracepoint:syscalls:sys_enter_sendmsg /cgroup == (uint64)$1/ {
+  printf("CDM_SENDMSG_BEGIN|%llu|%d|%d|%s|%d|%d\n",
+    nsecs, pid, tid, comm, args->fd, args->flags);
+}
+
+tracepoint:syscalls:sys_exit_sendmsg /cgroup == (uint64)$1/ {
+  printf("CDM_SENDMSG_END|%llu|%d|%d|%s|%d\n",
+    nsecs, pid, tid, comm, args->ret);
+}
