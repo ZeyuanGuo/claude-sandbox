@@ -45,6 +45,7 @@ from controlled_dev_machine.runtime import (
     _wait_audit_probe_ready,
     _wait_target_ebpf_ready,
     audit_status,
+    compose_shell,
     compose_start_closed,
     render_closed_compose,
 )
@@ -1120,6 +1121,71 @@ rules: []
 def test_daily_policy_is_deployable() -> None:
     policy = load_policy(Path("policies/daily/0001-public-web.yaml"))
     _require_deployable_policy(policy)
+
+
+@pytest.mark.parametrize(
+    ("root", "expected_user"),
+    [(False, "1000:1000"), (True, "0:0")],
+)
+def test_compose_shell_forwards_terminal_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root: bool,
+    expected_user: str,
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    compose_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    monkeypatch.setenv("TERM", "screen-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._compose",
+        lambda _config, _manifest, *args, **kwargs: (
+            compose_calls.append((args, kwargs))
+            or subprocess.CompletedProcess(args, 0)
+        ),
+    )
+
+    assert compose_shell(config, root=root) == 0
+    assert compose_calls == [
+        (
+            (
+                "exec",
+                "--env",
+                "TERM=screen-256color",
+                "--env",
+                "COLORTERM=truecolor",
+                "--user",
+                expected_user,
+                "target",
+                "bash",
+            ),
+            {"check": False},
+        )
+    ]
+
+
+def test_compose_shell_omits_unset_terminal_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    compose_calls: list[tuple[str, ...]] = []
+    monkeypatch.delenv("TERM", raising=False)
+    monkeypatch.delenv("COLORTERM", raising=False)
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._compose",
+        lambda _config, _manifest, *args, **_kwargs: (
+            compose_calls.append(args) or subprocess.CompletedProcess(args, 0)
+        ),
+    )
+
+    assert compose_shell(config, root=False) == 0
+    assert compose_calls == [("exec", "--user", "1000:1000", "target", "bash")]
 
 
 def test_legacy_stop_accepts_only_the_instances_fixed_compose_path(tmp_path: Path) -> None:
