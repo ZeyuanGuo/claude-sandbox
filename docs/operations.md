@@ -158,6 +158,8 @@ sudo bin/sandboxctl shell
 sudo bin/sandboxctl root-shell
 ```
 
+`shell` 和 `root-shell` 会自动把调用端非空的 `TERM` 和 `COLORTERM` 传入容器，使交互 shell、彩色提示符和全屏 TUI 使用当前终端的能力。用户不需要另外导出终端变量；非交互探针仍使用独立的无 TTY 执行路径。
+
 停止整套环境：
 
 ```bash

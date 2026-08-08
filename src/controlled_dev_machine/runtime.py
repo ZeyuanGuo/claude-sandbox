@@ -1108,7 +1108,21 @@ def compose_shell(config: HostConfig, *, root: bool) -> int:
     manifest = load_runtime(config)
     _require_root()
     user = "0:0" if root else f"{config.target.uid}:{config.target.gid}"
-    result = _compose(config, manifest, "exec", "--user", user, "target", "bash", check=False)
+    terminal_env: list[str] = []
+    for name in ("TERM", "COLORTERM"):
+        if value := os.environ.get(name):
+            terminal_env.extend(("--env", f"{name}={value}"))
+    result = _compose(
+        config,
+        manifest,
+        "exec",
+        *terminal_env,
+        "--user",
+        user,
+        "target",
+        "bash",
+        check=False,
+    )
     return result.returncode
 
 
