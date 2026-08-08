@@ -60,13 +60,13 @@ mounts: []
 #     access: rw
 #   - host_path: ~/.claude/skills
 #     container_path: /home/alice/.claude/skills
-#     access: ro
+#     access: rw
 #   - host_path: ~/.claude/agents
 #     container_path: /home/alice/.claude/agents
-#     access: ro
+#     access: rw
 #   - host_path: ~/.agents/skills
 #     container_path: /home/alice/.agents/skills
-#     access: ro
+#     access: rw
 #   - host_path: ~/.codex
 #     container_path: /home/alice/.codex
 #     access: rw
@@ -78,7 +78,7 @@ mounts: []
 #     access: ro
 #   - host_path: ~/.condarc
 #     container_path: /home/alice/.condarc
-#     access: ro
+#     access: rw
 #   - host_path: ~/miniconda3
 #     container_path: /home/alice/miniconda3
 #     access: rw

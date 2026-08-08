@@ -28,9 +28,9 @@
 
 - 宿主 `~/.claude/CLAUDE.md` 与沙箱网络约束合并，作为容器只读全局提示词；
 - 宿主 `.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 生成受控副本；
-- `~/.claude/skills`、`~/.claude/agents` 和 `~/.agents/skills` 只读同路径挂载；
+- `~/.claude/skills`、`~/.claude/agents` 和 `~/.agents/skills` 读写同路径挂载，便于容器内安装或更新技能与 agent；
 - 目标镜像固定安装 Codex CLI；整棵宿主 `~/.codex` 以同路径读写挂载，因此 Codex 的配置、登录状态、会话和 skills 与宿主共用；
-- Git 直接使用宿主 `~/.config/git` 读写目录，SSH 和 Conda 配置直接使用宿主 `.ssh`、`.condarc` 只读目录或文件；
+- Git 直接使用宿主 `~/.config/git` 读写目录，Conda 配置直接使用宿主 `.condarc` 读写；SSH 仍使用宿主 `.ssh` 只读目录，避免改写关键私钥；
 - 主机选择的 Conda 根目录以相同绝对路径读写挂载，默认环境由 `profile.default_conda_env` 指定。
 
 本机同时用 `profile.conda_root` 声明 `~/miniconda3`。其他服务器可以使用不同 Conda 根目录；未声明时只采用该服务器 `.bashrc` 已初始化的环境，不猜测安装位置。

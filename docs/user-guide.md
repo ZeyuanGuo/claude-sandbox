@@ -22,7 +22,7 @@ codex
 
 容器 Home 固定映射到宿主配置的 `paths.persistent_home`，不是临时卷。Claude 的会话、历史、memory、账号状态和其他持久文件因此长期保存；容器内的 `~/.claude` 位于这棵持久 Home 中。不要把宿主原生 `~/.claude` 整棵目录覆盖进去，两套 Claude 账号/会话状态应保持隔离。Codex 则相反：整棵宿主 `~/.codex` 读写挂载到容器同路径，容器和宿主共用 Codex 配置、登录状态、会话和 skills。
 
-默认配置生成器会自动创建并读写挂载宿主的 `~/.codex`，并在这些路径实际存在时同路径接入宿主的 `~/.config/git`、`.ssh` 和 `.condarc`：Git 配置目录可读写，`.ssh` 和 `.condarc` 只读。每台服务器只挂载实际存在且愿意交给目标软件的项目；不维护另一份沙箱凭据。
+默认配置生成器会自动创建并读写挂载宿主的 `~/.codex`，并在这些路径实际存在时同路径接入宿主的 skills、agents、`~/.config/git` 和 `.condarc`：这些普通配置和数据可读写，`.ssh` 仍只读以保护关键私钥。每台服务器只挂载实际存在且愿意交给目标软件的项目；不维护另一份沙箱凭据。
 
 文件、Git、Python、GPU、Skill、子 agent、MCP 和 Web 等开发流程已在 API-key 基线中验证。当前账号模式尚未完成整套验收；遇到阻断时按下文处理。退出 Claude 或 shell 不会停止沙箱，也不会删除会话。
 

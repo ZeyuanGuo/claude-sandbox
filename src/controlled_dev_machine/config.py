@@ -170,13 +170,13 @@ def create_host_config(path: Path) -> None:
 
     mounts = []
     for relative, access in (
-        (".claude/skills", "ro"),
-        (".claude/agents", "ro"),
-        (".agents/skills", "ro"),
+        (".claude/skills", "rw"),
+        (".claude/agents", "rw"),
+        (".agents/skills", "rw"),
         (".codex", "rw"),
         (".config/git", "rw"),
         (".ssh", "ro"),
-        (".condarc", "ro"),
+        (".condarc", "rw"),
     ):
         source = home / relative
         if source.is_symlink() or not (source.is_file() or source.is_dir()):

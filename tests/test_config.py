@@ -199,6 +199,7 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
     (home / ".claude" / "skills").mkdir(parents=True)
     (home / ".claude" / "agents").mkdir()
     (home / ".agents" / "skills").mkdir(parents=True)
+    (home / ".condarc").write_text("channels: [defaults]\n", encoding="utf-8")
     (home / ".bashrc").write_text("export EDITOR=vim\n", encoding="utf-8")
     account = SimpleNamespace(pw_name="alice", pw_uid=1000, pw_gid=1000, pw_dir=str(home))
     monkeypatch.setattr(
@@ -229,10 +230,11 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
     mounts = {mount.host_path: mount.read_only for mount in config.mounts}
     assert mounts[home / ".config" / "git"] is False
     assert mounts[home / ".ssh"] is True
-    assert mounts[home / ".claude" / "skills"] is True
-    assert mounts[home / ".claude" / "agents"] is True
-    assert mounts[home / ".agents" / "skills"] is True
+    assert mounts[home / ".claude" / "skills"] is False
+    assert mounts[home / ".claude" / "agents"] is False
+    assert mounts[home / ".agents" / "skills"] is False
     assert mounts[home / ".codex"] is False
+    assert mounts[home / ".condarc"] is False
     assert (home / ".codex").is_dir()
 
     with pytest.raises(ConfigError, match="拒绝覆盖"):
