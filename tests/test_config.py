@@ -227,6 +227,8 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
     mounts = {mount.host_path: mount.read_only for mount in config.mounts}
     assert mounts[home / ".config" / "git"] is False
     assert mounts[home / ".ssh"] is True
+    assert mounts[home / ".codex"] is False
+    assert (home / ".codex").is_dir()
 
     with pytest.raises(ConfigError, match="拒绝覆盖"):
         create_host_config(output)

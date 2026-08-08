@@ -20,7 +20,7 @@
 
 2026-07-29 已完成从显式代理到透明网络的迁移。封闭门禁、受控 DoH、DNS 租约、系统/Conda CA、curl、Python、Node 和审计失效闭锁均已实测。完整 Claude 功能正面证据仍来自 API-key 基线；账号模式要在真实授权后重新测试，不能用基础网络通过代替功能通过。
 
-## 宿主配置与环境同步
+## 宿主配置与工具同步
 
 容器的整个目标用户 Home 使用宿主固定目录 `~/.local/share/controlled-dev-machine/home` 的读写 bind mount；不使用 Docker anonymous volume 或临时存储。因此容器内 `~/.claude`、会话数据库、history、memory、插件状态和账号状态都能直接在宿主对应目录中备份、迁移或重新挂载。生成的 `CLAUDE.md`、`.bashrc` 和 `.gitconfig` 是只读受控副本，会覆盖 Home 中同名路径，但不会覆盖其余 Claude 状态。
 
@@ -28,7 +28,8 @@
 
 - 宿主 `~/.claude/CLAUDE.md` 与沙箱网络约束合并，作为容器只读全局提示词；
 - 宿主 `.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 生成受控副本；
-- `~/.claude/skills`、`~/.claude/agents` 以及 `~/.agents/skills`、`~/.codex/skills` 只读同路径挂载；
+- `~/.claude/skills`、`~/.claude/agents` 和 `~/.agents/skills` 只读同路径挂载；
+- 目标镜像固定安装 Codex CLI；整棵宿主 `~/.codex` 以同路径读写挂载，因此 Codex 的配置、登录状态、会话和 skills 与宿主共用；
 - Git 直接使用宿主 `~/.config/git` 读写目录，SSH 和 Conda 配置直接使用宿主 `.ssh`、`.condarc` 只读目录或文件；
 - 主机选择的 Conda 根目录以相同绝对路径读写挂载，默认环境由 `profile.default_conda_env` 指定。
 
@@ -36,7 +37,9 @@
 
 生成器保留宿主 alias、Conda、NVM 等 shell 行为，但会在最后清除大小写代理变量、Git 代理和专用 CA 路径。网关根证书合入系统、Conda OpenSSL 和 certifi 的标准信任文件，Node 使用系统 CA。profile 源必须位于用户 Home、由该用户拥有且不是符号链接。宿主 profile 变化后必须重新执行 `init`；运行清单保存源摘要和生成结果摘要，旧 profile 不会被静默当成当前配置。
 
-没有同步整个宿主 `.claude`。沙箱单独保存提供方、账号状态、设备标识和会话历史。此前 API-key 基线使用一个固定模型；私有别名不进入发布仓库，旧结果只作为历史基线。
+没有同步整个宿主 `.claude`。沙箱单独保存 Claude 的提供方、账号状态、设备标识和会话历史。此前 API-key 基线使用一个固定模型；私有别名不进入发布仓库，旧结果只作为历史基线。
+
+Codex CLI `0.147.0` 在目标镜像中固定；首次使用仍需在容器中完成自己的登录。登录凭据不进入镜像或仓库，而是写入宿主 `~/.codex`，并通过整棵目录挂载到容器。Codex 的本地命令沙箱配置也随该目录共享；外部网络仍由本项目透明网关控制。
 
 每台主机的 Python、PyTorch、CUDA、GPU、Git、tmux 和 Node 环境都可能不同。迁移后必须检查容器内实际可执行文件、关键 import 和 GPU 计算，不能继承源主机结论。失效的 Skill 或 agent 链接也不会因为挂载自动变成可用能力。
 
@@ -66,6 +69,8 @@ echo "$CONDA_PREFIX"
 command -v python
 python -c 'import torch; print(torch.__version__, torch.cuda.is_available())'
 claude
+# 或
+codex
 ```
 
 不需要附加 `--tools`、测试参数或特殊启动器。当前持久配置已经保存默认模型。退出 Claude 或容器 shell 不会停止沙箱和审计；需要停止整套环境时回到宿主执行 `sudo bin/sandboxctl stop`。

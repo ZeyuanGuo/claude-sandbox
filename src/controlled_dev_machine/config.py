@@ -162,12 +162,18 @@ def create_host_config(path: Path) -> None:
     }
     profile.update({"conda_root": None, "default_conda_env": None, "timezone": "UTC"})
 
+    # Codex keeps credentials and session data in this directory. Share the
+    # complete user-owned directory so host and target use the same state.
+    codex_home = home / ".codex"
+    if not codex_home.exists() and not codex_home.is_symlink():
+        codex_home.mkdir(mode=0o700)
+
     mounts = []
     for relative, access in (
         (".claude/skills", "ro"),
         (".claude/agents", "ro"),
         (".agents/skills", "ro"),
-        (".codex/skills", "ro"),
+        (".codex", "rw"),
         (".config/git", "rw"),
         (".ssh", "ro"),
         (".condarc", "ro"),

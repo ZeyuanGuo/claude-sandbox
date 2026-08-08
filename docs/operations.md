@@ -58,7 +58,7 @@ cd "$HOME/claude-sandbox"
 bin/sandboxctl config init
 ```
 
-`config init` 从实际系统账号填写用户名、UID、GID 和 Home，拒绝覆盖已有文件。它会在源文件安全且实际存在时接入常用 shell/Git/tmux/Claude 文本配置，并同路径挂载现有 Skills、agents、`~/.config/git`、`~/.ssh` 和 `~/.condarc`。Git 配置目录可读写，以支持 credential store 的锁文件和原子更新；SSH 与 Conda 配置只读。它不会挂载整棵宿主 `~/.claude`，Claude 的账号、会话和设备状态保留在沙箱持久 Home。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
+`config init` 从实际系统账号填写用户名、UID、GID 和 Home，拒绝覆盖已有文件。它会自动创建 `~/.codex`（不存在时）并以读写方式挂载整棵目录；Codex CLI 随目标镜像安装，首次登录后状态直接保存在宿主该目录。它还会在源文件安全且实际存在时接入常用 shell/Git/tmux/Claude 文本配置，并同路径挂载现有 Claude skills、agents、`~/.config/git`、`~/.ssh` 和 `~/.condarc`。Git 配置目录可读写，以支持 credential store 的锁文件和原子更新；SSH 与 Conda 配置只读。它不会挂载整棵宿主 `~/.claude`，Claude 的账号、会话和设备状态保留在沙箱持久 Home。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
 
 然后编辑 `~/.config/controlled-dev-machine/host.yaml`：
 
@@ -126,9 +126,10 @@ command -v python
 python -c 'import torch; print(torch.cuda.is_available(), torch.cuda.device_count())'
 git config --get user.name
 claude --version
+codex --version
 ```
 
-再在一个允许公开的测试项目中完成读写文件、运行测试、Git HTTPS 和一项正常 Claude 任务。环境名本身不算通过，必须检查实际 Python、关键 import 和 GPU 计算。
+再在一个允许公开的测试项目中完成读写文件、运行测试、Git HTTPS，以及各执行一项正常 Claude 和 Codex 任务。环境名本身不算通过，必须检查实际 Python、关键 import 和 GPU 计算。
 
 ## 日常进入与提权
 

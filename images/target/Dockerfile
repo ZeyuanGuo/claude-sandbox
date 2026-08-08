@@ -9,6 +9,7 @@ ARG TARGET_TIMEZONE=UTC
 ARG TARGET_BUILD_DIGEST
 ARG NODE_VERSION=22.23.1
 ARG NODE_SHA256=9749e988f437343b7fa832c69ded82a312e41a03116d766797ac14f6f9eee578
+ARG CODEX_VERSION=0.147.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=${TARGET_TIMEZONE} \
@@ -68,6 +69,7 @@ RUN apt-get update \
     && rm -f /tmp/node.tar.xz \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && npm install --global @anthropic-ai/claude-code@2.1.220 \
+    && npm install --global "@openai/codex@${CODEX_VERSION}" \
     && npm cache clean --force \
     && usermod --append --groups sudo "${TARGET_NAME}" \
     && rm -rf /var/lib/apt/lists/*
