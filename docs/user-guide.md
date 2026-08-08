@@ -18,15 +18,19 @@ cd "$HOME/project"        # 或其他已挂载项目
 claude
 ```
 
-容器 Home 固定映射到宿主配置的 `paths.persistent_home`，不是临时卷。Claude 的会话、历史、memory、账号状态和其他持久文件因此长期保存；容器内的 `~/.claude` 位于这棵持久 Home 中。不要把宿主原生 `~/.claude` 整棵目录覆盖进去，两套账号/会话状态应保持隔离。
+默认情况下，容器 Home 固定映射到宿主配置的 `paths.persistent_home`，不是临时卷。Claude 的会话、历史、memory、账号状态和其他持久文件因此长期保存；容器内的 `~/.claude` 位于这棵持久 Home 中。
 
-默认配置生成器会在这些路径实际存在时同路径接入宿主的 `~/.config/git`、`.ssh` 和 `.condarc`：Git 配置目录可读写，`.ssh` 和 `.condarc` 只读。每台服务器只挂载实际存在且愿意交给目标软件的项目；不维护另一份沙箱凭据。
+专用开发账号也可以设置 `workspace.share_host_home: true`，把宿主同名 Home 直接映射到容器 Home。此时 NVM、Conda、Rustup、浏览器缓存、Claude 状态和所有工作文件会即时双向可见；容器内的修改就是宿主修改。`paths.state` 和 `paths.audit` 必须放在这棵共享 Home 之外，控制器生成的 shell、Git、tmux 和 Claude 指令仍以只读覆盖层接入，避免宿主网络变量破坏透明网关。
+
+未共享整个 Home 时，默认配置生成器会在这些路径实际存在时同路径接入宿主的 `~/.config/git`、`.ssh` 和 `.condarc`：Git 配置目录可读写，`.ssh` 和 `.condarc` 只读。每台服务器只挂载实际存在且愿意交给目标软件的项目；不维护另一份沙箱凭据。
 
 文件、Git、Python、GPU、Skill、子 agent、MCP 和 Web 等开发流程已在 API-key 基线中验证。当前账号模式尚未完成整套验收；遇到阻断时按下文处理。退出 Claude 或 shell 不会停止沙箱，也不会删除会话。
 
 首次使用前先按 [凭据与风险](credentials.md#claude-的三种接入方式) 选择账号登录、标准 API key 或私有 Base URL。发布策略不包含私有模型端点；不要为了登录或 API 调用在容器内设置代理或修改 DNS。
 
 容器普通用户可以直接使用 `sudo`，密码与当前宿主账号一致。宿主密码变更后，执行 `stop -> init -> build -> start -> verify-closed`。若容器内 sudo 本身损坏，再从宿主执行 `sudo bin/sandboxctl root-shell` 修复。
+
+每个新交互 shell 会显示当前容器身份、共享路径和发布端口。`service_ports` 只启动配置中的同号 TCP relay；应用仍需在容器内监听 `0.0.0.0:PORT`。例如配置 `25600-25700` 后，容器服务使用该段内端口，宿主通过相同端口访问，不需要额外端口换算。relay 是审计 watchdog 监督的受控进程，停止或身份变化会关闭联网租约。
 
 ## 恢复迁入的会话
 

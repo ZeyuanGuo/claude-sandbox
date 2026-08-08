@@ -1,5 +1,23 @@
-from controlled_dev_machine.cli import _redacted_path, _safe_record
+from pathlib import Path
+from types import SimpleNamespace
+
+from controlled_dev_machine.cli import _redacted_path, _safe_record, _session_destination
 from controlled_dev_machine.review import ReviewRecord
+
+
+def test_session_destination_uses_the_active_home() -> None:
+    persistent_home = Path("/var/lib/cdm/persistent-home")
+    target_home = Path("/home/alice")
+    config = SimpleNamespace(
+        target=SimpleNamespace(home=target_home),
+        paths=SimpleNamespace(persistent_home=persistent_home),
+        workspace=SimpleNamespace(share_host_home=True),
+    )
+
+    assert _session_destination(config) == target_home
+
+    config.workspace.share_host_home = False
+    assert _session_destination(config) == persistent_home
 
 
 def test_redacted_path_removes_all_query_values() -> None:

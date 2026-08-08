@@ -95,6 +95,18 @@ class HostProfile:
 
 
 @dataclass(frozen=True)
+class WorkspaceConfig:
+    share_host_home: bool = False
+
+
+@dataclass(frozen=True)
+class ServicePorts:
+    bind_address: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
 class HostConfig:
     schema_version: int
     instance: str
@@ -106,6 +118,8 @@ class HostConfig:
     mounts: tuple[ProjectMount, ...]
     upstream: UpstreamConfig
     profile: HostProfile
+    workspace: WorkspaceConfig
+    service_ports: ServicePorts | None
 
     @property
     def resource_prefix(self) -> str:
@@ -214,6 +228,8 @@ def create_host_config(path: Path) -> None:
             "config_path": None,
         },
         "profile": profile,
+        "workspace": {"share_host_home": False},
+        "service_ports": None,
         "mounts": mounts,
     }
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -386,6 +402,41 @@ def load_host_config(path: Path) -> HostConfig:
         timezone=timezone,
     )
 
+    workspace_raw = _mapping(root.get("workspace", {}), "workspace")
+    share_host_home = workspace_raw.get("share_host_home", False)
+    if not isinstance(share_host_home, bool):
+        raise ConfigError("workspace.share_host_home 必须是布尔值")
+    workspace = WorkspaceConfig(share_host_home=share_host_home)
+    if share_host_home:
+        exposed_control_paths = (
+            name
+            for name, value in (
+                ("paths.state", paths.state),
+                ("paths.audit", paths.audit),
+            )
+            if _overlap(target.home, value)
+        )
+        if exposed := ", ".join(exposed_control_paths):
+            raise ConfigError(f"共享宿主 Home 时 {exposed} 必须位于 target.home 之外")
+
+    service_ports_raw = root.get("service_ports")
+    service_ports: ServicePorts | None = None
+    if service_ports_raw is not None:
+        service_ports_mapping = _mapping(service_ports_raw, "service_ports")
+        bind_address = _ipv4_address(
+            service_ports_mapping.get("bind_address", "127.0.0.1"),
+            "service_ports.bind_address",
+        )
+        start = _integer(service_ports_mapping.get("start"), "service_ports.start")
+        end = _integer(service_ports_mapping.get("end"), "service_ports.end")
+        if start < 1024 or end > 65535 or start > end:
+            raise ConfigError(
+                "service_ports 必须是 1024 到 65535 范围内的有序非特权端口段"
+            )
+        if end - start + 1 > 1024:
+            raise ConfigError("service_ports 一次最多发布 1024 个端口")
+        service_ports = ServicePorts(bind_address=bind_address, start=start, end=end)
+
     return HostConfig(
         schema_version=schema_version,
         instance=instance,
@@ -397,6 +448,8 @@ def load_host_config(path: Path) -> HostConfig:
         mounts=mounts,
         upstream=upstream,
         profile=profile,
+        workspace=workspace,
+        service_ports=service_ports,
     )
 
 
@@ -465,6 +518,20 @@ def _public_network(value: Any, name: str) -> str:
     if not network.network_address.is_global or not network[-1].is_global:
         raise ConfigError(f"{name} 只能声明公网地址范围")
     return str(network)
+
+
+def _ipv4_address(value: Any, name: str) -> str:
+    import ipaddress
+
+    text = _string(value, name)
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError as exc:
+        raise ConfigError(f"{name} 必须是有效的 IPv4 地址") from exc
+    invalid_unspecified = address.is_unspecified and text != "0.0.0.0"
+    if address.version != 4 or address.is_multicast or invalid_unspecified:
+        raise ConfigError(f"{name} 必须是有效的 IPv4 单播地址或 0.0.0.0")
+    return str(address)
 
 
 def _threshold(value: Any, name: str) -> StorageThreshold:

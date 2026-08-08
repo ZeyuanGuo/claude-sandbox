@@ -42,6 +42,11 @@ _MITMPROXY_SOURCE = (
 _MITMPROXY_LOCAL = "cdm-base-mitmproxy:12.2.3-sha256-68afa70d"
 _GATEWAY_UID = 1000
 _GATEWAY_GID = 1000
+_SERVICE_RELAY_UID = 65534
+_SERVICE_RELAY_GID = 65534
+_BUILD_PROVENANCE = False
+_BUILD_SBOM = False
+_COMPOSE_BUILD_ATTESTATION_ARGS = ("--provenance=false", "--sbom=false")
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _LIFECYCLE_LOCK_ROOT = Path("/run/controlled-dev-machine-locks")
 
@@ -115,6 +120,9 @@ def _target_build_digest(config: HostConfig, root: Path) -> str:
         raise DeploymentError(f"目标镜像构建输入缺失或不是普通文件: {dockerfile}")
     inputs = {
         "base_image": _UBUNTU_LOCAL,
+        "build_provenance": _BUILD_PROVENANCE,
+        "build_sbom": _BUILD_SBOM,
+        "compose_build_attestation_args": _COMPOSE_BUILD_ATTESTATION_ARGS,
         "target_name": config.target.name,
         "target_uid": str(config.target.uid),
         "target_gid": str(config.target.gid),
@@ -206,13 +214,57 @@ def _profile_bundle(
     source_digest.update(b"default_conda_env\0" + environment.encode("utf-8") + b"\0")
     conda_root = str(config.profile.conda_root or "")
     source_digest.update(b"conda_root\0" + conda_root.encode("utf-8") + b"\0")
+    workspace_description = ", ".join(
+        str(path)
+        for path in (
+            config.target.home if config.workspace.share_host_home else None,
+            *(item.container_path for item in config.mounts),
+        )
+        if path is not None
+    )
+    service_ports = (
+        f"{config.service_ports.bind_address}:{config.service_ports.start}-{config.service_ports.end}"
+        if config.service_ports is not None
+        else "none"
+    )
+    notice_lines = (
+        "--- Controlled development workstation ---",
+        (
+            "System identity: Ubuntu container, devbox, "
+            f"{config.profile.timezone}, en_US.UTF-8"
+        ),
+        f"Shared work paths: {workspace_description or 'none'}",
+        f"Published TCP ports: {service_ports}",
+        "Outbound Web traffic uses the controlled gateway and is audited.",
+        "Host-visible work files and inbound services use the listed paths and ports.",
+    )
+    shell_notice = "\n".join(
+        "        "
+        + shlex.quote(line)
+        + (" \\" if index < len(notice_lines) - 1 else "")
+        for index, line in enumerate(notice_lines)
+    )
+    source_digest.update(
+        b"workspace_description\0" + workspace_description.encode("utf-8") + b"\0"
+    )
+    source_digest.update(b"service_ports\0" + service_ports.encode("utf-8") + b"\0")
 
     host_instructions = sources.get("claude_instructions", "").rstrip()
     instructions = (
         f"{host_instructions}\n\n{controlled}\n" if host_instructions else f"{controlled}\n"
     )
     bashrc = sources.get("bashrc", "").rstrip()
-    bashrc = _network_neutral_shell(bashrc)
+    conda_executable = (
+        config.profile.conda_root / "bin" / "conda"
+        if config.profile.conda_root is not None
+        else None
+    )
+    conda_available = (
+        conda_executable is not None
+        and conda_executable.is_file()
+        and os.access(conda_executable, os.X_OK)
+    )
+    bashrc = _network_neutral_shell(bashrc, conda_enabled=conda_available)
     if bashrc:
         bashrc += "\n"
     bashrc += """
@@ -240,6 +292,14 @@ unset CURL_CA_BUNDLE GIT_SSL_CAINFO NODE_EXTRA_CA_CERTS
 unset REQUESTS_CA_BUNDLE SSL_CERT_FILE
 unset -f proxy_on proxy_off 2>/dev/null || true
 """.lstrip()
+    bashrc += f"""
+
+# Managed interactive-shell notice.
+if [[ $- == *i* ]]; then
+    printf '%s\\n' \\
+{shell_notice}
+fi
+"""
 
     login_profile = sources.get("login_profile")
     if login_profile is None:
@@ -248,7 +308,12 @@ unset -f proxy_on proxy_off 2>/dev/null || true
 fi
 """
     else:
-        login_profile = _network_neutral_shell(login_profile.rstrip()) + "\n"
+        login_profile = (
+            _network_neutral_shell(
+                login_profile.rstrip(), conda_enabled=conda_available
+            )
+            + "\n"
+        )
     login_profile += """
 
 # Managed by controlled-dev-machine. A host profile may alter PATH or network
@@ -273,20 +338,44 @@ unset -f proxy_on proxy_off 2>/dev/null || true
         files[".gitconfig"] = _network_neutral_gitconfig(sources["gitconfig"])
     if "tmux_config" in sources:
         files[".tmux.conf"] = sources["tmux_config"]
+    source_digest.update(b"rendered_profile\0")
+    for name, content in sorted(files.items()):
+        source_digest.update(name.encode("utf-8") + b"\0")
+        source_digest.update(content.encode("utf-8") + b"\0")
     return files, source_digest.hexdigest()
 
 
-def _network_neutral_shell(content: str) -> str:
+def _network_neutral_shell(content: str, *, conda_enabled: bool = True) -> str:
     lines = []
     invocation = re.compile(r"^\s*proxy_(?:on|off)(?:\s+[^#;]+)?\s*(?:#.*)?$")
+    conda_activation = re.compile(r"^\s*conda\s+activate\b.*$")
+    conda_block_start = re.compile(r"^\s*#\s*>>>\s*conda initialize\s*>>>")
+    conda_block_end = re.compile(r"^\s*#\s*<<<\s*conda initialize\s*<<<")
+    absolute_source = re.compile(
+        r"^\s*(?:\.|source)\s+[\"']?(/[^\"'\s]+)[\"']?\s*$"
+    )
     network_assignment = re.compile(
         r"^\s*(?:export\s+)?(?:HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|"
         r"http_proxy|https_proxy|all_proxy|no_proxy|CURL_CA_BUNDLE|"
         r"GIT_SSL_CAINFO|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE|SSL_CERT_FILE)="
     )
+    in_conda_block = False
     for line in content.splitlines():
-        if not invocation.fullmatch(line) and not network_assignment.match(line):
-            lines.append(line)
+        if not conda_enabled and conda_block_start.match(line):
+            in_conda_block = True
+            continue
+        if in_conda_block:
+            if conda_block_end.match(line):
+                in_conda_block = False
+            continue
+        if not conda_enabled and conda_activation.fullmatch(line):
+            continue
+        source_match = absolute_source.fullmatch(line)
+        if source_match and not Path(source_match.group(1)).is_file():
+            continue
+        if invocation.fullmatch(line) or network_assignment.match(line):
+            continue
+        lines.append(line)
     return "\n".join(lines).rstrip()
 
 
@@ -717,6 +806,8 @@ def render_closed_compose(
             "build": {
                 "context": str(root),
                 "dockerfile": str(root / "images/gateway/Dockerfile"),
+                "provenance": _BUILD_PROVENANCE,
+                "sbom": _BUILD_SBOM,
                 "args": {
                     "BASE_IMAGE": _MITMPROXY_LOCAL,
                     "GATEWAY_BUILD_DIGEST": manifest.gateway_build_digest,
@@ -803,6 +894,8 @@ def render_closed_compose(
             "build": {
                 "context": str(root),
                 "dockerfile": str(root / "images/target/Dockerfile"),
+                "provenance": _BUILD_PROVENANCE,
+                "sbom": _BUILD_SBOM,
                 "args": {
                     "BASE_IMAGE": _UBUNTU_LOCAL,
                     "TARGET_NAME": config.target.name,
@@ -844,7 +937,13 @@ def render_closed_compose(
             },
             "devices": ["nvidia.com/gpu=all"],
             "volumes": [
-                _bind(config.paths.persistent_home, config.target.home, read_only=False),
+                _bind(
+                    config.target.home
+                    if config.workspace.share_host_home
+                    else config.paths.persistent_home,
+                    config.target.home,
+                    read_only=False,
+                ),
                 *project_mounts,
                 *profile_mounts,
                 _bind(
@@ -886,7 +985,14 @@ def compose_build(config: HostConfig) -> None:
     _require_root()
     _require_instance_stopped(config, operation="build")
     sync_base_images(config)
-    _compose(config, manifest, "build", "target", "gateway")
+    _compose(
+        config,
+        manifest,
+        "build",
+        *_COMPOSE_BUILD_ATTESTATION_ARGS,
+        "target",
+        "gateway",
+    )
     _pin_built_images(config, manifest)
 
 
@@ -894,8 +1000,8 @@ def sync_base_images(config: HostConfig) -> None:
     _require_root()
     if os.uname().machine not in {"x86_64", "amd64"}:
         raise DeploymentError("当前基础镜像导入器只固定了 amd64 manifest")
-    if not shutil.which("skopeo"):
-        raise DeploymentError("缺少 skopeo；它用于绕过失效的共享 Docker registry mirror")
+    if not shutil.which("skopeo") and not shutil.which("docker"):
+        raise DeploymentError("缺少 skopeo 和 docker；无法导入固定基础镜像")
     for source, local in (
         (_UBUNTU_SOURCE, _UBUNTU_LOCAL),
         (_MITMPROXY_SOURCE, _MITMPROXY_LOCAL),
@@ -903,19 +1009,40 @@ def sync_base_images(config: HostConfig) -> None:
         exists = _docker(config, "image", "inspect", local, check=False, capture=True)
         if exists.returncode == 0:
             continue
-        _run(
-            [
-                "skopeo",
-                "copy",
-                "--override-os",
-                "linux",
-                "--override-arch",
-                "amd64",
-                source,
-                f"docker-daemon:{local}",
-            ],
-            env=_docker_env(config),
-        )
+        if shutil.which("skopeo"):
+            copied = _run(
+                [
+                    "skopeo",
+                    "copy",
+                    "--override-os",
+                    "linux",
+                    "--override-arch",
+                    "amd64",
+                    source,
+                    f"docker-daemon:{local}",
+                ],
+                env=_docker_env(config),
+                check=False,
+            )
+            if copied.returncode == 0:
+                continue
+        # Older distro skopeo builds speak Docker API 1.22 and cannot write to
+        # current engines. Pull the same digest with the Docker CLI, then tag
+        # the immutable image ID used by the generated Compose file.
+        reference = source.removeprefix("docker://")
+        _docker(config, "pull", reference)
+        image_id = _docker(
+            config,
+            "image",
+            "inspect",
+            reference,
+            "--format",
+            "{{.Id}}",
+            capture=True,
+        ).stdout.strip()
+        if not _IMAGE_ID_RE.fullmatch(image_id):
+            raise DeploymentError(f"固定基础镜像 ID 无效: {image_id}")
+        _docker(config, "image", "tag", image_id, local)
 
 
 @_locked_lifecycle
@@ -1080,6 +1207,8 @@ def audit_status(config: HostConfig) -> dict[str, object]:
         "target-connect-ebpf",
         "network-watchdog",
     }
+    if config.service_ports is not None:
+        expected_processes.add("service-relay")
     process_names = [str(item["kind"]) for item in processes]
     if len(process_names) != len(expected_processes) or set(process_names) != expected_processes:
         raise DeploymentError(f"审计运行清单探针集合不完整: {path}")
@@ -1167,13 +1296,23 @@ def compose_exec_async(
 
 
 def _prepare_directories(config: HostConfig) -> None:
-    _mkdir(config.paths.persistent_home, 0o700, config.target.uid, config.target.gid)
-    _mkdir(
-        config.paths.persistent_home / ".claude",
-        0o700,
-        config.target.uid,
-        config.target.gid,
-    )
+    if config.workspace.share_host_home:
+        if not config.target.home.is_dir():
+            raise DeploymentError("共享宿主 Home 必须存在且属于目标用户")
+        metadata = config.target.home.stat()
+        if metadata.st_uid != config.target.uid or metadata.st_gid != config.target.gid:
+            raise DeploymentError("共享宿主 Home 必须存在且属于目标用户")
+        claude_home = config.target.home / ".claude"
+        if not claude_home.is_dir():
+            raise DeploymentError("共享宿主 Home 缺少 .claude 目录")
+    else:
+        _mkdir(config.paths.persistent_home, 0o700, config.target.uid, config.target.gid)
+        _mkdir(
+            config.paths.persistent_home / ".claude",
+            0o700,
+            config.target.uid,
+            config.target.gid,
+        )
     _mkdir(config.paths.state, 0o700, 0, 0)
     _mkdir(config.paths.audit, 0o700, 0, 0)
     for path in (
@@ -2163,6 +2302,30 @@ def _service_container_id(
     ).stdout.strip()
 
 
+def _service_relay_command(
+    config: HostConfig, manifest: RuntimeManifest, target_pid: int
+) -> list[str] | None:
+    ports = config.service_ports
+    if ports is None:
+        return None
+    return [
+        sys.executable,
+        str(Path(manifest.repo_root) / "src/controlled_dev_machine/service_relay.py"),
+        "--bind-address",
+        ports.bind_address,
+        "--start",
+        str(ports.start),
+        "--end",
+        str(ports.end),
+        "--target-netns",
+        f"/proc/{target_pid}/ns/net",
+        "--uid",
+        str(_SERVICE_RELAY_UID),
+        "--gid",
+        str(_SERVICE_RELAY_GID),
+    ]
+
+
 def _start_audit(
     config: HostConfig,
     manifest: RuntimeManifest,
@@ -2212,7 +2375,7 @@ def _start_audit(
         "entries": [],
     }
     _write_audit_state(config, state)
-    commands = (
+    commands = [
         (
             "target-pcap",
             [
@@ -2299,7 +2462,17 @@ def _start_audit(
             structured_root / "connect.bpftrace.log",
             structured_root / "connect.log",
         ),
-    )
+    ]
+    relay_command = _service_relay_command(config, manifest, target_pid)
+    if relay_command is not None:
+        commands.append(
+            (
+                "service-relay",
+                relay_command,
+                structured_root / "service-relay.log",
+                None,
+            )
+        )
     started: list[dict[str, object]] = []
     try:
         for kind, command, error_log, capture_path in commands:
@@ -2554,12 +2727,27 @@ def _target_cgroup_path(pid: int) -> str:
 
 def _bpftrace_cgroup_id(path: str) -> int:
     expression = f'BEGIN {{ printf("%llu\\n", cgroupid("{path}")); exit(); }}'
-    result = _run(["bpftrace", "-e", expression], capture=True)
+    result = _run(["bpftrace", "-e", expression], capture=True, check=False)
     for line in result.stdout.splitlines():
         line = line.strip()
         if line.isdecimal():
             return int(line)
-    raise DeploymentError(f"无法解析目标 cgroup ID: {path}")
+    # Ubuntu's packaged bpftrace 0.14 can fail to attach its BEGIN trigger
+    # because the stripped binary lacks BEGIN_trigger. For cgroup v2, the
+    # kernel cgroup ID used by bpftrace's /cgroup filter is the directory
+    # inode, so use that exact local value while retaining later probe checks.
+    cgroup_root = Path("/sys/fs/cgroup")
+    cgroup_path = Path(path)
+    try:
+        if cgroup_path != cgroup_root and cgroup_root not in cgroup_path.parents:
+            raise ValueError("cgroup path outside cgroup v2 root")
+        metadata = cgroup_path.stat()
+    except (OSError, ValueError) as exc:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise DeploymentError(f"无法解析目标 cgroup ID: {path}; {detail}") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_ino <= 0:
+        raise DeploymentError(f"目标 cgroup 路径无效: {path}")
+    return metadata.st_ino
 
 
 def _spawn_audit_process(
@@ -2597,6 +2785,9 @@ def _wait_audit_probe_ready(
     if kind.endswith("-pcap"):
         ready_path = error_log
         marker = "listening on"
+    elif kind == "service-relay":
+        ready_path = error_log
+        marker = "service relay ready"
     else:
         raise DeploymentError(f"未知审计探针类型，无法确认就绪: {kind}")
     deadline = time.monotonic() + timeout_seconds

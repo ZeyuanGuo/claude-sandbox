@@ -16,7 +16,7 @@
 - 登记的项目目录可以直接读写。每台服务器自行选择项目，通用代码不写死项目名称。
 - 全部 GPU 可见并允许使用，不修改 GPU 的独占模式，也不自动停止其他用户的任务。
 - 任何涉及其他用户进程的停止、暂停或修改，都必须先获得本次明确确认。
-- 不开放沙箱 Web 端口，不建设 VNC 或浏览器转发。当前主要入口是 shell 和 TUI。
+- 默认不开放沙箱 Web 端口，不建设 VNC 或浏览器转发；主机配置可以显式发布受限 TCP 端口段供开发服务使用。当前主要入口是 shell 和 TUI。
 - 网络从全断开始。新软件和新认证方式先使用严格策略，未知 Web 请求在连接真实上游前暂停；解释核心流量并完成真实任务后，可以单独生成日常策略。公开仓库提供公共 Web 日常策略：普通公网 HTTP/HTTPS 默认放行并记录，其他直接 IP、外部 DNS、特殊主机名、已知加密 DNS、非 Web 端口和默认 UDP/QUIC 仍保持阻断。历史私有 API 端点不随发布策略提供。
 - 普通 TLS 默认解密。解密失败不能自动改成密文直通。
 - 上游 VPN 或代理只负责把已批准流量送到目标出口，不负责决定放行什么。
@@ -101,7 +101,7 @@ examples/            不含秘密的主机配置示例
 
 实际路径可以在主机配置中修改。配置中的 `~` 和相对 Home 路径必须相对目标用户的 Home 解析，不能使用启动 `sandboxctl` 的 root 账号 Home。项目路径尽量使用 Home 相对形式记录，并在容器内映射到相同绝对路径，例如宿主和容器都使用 `/home/alice/project`。
 
-`host.yaml` 至少声明：目标用户及其 Home、UID/GID、持久 Home、项目挂载、本地开发环境、GPU 暴露、审计目录、上游配置位置、期望出口、各数据类型硬上限、分区保留线和默认策略。上游凭据、CA 私钥和账号令牌只引用本地只读文件，不能直接写入仓库配置。
+`host.yaml` 至少声明：目标用户及其 Home、UID/GID、持久 Home、可选的共享宿主 Home、项目挂载、本地开发环境、GPU 暴露、可选服务端口段、审计目录、上游配置位置、期望出口、各数据类型硬上限、分区保留线和默认策略。上游凭据、CA 私钥和账号令牌只引用本地只读文件，不能直接写入仓库配置。
 
 控制层只维护三类核心数据：
 
@@ -174,9 +174,9 @@ sudo sandboxctl verify-closed
 
 - 使用固定 digest 的 Ubuntu 24.04 基础镜像，创建与宿主 UID/GID 一致的普通用户，并按本机密码哈希配置容器内 `sudo`。
 - 按主机私有配置设置时区，配置英文 locale、常见英文字体、中性主机名、bash、tmux、编辑器、Git、Python、常用诊断和构建工具。
-- 使用独立持久 Home，不复制整个宿主 Home、shell 历史或整棵 `.claude`。`config init` 生成受控 shell/profile 副本，并按后续明确选择默认挂载宿主 Git/SSH 等常用开发配置。
+- 默认使用独立持久 Home，不复制整个宿主 Home、shell 历史或整棵 `.claude`；专用开发账号可设置 `workspace.share_host_home: true` 直接共享同名 Home。`config init` 生成受控 shell/profile 副本，并按后续明确选择默认挂载宿主 Git/SSH 等常用开发配置。
 - 基础设施容器丢弃全部 capability 并启用 `no-new-privileges`；目标容器为支持 setuid `sudo` 保留 Docker 默认 capability 集，但不使用 `--privileged`，不获得 `NET_ADMIN`、Docker socket或宿主命名空间。
-- 不发布端口，不挂载 Docker socket、宿主 `/proc`、`/sys` 或 `/run`。
+- 默认不发布端口；若配置 `service_ports`，由受控宿主 relay 只监听声明的同号 TCP 端口段，进入目标 netns 后连接 `127.0.0.1:同号端口`，不开放目标网络接口入站。不挂载 Docker socket、宿主 `/proc`、`/sys` 或 `/run`。
 - 使用 NVIDIA Container Toolkit CDI 把全部 GPU 提供给目标容器，设置 `compute,utility` 能力；不修改 GPU 独占模式，不自动停止其他任务。
 
 产物：基础镜像、固定软件清单、持久 Home、shell 与 root 进入文档。

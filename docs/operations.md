@@ -68,6 +68,8 @@ bin/sandboxctl config init
 - 删除不希望交给目标软件的凭据挂载；
 - 确认持久 Home、状态、审计目录和存储保留线；
 - 确认父代理端口与 `expected_exit_cidr`。
+- 专用账号需要透明复用整棵 Home 时设置 `workspace.share_host_home: true`，并把 `paths.state`、`paths.audit` 放到共享 Home 之外；
+- 需要从宿主访问容器服务时填写 `service_ports`，端口段必须在 `1024-65535` 内且最多 1024 个端口。
 
 编辑完成后再校验：
 
@@ -114,9 +116,9 @@ sudo bin/sandboxctl verify-closed
 
 `doctor` 任一 `blocked` 都要先修复。`init`、`build`、`start` 和 `stop` 对同一实例互斥；运行中执行 `init` 或 `build` 会直接拒绝，避免活动容器、`current` 清单和镜像标签分叉。
 
-基础镜像固定上游 digest，并由 `skopeo` 导入本机 Docker。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 同时核对源码、清单、策略、profile、镜像标签和 image ID。同一标签被重新构建成不同内容时会拒绝启动。构建时如需代理，只给当前构建命令设置 `HTTP_PROXY`/`HTTPS_PROXY`，这些变量不会写入目标运行环境。
+基础镜像固定上游 digest，优先由 `skopeo` 导入本机 Docker；旧版 skopeo 与 Docker Engine API 不兼容时自动回退到同一 digest 的 Docker CLI pull，再以 immutable image ID 打标签。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 同时核对源码、清单、策略、profile、镜像标签和 image ID。同一标签被重新构建成不同内容时会拒绝启动。构建时如需代理，只给当前构建命令设置 `HTTP_PROXY`/`HTTPS_PROXY`，这些变量不会写入目标运行环境。
 
-`start` 安装本实例的宿主 nftables 父代理门禁和 systemd 恢复单元，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不发布端口，不挂 Docker socket；全部 GPU 可见但不设置独占模式。
+`start` 安装本实例的宿主 nftables 父代理门禁和 systemd 恢复单元，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不挂 Docker socket；只有配置了 `service_ports` 时才启动同号 TCP relay。relay 先在宿主命名空间监听声明端口，再进入目标网络命名空间连接 `127.0.0.1:同号端口`，并以无补充组的 `65534:65534` 运行；不会为目标网络接口增加入站放行。全部 GPU 可见但不设置独占模式。
 
 `verify-closed` 证明网络门禁和审计路径，不等于项目环境、Claude 登录或真实开发任务已经可用。新主机还要进入 shell 检查实际路径：
 

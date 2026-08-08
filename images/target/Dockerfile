@@ -21,6 +21,7 @@ RUN apt-get update \
         build-essential \
         ca-certificates \
         curl \
+        cargo \
         dnsutils \
         fd-find \
         file \
@@ -28,11 +29,31 @@ RUN apt-get update \
         fonts-dejavu-core \
         fonts-liberation \
         git \
+        golang-go \
         gnupg \
         iproute2 \
         iputils-ping \
         jq \
         less \
+        libasound2t64 \
+        libatk-bridge2.0-0 \
+        libatk1.0-0 \
+        libcups2 \
+        libdbus-1-3 \
+        libdrm2 \
+        libgbm1 \
+        libglib2.0-0 \
+        libnspr4 \
+        libnss3 \
+        libpango-1.0-0 \
+        libx11-6 \
+        libxcb1 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxext6 \
+        libxfixes3 \
+        libxkbcommon0 \
+        libxrandr2 \
         locales \
         lsof \
         nano \
@@ -43,6 +64,7 @@ RUN apt-get update \
         python3-pip \
         python3-venv \
         ripgrep \
+        rustc \
         screen \
         strace \
         sudo \
@@ -51,6 +73,7 @@ RUN apt-get update \
         unzip \
         vim-tiny \
         wget \
+        xvfb \
         xz-utils \
         zip \
     && locale-gen en_US.UTF-8 \

@@ -117,7 +117,15 @@ def run_closed_gate(config: HostConfig, *, timeout_seconds: float = 15.0) -> dic
             )
         )
     checks.append(_run_policy_digest_fault(config, store, timeout_seconds, audit))
-    checks.append(_run_public_web_via_parent(config, audit))
+    checks.append(
+        _run_public_web_via_parent(
+            config,
+            audit,
+            store,
+            timeout_seconds=timeout_seconds,
+            require_review=policy.web_default == "review",
+        )
+    )
     checks.append(_run_review_store_fault(config, store, timeout_seconds))
     for scheme in ("http", "https"):
         checks.append(_run_approved_request(config, store, scheme, timeout_seconds))
@@ -677,10 +685,17 @@ def _require_live_audit(audit: dict[str, Any]) -> None:
         "target-connect-ebpf",
         "network-watchdog",
     }
+    allowed = required | {"service-relay"}
+    observed = (
+        {item.get("kind") for item in processes if isinstance(item, dict)}
+        if isinstance(processes, list)
+        else set()
+    )
     if (
         not audit.get("active")
         or not isinstance(processes, list)
-        or {item.get("kind") for item in processes if isinstance(item, dict)} != required
+        or not required.issubset(observed)
+        or not observed.issubset(allowed)
         or not all(item.get("alive") for item in processes if isinstance(item, dict))
     ):
         raise DeploymentError("透明网络门禁要求全部抓包、eBPF 和监督进程均在运行")
@@ -938,6 +953,10 @@ def _run_public_review_before_upstream(
 def _run_public_web_via_parent(
     config: HostConfig,
     audit: dict[str, Any],
+    store: RequestStore,
+    *,
+    timeout_seconds: float,
+    require_review: bool,
 ) -> dict[str, Any]:
     if config.upstream.kind != "http" or config.upstream.port is None:
         raise DeploymentError("透明 Web 出口验收要求 HTTP 父代理")
@@ -950,13 +969,14 @@ def _run_public_web_via_parent(
     if ipaddress.ip_address(observed_upstream_ip) not in expected:
         raise DeploymentError(f"父代理出口不在验收要求的范围 {expected}")
     test_id = f"closed-gate-public-parent-{uuid.uuid4().hex[:12]}"
+    path = f"/?cdm_test_id={test_id}"
     capture = _start_gateway_capture(
         config,
         audit,
         test_id,
         capture_filter=f"dst port {config.upstream.port}",
         artifact_kind="public-parent",
-        direction="out",
+        packet_limit=1,
     )
     try:
         process = compose_exec_async(
@@ -971,9 +991,23 @@ def _run_public_web_via_parent(
                 "4",
                 "--max-time",
                 "12",
-                "https://api.ipify.org/",
+                f"https://api.ipify.org{path}",
             ],
         )
+        record: ReviewRecord | None = None
+        if require_review:
+            record = _wait_pending(store, path, timeout_seconds)
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                raise DeploymentError(
+                    "公网出口请求在批准前结束: "
+                    f"rc={process.returncode}; {stderr.strip() or stdout.strip()}"
+                )
+            store.approve_once(
+                record.request_id,
+                ttl_seconds=30,
+                reason="封闭门禁公网出口回归",
+            )
         stdout, stderr = _communicate(process, 14)
         if process.returncode != 0:
             raise DeploymentError(
@@ -984,6 +1018,10 @@ def _run_public_web_via_parent(
             raise DeploymentError(
                 f"目标容器出口 {returned_ip!r} 与宿主父代理出口 {observed_upstream_ip!r} 不一致"
             )
+        if record is not None:
+            final = store.get(record.request_id)
+            if final.state != "completed":
+                raise DeploymentError(f"公网出口批准后状态异常: {final.state}")
     except Exception:
         _discard_gateway_capture(capture)
         raise
@@ -997,6 +1035,7 @@ def _run_public_web_via_parent(
         "ok": True,
         "returned_ip": returned_ip,
         "observed_upstream_ip": observed_upstream_ip,
+        "request_id": None if record is None else record.request_id,
         "parent_packet_capture": evidence,
     }
 
@@ -1252,12 +1291,15 @@ def _start_gateway_capture(
     artifact_kind: str,
     namespace: str = "gateway",
     direction: str | None = None,
+    packet_limit: int | None = None,
 ) -> _GatewayCapture:
     namespace_pid = audit.get(f"{namespace}_pid")
     if not isinstance(namespace_pid, int) or namespace_pid <= 0:
         raise DeploymentError(f"无法定位当前 {namespace} 网络命名空间")
     if direction not in {None, "in", "out"}:
         raise DeploymentError(f"无效的抓包方向: {direction}")
+    if packet_limit is not None and packet_limit < 1:
+        raise DeploymentError("无效的抓包包数上限")
     run_id = audit.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise DeploymentError("无法定位当前审计运行")
@@ -1270,12 +1312,16 @@ def _start_gateway_capture(
     pcap_path = evidence_root / f"{test_id}.{artifact_kind}.pcap"
     log_path = evidence_root / f"{test_id}.{artifact_kind}.tcpdump.log"
     metadata_path = evidence_root / f"{test_id}.{artifact_kind}.json"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    # Pre-create both artifacts with root-only permissions. Tcpdump opens the
+    # PCAP path itself; forwarding its binary stream through nsenter stdout is
+    # unreliable on short captures on this host.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     pcap_descriptor = os.open(pcap_path, flags, 0o600)
+    os.close(pcap_descriptor)
     try:
         log_descriptor = os.open(log_path, flags, 0o600)
     except Exception:
-        os.close(pcap_descriptor)
+        pcap_path.unlink(missing_ok=True)
         raise
     started_at = _now()
     try:
@@ -1295,22 +1341,22 @@ def _start_gateway_capture(
             "-Z",
             "root",
             *(["-Q", direction] if direction is not None else []),
+            *(["-c", str(packet_limit)] if packet_limit is not None else []),
             "-w",
-            "-",
+            str(pcap_path),
             capture_filter,
         ]
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
-            stdout=pcap_descriptor,
+            stdout=subprocess.DEVNULL,
             stderr=log_descriptor,
             start_new_session=True,
         )
     except Exception:
-        os.close(pcap_descriptor)
         os.close(log_descriptor)
+        pcap_path.unlink(missing_ok=True)
         raise
-    os.close(pcap_descriptor)
     os.close(log_descriptor)
     capture = _GatewayCapture(
         process=process,
@@ -1329,6 +1375,10 @@ def _start_gateway_capture(
             raise DeploymentError(f"独立网关抓包启动失败: {detail[-500:]}")
         detail = log_path.read_text(encoding="utf-8", errors="replace")
         if "listening on" in detail.lower():
+            # On Linux's `any` pseudo-interface tcpdump announces readiness
+            # before its dispatch loop reliably delivers the first buffered
+            # packet. Give short validation captures a bounded settle window.
+            time.sleep(0.25)
             return _GatewayCapture(
                 process=capture.process,
                 pcap_path=capture.pcap_path,

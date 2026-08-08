@@ -6,6 +6,9 @@ REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
 
+if [ -z "${CDM_PYTHON:-}" ] && [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    CDM_PYTHON="$REPO_ROOT/.venv/bin/python"
+fi
 CDM_PYTHON=${CDM_PYTHON:-/usr/bin/python3}
 if [ ! -x "$CDM_PYTHON" ]; then
     echo "错误: 找不到控制器 Python: $CDM_PYTHON" >&2

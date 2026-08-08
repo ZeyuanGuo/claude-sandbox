@@ -56,6 +56,76 @@ def test_paths_resolve_against_target_home_not_process_home(tmp_path: Path) -> N
     assert config.profile.conda_root is None
     assert config.profile.default_conda_env is None
     assert config.profile.timezone == "UTC"
+    assert config.workspace.share_host_home is False
+    assert config.service_ports is None
+
+
+def test_shared_home_and_service_port_range_are_explicit(tmp_path: Path) -> None:
+    path = _config(tmp_path)
+    content = path.read_text(encoding="utf-8")
+    path.write_text(
+        content.replace(
+            "state: ~/.local/state/controlled-dev-machine/runtime",
+            f"state: {tmp_path}/runtime",
+        ).replace(
+            "audit: ~/.local/state/controlled-dev-machine/audit",
+            f"audit: {tmp_path}/audit",
+        )
+        + """
+workspace:
+  share_host_home: true
+service_ports:
+  bind_address: 0.0.0.0
+  start: 25600
+  end: 25700
+""",
+        encoding="utf-8",
+    )
+
+    config = load_host_config(path)
+
+    assert config.workspace.share_host_home is True
+    assert config.service_ports is not None
+    assert config.service_ports.bind_address == "0.0.0.0"
+    assert (config.service_ports.start, config.service_ports.end) == (25600, 25700)
+
+
+def test_shared_home_requires_control_paths_outside_target_home(tmp_path: Path) -> None:
+    path = _config(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + """
+workspace:
+  share_host_home: true
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="paths.state, paths.audit.*target.home 之外"):
+        load_host_config(path)
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "message"),
+    ((80, 100, "非特权"), (25700, 25600, "有序"), (20000, 22000, "1024")),
+)
+def test_service_port_range_is_bounded(
+    tmp_path: Path, start: int, end: int, message: str
+) -> None:
+    path = _config(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + f"""
+service_ports:
+  bind_address: 127.0.0.1
+  start: {start}
+  end: {end}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match=message):
+        load_host_config(path)
 
 
 def test_gpu_mode_cannot_disable_required_gpu_visibility(tmp_path: Path) -> None:

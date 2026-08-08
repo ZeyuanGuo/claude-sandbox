@@ -10,7 +10,9 @@ import pytest
 from controlled_dev_machine.config import (
     HostProfile,
     ProjectMount,
+    ServicePorts,
     UpstreamConfig,
+    WorkspaceConfig,
     load_host_config,
 )
 from controlled_dev_machine.errors import DeploymentError
@@ -18,6 +20,7 @@ from controlled_dev_machine.policy import load_policy
 from controlled_dev_machine.runtime import (
     RuntimeManifest,
     _activate_generation,
+    _bpftrace_cgroup_id,
     _check_upstream,
     _configure_host_parent_guard,
     _configure_infrastructure_network,
@@ -40,11 +43,13 @@ from controlled_dev_machine.runtime import (
     _require_policy_files,
     _require_profile_sources,
     _require_target_image,
+    _service_relay_command,
     _stopped_host_parent_guard_script,
     _target_build_digest,
     _wait_audit_probe_ready,
     _wait_target_ebpf_ready,
     audit_status,
+    compose_build,
     compose_start_closed,
     render_closed_compose,
 )
@@ -154,6 +159,8 @@ def test_target_has_no_publication_or_audit_mount(tmp_path: Path) -> None:
     assert target["environment"]["NVIDIA_VISIBLE_DEVICES"] == "all"
     assert target["user"] == "1000:1000"
     assert target["group_add"] == ["sudo"]
+    assert target["build"]["provenance"] is False
+    assert target["build"]["sbom"] is False
     assert target["build"]["args"]["TARGET_BUILD_DIGEST"] == "c" * 64
     assert "CDM_TARGET_UID" not in target["environment"]
     assert "CDM_TARGET_GID" not in target["environment"]
@@ -206,6 +213,40 @@ def test_target_home_uses_fixed_persistent_host_bind(tmp_path: Path) -> None:
     )
 
 
+def test_shared_host_home_and_declared_service_ports_are_rendered(tmp_path: Path) -> None:
+    config = replace(
+        _host_config(tmp_path),
+        workspace=WorkspaceConfig(share_host_home=True),
+        service_ports=ServicePorts(bind_address="0.0.0.0", start=25600, end=25700),
+    )
+
+    target = render_closed_compose(config, _manifest(config, tmp_path))["services"]["target"]
+    home = next(
+        item for item in target["volumes"] if item["target"] == str(config.target.home)
+    )
+
+    assert home["source"] == str(config.target.home)
+    assert home["read_only"] is False
+    assert "ports" not in target
+
+    command = _service_relay_command(config, _manifest(config, tmp_path), 4321)
+    assert command is not None
+    assert command[-12:] == [
+        "--bind-address",
+        "0.0.0.0",
+        "--start",
+        "25600",
+        "--end",
+        "25700",
+        "--target-netns",
+        "/proc/4321/ns/net",
+        "--uid",
+        "65534",
+        "--gid",
+        "65534",
+    ]
+
+
 def test_host_password_hash_selects_only_target_user(tmp_path: Path) -> None:
     shadow = tmp_path / "shadow"
     shadow.write_text(
@@ -244,6 +285,42 @@ def test_prepare_directories_accepts_file_mount(
     )
     monkeypatch.setattr("controlled_dev_machine.runtime.os.chown", lambda *_args: None)
     _prepare_directories(config)
+
+
+def test_prepare_directories_accepts_owned_shared_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _host_config(tmp_path)
+    config.target.home.joinpath(".claude").mkdir()
+    config = replace(
+        config,
+        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+        paths=replace(
+            config.paths,
+            state=tmp_path / "state",
+            audit=tmp_path / "audit",
+        ),
+        workspace=WorkspaceConfig(share_host_home=True),
+    )
+
+    monkeypatch.setattr("controlled_dev_machine.runtime.os.chown", lambda *_args: None)
+    _prepare_directories(config)
+
+
+def test_bpftrace_cgroup_id_falls_back_to_cgroup_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del tmp_path
+    cgroup_path = Path("/sys/fs/cgroup")
+    expected = cgroup_path.stat().st_ino
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["bpftrace"], 255, "", "BEGIN_trigger missing"
+        ),
+    )
+
+    assert _bpftrace_cgroup_id(str(cgroup_path)) == expected
 
 
 def test_strict_runtime_resolves_public_domains(
@@ -319,6 +396,8 @@ def test_gateway_is_lazy_and_records_plaintext(tmp_path: Path) -> None:
     ).policy_digest
     assert gateway["environment"]["CDM_GATEWAY_BUILD_DIGEST"] == "b" * 64
     assert gateway["environment"]["CDM_CANARY_ADDRESS"] == "172.28.0.19"
+    assert gateway["build"]["provenance"] is False
+    assert gateway["build"]["sbom"] is False
     assert gateway["build"]["args"]["GATEWAY_BUILD_DIGEST"] == "b" * 64
     assert gateway["healthcheck"]["test"] == [
         "CMD",
@@ -352,9 +431,15 @@ def test_host_profile_is_merged_without_overriding_sandbox_network(
     host_prompt = config.target.home / ".claude" / "CLAUDE.md"
     host_prompt.parent.mkdir()
     host_bashrc = config.target.home / ".bashrc"
+    conda_executable = config.target.home / "conda" / "bin" / "conda"
+    conda_executable.parent.mkdir(parents=True)
+    conda_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    conda_executable.chmod(0o755)
     host_prompt.write_text("# Host instructions\n\nUse Chinese.\n", encoding="utf-8")
     host_bashrc.write_text(
-        "export HTTPS_PROXY=http://127.0.0.1:11430\n", encoding="utf-8"
+        "export HTTPS_PROXY=http://127.0.0.1:11430\n"
+        "conda activate host-env\n",
+        encoding="utf-8",
     )
     config = replace(
         config,
@@ -373,11 +458,15 @@ def test_host_profile_is_merged_without_overriding_sandbox_network(
     assert "# Host instructions" in files["CLAUDE.md"]
     assert "# Controlled development environment" in files["CLAUDE.md"]
     assert "127.0.0.1:11430" not in files[".bashrc"]
+    assert "conda activate host-env" in files[".bashrc"]
     assert "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY" in files[".bashrc"]
     assert "conda activate \"$CDM_DEFAULT_CONDA_ENV\"" in files[".bashrc"]
     assert "$CDM_CONDA_ROOT/etc/profile.d/conda.sh" in files[".bashrc"]
     assert "$HOME/miniconda3" not in files[".bashrc"]
     assert "unset REQUESTS_CA_BUNDLE SSL_CERT_FILE" in files[".profile"]
+    assert "Controlled development workstation" in files[".bashrc"]
+    assert "System identity: Ubuntu container, devbox, Etc/UTC, en_US.UTF-8" in files[".bashrc"]
+    assert "CDM_SHELL_NOTICE_SHOWN" not in files[".bashrc"]
     assert len(source_digest) == 64
 
     compose = render_closed_compose(config, _manifest(config, tmp_path))
@@ -391,6 +480,41 @@ def test_host_profile_is_merged_without_overriding_sandbox_network(
     profile_targets = {item["target"] for item in target["volumes"]}
     assert str(config.target.home / ".bashrc") in profile_targets
     assert str(config.target.home / ".profile") in profile_targets
+
+
+def test_profile_skips_missing_optional_shell_initializers(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    config = replace(
+        config,
+        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+    )
+    host_bashrc = config.target.home / ".bashrc"
+    optional_initializer = config.target.home / ".deno" / "env"
+    host_bashrc.write_text(
+        f"""export EDITOR=vim
+# >>> conda initialize >>>
+__conda_setup="$('/home/alice/miniconda3/bin/conda' 'shell.bash' 'hook')"
+# <<< conda initialize <<<
+conda activate pthgnn
+. \"{optional_initializer}\"
+""",
+        encoding="utf-8",
+    )
+    config = replace(config, profile=replace(config.profile, bashrc=host_bashrc))
+
+    files, digest_without_initializer = _profile_bundle(config, Path.cwd())
+
+    assert "export EDITOR=vim" in files[".bashrc"]
+    assert "conda initialize" not in files[".bashrc"]
+    assert "conda activate pthgnn" not in files[".bashrc"]
+    assert ".deno/env" not in files[".bashrc"]
+
+    optional_initializer.parent.mkdir()
+    optional_initializer.write_text("export DENO_INSTALL=ready\n", encoding="utf-8")
+    updated_files, digest_with_initializer = _profile_bundle(config, Path.cwd())
+
+    assert str(optional_initializer) in updated_files[".bashrc"]
+    assert digest_with_initializer != digest_without_initializer
 
 
 def test_start_rejects_profile_source_changed_after_init(tmp_path: Path) -> None:
@@ -719,6 +843,29 @@ def test_audit_status_requires_exact_probe_and_namespace_sets(
     with pytest.raises(DeploymentError, match="网络命名空间集合不完整"):
         audit_status(config)
 
+    relay_config = replace(
+        config,
+        service_ports=ServicePorts(bind_address="127.0.0.1", start=25600, end=25700),
+    )
+    state = _audit_state()
+    entries = state["entries"]
+    assert isinstance(entries, list)
+    entries.insert(
+        -1,
+        {
+            "kind": "service-relay",
+            "pid": 30,
+            "starttime": 30,
+            "identity": {
+                "executable_path": "/bin/true",
+                "executable_device": 1,
+                "executable_inode": 2,
+            },
+        },
+    )
+    path.write_text(json.dumps(state), encoding="utf-8")
+    assert audit_status(relay_config)["active"] is True
+
 
 def test_audit_probe_requires_an_explicit_ready_marker(tmp_path: Path) -> None:
     class Process:
@@ -730,6 +877,14 @@ def test_audit_probe_requires_an_explicit_ready_marker(tmp_path: Path) -> None:
 
     _wait_audit_probe_ready(
         "target-pcap",
+        Process(),  # type: ignore[arg-type]
+        error_log=error_log,
+        timeout_seconds=0.1,
+    )
+
+    error_log.write_text("service relay ready\n", encoding="utf-8")
+    _wait_audit_probe_ready(
+        "service-relay",
         Process(),  # type: ignore[arg-type]
         error_log=error_log,
         timeout_seconds=0.1,
@@ -812,6 +967,7 @@ def test_transparent_firewalls_allow_only_the_controlled_paths(
         upstream=UpstreamConfig(
             kind="http", host="127.0.0.1", port=11440, config_path=None
         ),
+        service_ports=ServicePorts(bind_address="0.0.0.0", start=25600, end=25700),
     )
     manifest = _manifest(config, tmp_path)
     pids = {"gateway": 101, "dns": 102, "target": 103}
@@ -862,6 +1018,7 @@ def test_transparent_firewalls_allow_only_the_controlled_paths(
     target = scripts[103]
     assert "ip daddr @audit_dns_addresses udp dport 53 accept" in target
     assert "tcp dport @audit_tcp_ports accept" in target
+    assert "tcp dport 25600-25700 accept" not in target
     assert "policy drop" in target
     assert any(command[-3:] == ["default", "via", "172.28.0.2"] for command in commands)
 
@@ -970,6 +1127,48 @@ def test_target_image_tag_and_label_match_build_inputs(tmp_path: Path, monkeypat
     (tmp_path / "images/target/Dockerfile").write_text("FROM scratch\nRUN true\n")
     with pytest.raises(DeploymentError, match="构建输入已变化"):
         _require_target_image(config, manifest)
+
+
+@pytest.mark.parametrize("setting", ["_BUILD_PROVENANCE", "_BUILD_SBOM"])
+def test_target_build_digest_covers_attestation_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, setting: str
+) -> None:
+    _gateway_source_tree(tmp_path)
+    config = _host_config(tmp_path)
+    original = _target_build_digest(config, tmp_path)
+
+    monkeypatch.setattr(f"controlled_dev_machine.runtime.{setting}", True)
+
+    assert _target_build_digest(config, tmp_path) != original
+
+
+def test_compose_build_disables_attestations_at_command_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    compose_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._require_instance_stopped",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("controlled_dev_machine.runtime.sync_base_images", lambda _config: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._compose",
+        lambda _config, _manifest, *args: compose_calls.append(args),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._pin_built_images",
+        lambda _config, _manifest: None,
+    )
+
+    compose_build.__wrapped__(config)
+
+    assert compose_calls == [
+        ("build", "--provenance=false", "--sbom=false", "target", "gateway")
+    ]
 
 
 def test_built_image_ids_are_pinned_and_rechecked(tmp_path: Path, monkeypatch) -> None:

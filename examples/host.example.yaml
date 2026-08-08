@@ -52,6 +52,16 @@ profile:
   conda_root:
   default_conda_env:
 
+# 直接把同名宿主 Home 挂到容器 Home。适合专用开发账号；容器内修改会立即写回宿主。
+workspace:
+  share_host_home: false
+
+# 可选：通过受控同号 relay 发布一个 TCP 端口段。0.0.0.0 会监听宿主所有 IPv4 接口。
+service_ports:
+  bind_address: 127.0.0.1
+  start: 25600
+  end: 25700
+
 mounts: []
 # 按本机实际存在的路径添加项目、配置和环境，容器路径尽量保持一致。例如：
 # mounts:
