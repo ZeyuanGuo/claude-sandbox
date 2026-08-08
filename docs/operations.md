@@ -60,6 +60,18 @@ bin/sandboxctl config init
 
 `config init` 从实际系统账号填写用户名、UID、GID 和 Home，拒绝覆盖已有文件。它会自动创建 `~/.codex`（不存在时）并以读写方式挂载整棵目录；Codex CLI 随目标镜像安装，首次登录后状态直接保存在宿主该目录。它还会在源文件安全且实际存在时接入常用 shell/Git/tmux/Claude 文本配置，并同路径挂载现有 Claude skills、agents、`~/.config/git`、`~/.ssh` 和 `~/.condarc`。Git 配置目录可读写，以支持 credential store 的锁文件和原子更新；SSH 与 Conda 配置只读。它不会挂载整棵宿主 `~/.claude`，Claude 的账号、会话和设备状态保留在沙箱持久 Home。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
 
+默认通用挂载由仓库中的 `config init` 固定生成；只有源路径实际存在时才加入：
+
+| 宿主路径 | 容器路径 | 权限 | 用途 |
+|---|---|---|---|
+| `~/.codex` | 同路径 | 读写 | Codex 配置、登录状态、会话和 skills |
+| `~/.claude/skills`、`~/.claude/agents`、`~/.agents/skills` | 同路径 | 只读 | Claude/Codex 可见的通用 skills 与 agents |
+| `~/.config/git` | 同路径 | 读写 | Git 凭据存储和配置数据库 |
+| `~/.ssh` | 同路径 | 只读 | 日常 SSH 配置和密钥 |
+| `~/.condarc` | 同路径 | 只读 | Conda 配置 |
+
+`.claude/CLAUDE.md`、`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 不直接覆盖容器文件，而是由 `init` 生成受控副本并挂入目标 Home；Claude 会话数据库和其他状态留在持久 Home。项目目录、Conda 根目录和其他大型数据目录属于主机特定配置，由操作者在 `host.yaml` 中追加。
+
 然后编辑 `~/.config/controlled-dev-machine/host.yaml`：
 
 - 给每个项目增加同路径 `rw` 挂载；

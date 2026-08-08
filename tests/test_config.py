@@ -196,7 +196,9 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
     home = tmp_path / "home" / "alice"
     (home / ".config" / "git").mkdir(parents=True)
     (home / ".ssh").mkdir()
-    (home / ".claude").mkdir()
+    (home / ".claude" / "skills").mkdir(parents=True)
+    (home / ".claude" / "agents").mkdir()
+    (home / ".agents" / "skills").mkdir(parents=True)
     (home / ".bashrc").write_text("export EDITOR=vim\n", encoding="utf-8")
     account = SimpleNamespace(pw_name="alice", pw_uid=1000, pw_gid=1000, pw_dir=str(home))
     monkeypatch.setattr(
@@ -227,6 +229,9 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
     mounts = {mount.host_path: mount.read_only for mount in config.mounts}
     assert mounts[home / ".config" / "git"] is False
     assert mounts[home / ".ssh"] is True
+    assert mounts[home / ".claude" / "skills"] is True
+    assert mounts[home / ".claude" / "agents"] is True
+    assert mounts[home / ".agents" / "skills"] is True
     assert mounts[home / ".codex"] is False
     assert (home / ".codex").is_dir()
 

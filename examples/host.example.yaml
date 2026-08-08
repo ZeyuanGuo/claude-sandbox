@@ -64,6 +64,12 @@ mounts: []
 #   - host_path: ~/.claude/agents
 #     container_path: /home/alice/.claude/agents
 #     access: ro
+#   - host_path: ~/.agents/skills
+#     container_path: /home/alice/.agents/skills
+#     access: ro
+#   - host_path: ~/.codex
+#     container_path: /home/alice/.codex
+#     access: rw
 #   - host_path: ~/.config/git
 #     container_path: /home/alice/.config/git
 #     access: rw
