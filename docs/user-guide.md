@@ -18,11 +18,11 @@ cd "$HOME/project"        # 或其他已挂载项目
 claude
 ```
 
-默认情况下，容器 Home 固定映射到宿主配置的 `paths.persistent_home`，不是临时卷。Claude 的会话、历史、memory、账号状态和其他持久文件因此长期保存；容器内的 `~/.claude` 位于这棵持久 Home 中。
+默认情况下，容器 Home 固定映射到宿主配置的 `paths.persistent_home`，不是临时卷。Claude 的会话、历史、memory、账号状态和其他持久文件因此长期保存；容器内的 `~/.claude` 位于这棵持久 Home 中。Codex 的整棵 `~/.codex` 默认读写挂载，因此宿主和容器共用 Codex 配置、登录状态、会话和 skills。
 
-专用开发账号也可以设置 `workspace.share_host_home: true`，把宿主同名 Home 直接映射到容器 Home。此时 NVM、Conda、Rustup、浏览器缓存、Claude 状态和所有工作文件会即时双向可见；容器内的修改就是宿主修改。`paths.state` 和 `paths.audit` 必须放在这棵共享 Home 之外，控制器生成的 shell、Git、tmux 和 Claude 指令仍以只读覆盖层接入，避免宿主网络变量破坏透明网关。
+默认配置生成器会在路径实际存在时接入宿主的 `~/.claude/skills`、`~/.claude/agents`、`~/.agents/skills`、`~/.codex`、`~/.config/git` 和 `.condarc`，这些普通工具状态按上游配置读写；`.ssh` 仍只读。每台服务器只挂载实际存在且愿意交给目标软件的项目；不维护另一份沙箱凭据。
 
-未共享整个 Home 时，默认配置生成器会在这些路径实际存在时同路径接入宿主的 `~/.config/git`、`.ssh` 和 `.condarc`：Git 配置目录可读写，`.ssh` 和 `.condarc` 只读。每台服务器只挂载实际存在且愿意交给目标软件的项目；不维护另一份沙箱凭据。
+专用开发账号也可以设置 `workspace.share_host_home: true`，把宿主同名 Home 直接映射到容器 Home。此时 NVM、Conda、Rustup、浏览器缓存和所有工作文件会即时双向可见；容器内的修改就是宿主修改。后续本机可在这层共享 Home 上声明受控子目录挂载，例如 `.claude`、`.codex` 或其他相对路径；这些子目录会覆盖父 Home，但其存储由控制器单独管理。`paths.state` 和 `paths.audit` 必须放在这棵共享 Home 之外，控制器生成的 shell、Git、tmux 和 Claude 指令仍以只读覆盖层接入，避免宿主网络变量破坏透明网关。
 
 文件、Git、Python、GPU、Skill、子 agent、MCP 和 Web 等开发流程已在 API-key 基线中验证。当前账号模式尚未完成整套验收；遇到阻断时按下文处理。退出 Claude 或 shell 不会停止沙箱，也不会删除会话。
 

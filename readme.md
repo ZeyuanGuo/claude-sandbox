@@ -11,6 +11,8 @@ cd "$HOME/claude-sandbox"
 sudo bin/sandboxctl shell
 cd "$HOME/project"                 # 或其他已挂载项目
 claude
+# 或
+codex
 ```
 
 沙箱持续运行时，日常进入不需要逐项检查。环境刚启动或切换过策略、准备长时间使用、登录或请求被阻断、增加新 MCP/插件时，再按 [用户使用指南](docs/user-guide.md) 检查状态和流量。退出 shell 不会停止沙箱。
@@ -41,7 +43,7 @@ claude
 | 要做的事 | 入口 |
 |---|---|
 | 进入 shell、日常使用、恢复会话、何时检查流量 | [用户使用指南](docs/user-guide.md) |
-| 使用 Claude、处理阻断、增加 MCP/插件、切换模式 | [Claude Code 使用与审计手册](docs/targets/claude-code.md) |
+| 使用 Claude/Codex、处理阻断、增加 MCP/插件、切换模式 | [Claude Code 使用与审计手册](docs/targets/claude-code.md) |
 | 新主机从零部署、启动、升级、回滚和整机迁移 | [部署与操作](docs/operations.md) |
 | 查看明文、PCAP、eBPF、权限和证据边界 | [默认审计](docs/audit.md) |
 | 选择账号登录、API key、Git/SSH 凭据接入方式 | [凭据与风险](docs/credentials.md) |
