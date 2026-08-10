@@ -44,6 +44,16 @@ _GATEWAY_UID = 1000
 _GATEWAY_GID = 1000
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _LIFECYCLE_LOCK_ROOT = Path("/run/controlled-dev-machine-locks")
+_BUILD_PROXY_VARIABLES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
 
 
 @dataclass(frozen=True)
@@ -717,6 +727,7 @@ def render_closed_compose(
             "build": {
                 "context": str(root),
                 "dockerfile": str(root / "images/gateway/Dockerfile"),
+                "network": "host",
                 "args": {
                     "BASE_IMAGE": _MITMPROXY_LOCAL,
                     "GATEWAY_BUILD_DIGEST": manifest.gateway_build_digest,
@@ -803,6 +814,7 @@ def render_closed_compose(
             "build": {
                 "context": str(root),
                 "dockerfile": str(root / "images/target/Dockerfile"),
+                "network": "host",
                 "args": {
                     "BASE_IMAGE": _UBUNTU_LOCAL,
                     "TARGET_NAME": config.target.name,
@@ -886,8 +898,35 @@ def compose_build(config: HostConfig) -> None:
     _require_root()
     _require_instance_stopped(config, operation="build")
     sync_base_images(config)
-    _compose(config, manifest, "build", "target", "gateway")
+    _compose(
+        config,
+        manifest,
+        "build",
+        *_build_proxy_options(),
+        "target",
+        "gateway",
+    )
     _pin_built_images(config, manifest)
+
+
+def _build_proxy_options() -> tuple[str, ...]:
+    options: list[str] = []
+    for variable in _BUILD_PROXY_VARIABLES:
+        if os.environ.get(variable):
+            # Compose reads the value from its inherited environment. Keeping
+            # the value out of argv also avoids persisting it in generated YAML.
+            options.extend(("--build-arg", variable))
+    return tuple(options)
+
+
+@_locked_lifecycle
+def prepare_parent_guard(config: HostConfig) -> None:
+    """Install the persistent loopback-only guard before the parent proxy starts."""
+    manifest = load_runtime(config)
+    _require_root()
+    _require_instance_stopped(config, operation="guard")
+    _install_host_parent_guard(config, manifest)
+    _configure_stopped_host_parent_guard(config, manifest)
 
 
 def sync_base_images(config: HostConfig) -> None:

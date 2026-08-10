@@ -27,15 +27,6 @@ sudo apt-get install -y python3 python3-yaml nftables iproute2 util-linux \
   tcpdump bpftrace skopeo curl openssl
 ```
 
-父代理是本项目的外部前置条件，不由 `sandboxctl` 安装。部署者应先让一个支持 HTTPS `CONNECT` 的 HTTP 代理只监听宿主 `127.0.0.1:11440`，并确认它使用期望的公网出口。代理可以由 Clash 或其他实现提供；本项目只连接端口，不解析代理自己的 YAML，也不把代理地址暴露给目标容器。
-
-```bash
-curl --fail --silent --show-error \
-  --proxy http://127.0.0.1:11440 https://api.ipify.org
-```
-
-输出必须落在随后配置的 `upstream.expected_exit_cidr` 内。只有一个固定出口时，把实际输出追加 `/32`；只有 VPN 服务明确保证一段地址池时才填写较大的 CIDR。真实出口属于主机私有配置，不能写入仓库。若父代理需要本地配置文件，可把路径写入 `upstream.config_path` 作为存在性检查；控制器不会用它启动父代理。
-
 ### 2. 取得固定代码
 
 从发布仓库克隆后切到明确的 release tag 或 commit，不使用会移动的分支名作为部署依据：
@@ -43,13 +34,48 @@ curl --fail --silent --show-error \
 ```bash
 git clone https://github.com/ZeyuanGuo/claude-sandbox.git "$HOME/claude-sandbox"
 cd "$HOME/claude-sandbox"
-git checkout <RELEASE_TAG_OR_COMMIT>
+release_ref=REPLACE_WITH_RELEASE_TAG_OR_COMMIT
+git checkout "$release_ref"
 git status --short
 ```
 
-当前仓库若尚未配置私有 remote，只能完成本机构建，不能声称已经发布。发布方需记录 commit、策略摘要以及构建后两个镜像的内容摘要。
+发布方需记录 commit、策略摘要以及构建后两个镜像的内容摘要。
 
-### 3. 生成本机配置
+### 3. 配置固定出口父代理
+
+父代理是本项目的外部前置条件，不由 `sandboxctl` 安装。部署者应先让一个支持 HTTPS `CONNECT` 的 HTTP 代理监听宿主 `11450`，并确认它使用期望的公网出口。DNS 和网关从 Docker 内部桥访问宿主，因此父代理必须监听该桥可达的地址；示例使用 `0.0.0.0`。安全边界由 `sandboxctl` 安装的宿主 nftables 提供：运行时只允许回环及本实例 DNS/网关的固定源地址，停止时只允许回环，其他容器、LAN 和外部来源均被拒绝。代理可以由 Mihomo、Clash 或其他实现提供；父代理必须全局使用指定出口，出口失效时直接失败，不能回退到其他代理或直连。
+
+仓库提供了脱敏的 [`examples/mihomo-11450.example.yaml`](../examples/mihomo-11450.example.yaml)：`11450` 的唯一规则指向固定出口节点，该节点再通过 `dialer-proxy` 使用商业 VPN 作为第一跳。把模板复制到宿主私有目录、填入两级节点参数并设为 `0600`；不要把真实服务器、账号或密码提交到 Git。模板中的 `allow-lan: true` 只用于让 Docker 内部桥可达，不能代替上述 nftables 门禁。使用其他父代理实现时也必须保持“唯一最终出口、失败即失败”的结构。
+
+下面是仓库验收过的 amd64 参考部署。Mihomo 固定为 `v1.18.3`，解压后程序的 SHA-256 是 `6a31325951db7ed8bb42f484fa4c5c4dc02d06488a4cb25f810e8ecb0245163d`：
+
+```bash
+mihomo_root="$HOME/.local/share/claude-sandbox/mihomo"
+mihomo_config="$HOME/.config/claude-sandbox/mihomo-11450.yaml"
+install -d -m 700 "$mihomo_root" "$(dirname "$mihomo_config")"
+curl -fsSL \
+  https://github.com/MetaCubeX/mihomo/releases/download/v1.18.3/mihomo-linux-amd64-compatible-v1.18.3.gz \
+  | gzip -dc > "$mihomo_root/mihomo"
+chmod 700 "$mihomo_root/mihomo"
+printf '%s  %s\n' \
+  6a31325951db7ed8bb42f484fa4c5c4dc02d06488a4cb25f810e8ecb0245163d \
+  "$mihomo_root/mihomo" | sha256sum --check --strict
+install -m 600 examples/mihomo-11450.example.yaml "$mihomo_config"
+```
+
+填好私有配置后先检查并安装用户服务，但先不要启动：
+
+```bash
+"$mihomo_root/mihomo" -t -d "$mihomo_root" -f "$mihomo_config"
+install -Dm644 examples/mihomo-11450.service \
+  "$HOME/.config/systemd/user/claude-sandbox-mihomo.service"
+systemctl --user daemon-reload
+```
+
+不要在 `sandboxctl guard` 之前启动这个服务。父代理配置、程序和运行数据都位于用户目录；迁移时只需重新下载已校验程序并放入该主机自己的私有配置，不复制凭据到仓库。
+示例服务每次启动前都会确认当前用户 `main` 实例的系统级门禁已经 active；门禁安装失败或开机恢复失败时，父代理保持启动失败，不会绑定 `11450`。
+
+### 4. 生成本机配置
 
 普通用户执行：
 
@@ -104,6 +130,8 @@ sudo bin/sandboxctl --config /absolute/path/host.yaml doctor --json
 sudo bin/sandboxctl --config /absolute/path/host.yaml storage plan
 sudo bin/sandboxctl --config /absolute/path/host.yaml init \
   --policy policies/strict/0002-claude-account.yaml
+sudo bin/sandboxctl --config /absolute/path/host.yaml guard
+# 先按本机情况设置 HTTP_PROXY/HTTPS_PROXY/NO_PROXY
 sudo -E bin/sandboxctl --config /absolute/path/host.yaml build
 sudo bin/sandboxctl --config /absolute/path/host.yaml start
 sudo bin/sandboxctl --config /absolute/path/host.yaml verify-closed
@@ -111,24 +139,55 @@ sudo bin/sandboxctl --config /absolute/path/host.yaml verify-closed
 
 这套显式路径主要用于迁移预检或故障恢复。正常部署仍使用下节的默认路径；同一用户不要同时启动两个实例。
 
-### 4. 预检、构建和启动
+### 5. 预检、构建和启动
 
 首次部署从严格策略开始：
 
 ```bash
+sudo bin/sandboxctl init --policy policies/strict/0002-claude-account.yaml
+sudo bin/sandboxctl guard
+systemctl --user start claude-sandbox-mihomo.service
+curl --fail --silent --show-error \
+  --proxy http://127.0.0.1:11450 https://api.ipify.org
 sudo bin/sandboxctl doctor --json
 sudo bin/sandboxctl storage plan
-sudo bin/sandboxctl init --policy policies/strict/0002-claude-account.yaml
+HOST_BUILD_PROXY=http://127.0.0.1:11400  # 按本机实际构建代理修改
+export HTTP_PROXY="$HOST_BUILD_PROXY"
+export HTTPS_PROXY="$HTTP_PROXY"
+export NO_PROXY=127.0.0.1,localhost
 sudo -E bin/sandboxctl build
+unset HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy
+sudo bin/sandboxctl start
+sudo bin/sandboxctl verify-closed
+systemctl --user enable claude-sandbox-mihomo.service
+```
+
+`guard` 在父代理启动前安装并启用持久 nftables 门禁，此时 `11450` 只允许宿主回环访问；正式 `start` 才原子加入本实例 DNS 和网关的固定来源。这样首次部署也不会在两条命令之间向 LAN、外部或其他容器暴露代理。出口探测结果必须落在 `upstream.expected_exit_cidr` 内；固定出口填写精确 `/32`。`doctor` 任一 `blocked` 都要先修复。`init`、`guard`、`build`、`start` 和 `stop` 对同一实例互斥；运行中执行这些命令会直接拒绝，避免活动容器、门禁、`current` 清单和镜像标签分叉。
+
+基础镜像固定上游 digest，并由 `skopeo` 导入本机 Docker。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 同时核对源码、清单、策略、profile、镜像标签和 image ID。同一标签被重新构建成不同内容时会拒绝启动。构建阶段使用宿主网络；`sudo -E` 会把当前命令已有的标准代理变量临时交给 BuildKit，因此 `127.0.0.1` 上的宿主代理可直接使用。代理值不写入生成的 Compose、镜像或目标运行环境。容器启动后仍没有代理变量，运行流量只走 `11450`。
+
+`start` 会再次核对父代理门禁，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不发布端口，不挂 Docker socket；全部 GPU 可见但不设置独占模式。首次验收前不要配置 linger 或其他无人值守启动方式。
+
+### 更换父代理或固定出口
+
+父代理地址、端口和期望出口只属于运行配置，不属于目标或网关镜像。先保留旧配置并停止当前沙箱和旧父代理；确认两者都已停止后，再修改父代理私有配置与 `host.yaml`：
+
+```bash
+sudo bin/sandboxctl stop
+systemctl --user stop claude-sandbox-mihomo.service
+# 现在修改父代理私有配置和 host.yaml
+bin/sandboxctl config validate
+current_policy=policies/daily/0001-public-web.yaml  # 按当前策略修改
+sudo bin/sandboxctl init --policy "$current_policy"
+sudo bin/sandboxctl guard
+systemctl --user start claude-sandbox-mihomo.service
+curl --fail --silent --show-error \
+  --proxy http://127.0.0.1:11450 https://api.ipify.org
 sudo bin/sandboxctl start
 sudo bin/sandboxctl verify-closed
 ```
 
-`doctor` 任一 `blocked` 都要先修复。`init`、`build`、`start` 和 `stop` 对同一实例互斥；运行中执行 `init` 或 `build` 会直接拒绝，避免活动容器、`current` 清单和镜像标签分叉。
-
-基础镜像固定上游 digest，并由 `skopeo` 导入本机 Docker。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 同时核对源码、清单、策略、profile、镜像标签和 image ID。同一标签被重新构建成不同内容时会拒绝启动。构建时如需代理，只给当前构建命令设置 `HTTP_PROXY`/`HTTPS_PROXY`，这些变量不会写入目标运行环境。
-
-`start` 安装本实例的宿主 nftables 父代理门禁和 systemd 恢复单元，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不发布端口，不挂 Docker socket；全部 GPU 可见但不设置独占模式。
+不要为这类改动执行 `build`。只有 `start` 明确报告目标或网关镜像缺失、构建输入变化或内容摘要不符时，才在停止状态运行 `sudo -E bin/sandboxctl build`，然后重新启动。固定出口填精确 `/32`；启动时控制器会通过父代理查询公网地址，不匹配即拒绝启动。
 
 `verify-closed` 证明网络门禁和审计路径，不等于项目环境、Claude 登录或真实开发任务已经可用。新主机还要进入 shell 检查实际路径：
 

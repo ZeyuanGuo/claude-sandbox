@@ -1,0 +1,34 @@
+# Fill the placeholders in a private 0600 copy. Never commit real credentials.
+allow-lan: true
+bind-address: 0.0.0.0
+mode: rule
+log-level: info
+ipv6: false
+
+mixed-port: 11450
+
+proxies:
+  - name: commercial-first-hop
+    type: ss
+    server: commercial-vpn.example.com
+    port: 12345
+    cipher: aes-128-gcm
+    password: replace-commercial-password
+
+  - name: fixed-la-exit
+    type: http
+    server: los-angeles-http-proxy.example.com
+    port: 45495
+    username: replace-la-username
+    password: replace-la-password
+    tls: false
+    dialer-proxy: commercial-first-hop
+
+proxy-groups:
+  - name: sandbox-fixed-exit
+    type: select
+    proxies:
+      - fixed-la-exit
+
+rules:
+  - MATCH,sandbox-fixed-exit

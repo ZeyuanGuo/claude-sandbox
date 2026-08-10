@@ -13,6 +13,7 @@ import struct
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ _TCP_CLIENT_TIMEOUT_SECONDS = 2.0
 # three bounded pools below that limit even when all request types burst.
 _DNS_MAX_WORKERS = 48
 _LEASE_EXPIRY_GRACE_SECONDS = 60
+_DNS_CACHE_MAX_ENTRIES = 4096
 
 
 def public_address(value: str) -> str:
@@ -59,6 +61,13 @@ class _ResourceRecord:
     ttl: int
     payload_offset: int
     payload_end: int
+
+
+@dataclass(frozen=True)
+class _CachedResponse:
+    response: bytes
+    addresses: tuple[str, ...]
+    expires_at: float
 
 
 def checked_response(
@@ -369,6 +378,32 @@ def _servfail(query: bytes) -> bytes:
     return query[:2] + struct.pack("!HHHHH", flags, 1, 0, 0, 0) + query[12:end]
 
 
+def _cap_response_ttls(response: bytes, maximum: int) -> bytes:
+    """Cap cached response TTLs so the client cannot outlive its lease."""
+    if maximum < 0 or len(response) < _DNS_HEADER_SIZE:
+        raise ValueError("DNS 缓存 TTL 无效")
+    _, _, question_count, answer_count, authority_count, additional_count = struct.unpack(
+        "!HHHHHH", response[:_DNS_HEADER_SIZE]
+    )
+    if question_count != 1:
+        raise ValueError("DNS 缓存响应必须包含一个问题")
+    _, _, _, offset = _question(response)
+    capped = bytearray(response)
+    for _ in range(answer_count + authority_count + additional_count):
+        offset = _skip_name(response, offset)
+        if offset + 10 > len(response):
+            raise ValueError("DNS 缓存资源记录头被截断")
+        record_type, _, ttl, size = struct.unpack("!HHIH", response[offset : offset + 10])
+        if record_type != _TYPE_OPT:
+            capped[offset + 4 : offset + 8] = struct.pack("!I", min(ttl, maximum))
+        offset += 10 + size
+        if offset > len(response):
+            raise ValueError("DNS 缓存资源记录正文被截断")
+    if offset != len(response):
+        raise ValueError("DNS 缓存响应包含无法解释的尾部数据")
+    return bytes(capped)
+
+
 @dataclass(frozen=True)
 class DohEndpoint:
     proxy_host: str
@@ -390,7 +425,12 @@ class DohClient:
     def query(self, packet: bytes) -> tuple[bytes, dict[str, str]]:
         if len(packet) > _MAX_DNS_MESSAGE:
             raise ValueError("DNS 查询超过最大长度")
-        return self._query_once(packet)
+        try:
+            return self._query_once(packet)
+        except OSError:
+            # Retry only the same fixed DoH path. A cold double-hop tunnel may
+            # lose its first TLS handshake, but must never select another exit.
+            return self._query_once(packet)
 
     def _query_once(self, packet: bytes) -> tuple[bytes, dict[str, str]]:
         endpoint = self.endpoint
@@ -471,6 +511,8 @@ class LeaseRegistry:
         ttl: int,
         *,
         lease_id: str | None = None,
+        grace_seconds: int | None = None,
+        expires_at: float | None = None,
     ) -> str | None:
         if not addresses or ttl <= 0:
             return None
@@ -479,11 +521,15 @@ class LeaseRegistry:
             character not in "0123456789abcdef" for character in lease_id
         ):
             raise ValueError("DNS 租约编号无效")
-        expires_at = (
-            time.time()
-            + min(ttl, self.max_ttl_seconds)
-            + self.expiry_grace_seconds
-        )
+        now = time.time()
+        if expires_at is None:
+            if grace_seconds is None:
+                grace_seconds = self.expiry_grace_seconds
+            if grace_seconds < 0:
+                raise ValueError("DNS 租约宽限期无效")
+            expires_at = now + min(ttl, self.max_ttl_seconds) + grace_seconds
+        elif expires_at <= now:
+            return None
         with self._lock:
             self._purge_locked()
             for address in addresses:
@@ -544,6 +590,8 @@ class DnsGateway:
         self.allowed_suffix = tuple(allowed_suffix)
         self.allow_public_domains = allow_public_domains
         self._record_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._response_cache: OrderedDict[tuple[str, int], _CachedResponse] = OrderedDict()
 
     def resolve(self, packet: bytes, peer: str) -> bytes:
         record_written = False
@@ -567,28 +615,69 @@ class DnsGateway:
                 return response
             if not self._domain_allowed(name):
                 raise ValueError("DNS 域名未被当前策略放行")
-            response, headers = self.client.query(packet)
+            fallback = False
+            fallback_reason: str | None = None
+            try:
+                response, headers = self.client.query(packet)
+            except Exception as exc:
+                cached = self._cached_response(name, query_type)
+                if cached is None:
+                    raise
+                response = packet[:2] + cached.response[2:]
+                headers = {}
+                fallback = True
+                fallback_reason = f"{type(exc).__name__}: {exc}"
             _, _, addresses, ttl = checked_response(packet, response)
-            lease_id = uuid.uuid4().hex if addresses and ttl > 0 else None
+            if fallback:
+                fallback_ttl = int(cached.expires_at - time.time())
+                if fallback_ttl <= 0:
+                    raise OSError("DNS 缓存已到期")
+                response = _cap_response_ttls(response, 0)
+                _, _, addresses, ttl = checked_response(packet, response)
+                addresses = cached.addresses
+                lease_id = uuid.uuid4().hex
+            else:
+                fallback_ttl = ttl
+                self._cache_response(name, query_type, response, addresses, ttl)
+                lease_id = uuid.uuid4().hex if addresses and ttl > 0 else None
             record.update(
                 {
-                    "action": "allow",
+                    # The audit record is durable before the fallback lease is
+                    # granted.  It must not claim success if the cache expires
+                    # while fsync is still in progress.
+                    "action": "cached-pending" if fallback else "allow",
                     "addresses": list(addresses),
                     "effective_ttl": ttl,
-                    "lease_grace_seconds": self.lease_registry.expiry_grace_seconds,
+                    "lease_grace_seconds": (
+                        0 if fallback else self.lease_registry.expiry_grace_seconds
+                    ),
                     "lease_id": lease_id,
                     "response_b64": base64.b64encode(response).decode("ascii"),
                     "doh_cf_ray": headers.get("cf-ray"),
+                    **(
+                        {
+                            "fallback_reason": fallback_reason,
+                            "lease_expires_at": datetime.fromtimestamp(
+                                cached.expires_at, UTC
+                            ).isoformat(),
+                        }
+                        if fallback
+                        else {}
+                    ),
                 }
             )
             self._write_record(record)
-            record_written = True
-            self.lease_registry.grant(
+            granted = self.lease_registry.grant(
                 name,
                 addresses,
-                ttl,
+                fallback_ttl,
                 lease_id=lease_id,
+                grace_seconds=0 if fallback else None,
+                expires_at=cached.expires_at if fallback else None,
             )
+            if lease_id is not None and granted != lease_id:
+                raise OSError("DNS 缓存在审计完成前到期")
+            record_written = True
             return response
         except Exception as exc:
             record.update({"action": "servfail", "reason": str(exc)})
@@ -602,6 +691,52 @@ class DnsGateway:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+
+    def _cache_response(
+        self,
+        name: str,
+        query_type: int,
+        response: bytes,
+        addresses: tuple[str, ...],
+        ttl: int,
+    ) -> None:
+        if not addresses or ttl <= 0:
+            return
+        expiry = (
+            time.time()
+            + min(ttl, self.lease_registry.max_ttl_seconds)
+            + self.lease_registry.expiry_grace_seconds
+        )
+        with self._cache_lock:
+            self._purge_response_cache_locked(time.time())
+            key = (name, query_type)
+            self._response_cache.pop(key, None)
+            self._response_cache[key] = _CachedResponse(
+                response=response,
+                addresses=addresses,
+                expires_at=expiry,
+            )
+            while len(self._response_cache) > _DNS_CACHE_MAX_ENTRIES:
+                self._response_cache.popitem(last=False)
+
+    def _cached_response(
+        self, name: str, query_type: int
+    ) -> _CachedResponse | None:
+        with self._cache_lock:
+            self._purge_response_cache_locked(time.time())
+            key = (name, query_type)
+            cached = self._response_cache.pop(key, None)
+            if cached is None:
+                return None
+            self._response_cache[key] = cached
+            return cached
+
+    def _purge_response_cache_locked(self, now: float) -> None:
+        expired = [
+            key for key, cached in self._response_cache.items() if cached.expires_at <= now
+        ]
+        for key in expired:
+            self._response_cache.pop(key)
 
     def _domain_allowed(self, name: str) -> bool:
         if self.allow_public_domains or name in self.allowed_exact:

@@ -18,6 +18,7 @@ from controlled_dev_machine.policy import load_policy
 from controlled_dev_machine.runtime import (
     RuntimeManifest,
     _activate_generation,
+    _build_proxy_options,
     _check_upstream,
     _configure_host_parent_guard,
     _configure_infrastructure_network,
@@ -47,6 +48,7 @@ from controlled_dev_machine.runtime import (
     audit_status,
     compose_shell,
     compose_start_closed,
+    prepare_parent_guard,
     render_closed_compose,
 )
 
@@ -486,6 +488,37 @@ def test_target_dns_queries_only_reach_project_dns(tmp_path: Path) -> None:
     assert "canary_net" not in dns["networks"]
 
 
+def test_image_builds_use_host_network_without_persisting_proxy_values(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _host_config(tmp_path)
+    compose = render_closed_compose(config, _manifest(config, tmp_path))
+    assert compose["services"]["target"]["build"]["network"] == "host"
+    assert compose["services"]["gateway"]["build"]["network"] == "host"
+
+    for variable in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://user:secret@127.0.0.1:11430")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    options = _build_proxy_options()
+    assert options == (
+        "--build-arg",
+        "HTTP_PROXY",
+        "--build-arg",
+        "NO_PROXY",
+    )
+    assert "secret" not in " ".join(options)
+
+
 def test_project_path_is_identical_inside_and_outside(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
     compose = render_closed_compose(config, _manifest(config, tmp_path))
@@ -665,6 +698,32 @@ def test_repeated_start_exits_before_changing_host_state(
     with pytest.raises(DeploymentError, match="环境已经运行"):
         compose_start_closed(config)
     assert touched == []
+
+
+def test_prepare_parent_guard_installs_loopback_only_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    touched: list[str] = []
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._require_instance_stopped",
+        lambda _config, *, operation: touched.append(operation),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._install_host_parent_guard",
+        lambda _config, _manifest: touched.append("install"),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._configure_stopped_host_parent_guard",
+        lambda _config, _manifest: touched.append("loopback-only"),
+    )
+
+    prepare_parent_guard(config)
+
+    assert touched == ["guard", "install", "loopback-only"]
 
 
 def _audit_state() -> dict[str, object]:

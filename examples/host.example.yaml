@@ -32,7 +32,7 @@ storage:
 upstream:
   kind: http
   host: 127.0.0.1
-  port: 11440
+  port: 11450
   # 必填：固定出口填写实际公网 IP/32；地址池必须由供应商明确保证。
   expected_exit_cidr:
   # 只用于记录父代理配置来源；控制器不会启动或解析它。

@@ -21,8 +21,8 @@ sudo bin/sandboxctl verify-closed
 - 透明端口上的原始 TCP、请求 Upgrade、应用层 `CONNECT` 和上游 `101 Switching Protocols` 被阻断；
 - 策略摘要不一致时请求本地失败，网关变为不健康；
 - 先由网关健康检查发现审核目录不可写，再确认后续请求以 `review-unavailable` 在本地失败；
-- 策略故障请求对应的宿主 `11440` 短时 PCAP 为零包；
-- 目标容器的固定出口查询落在 `upstream.expected_exit_cidr` 内，且网关到 `11440` 的短时 PCAP 非零；
+- 策略故障请求对应的宿主父代理端口短时 PCAP 为零包；
+- 目标容器的固定出口查询落在 `upstream.expected_exit_cidr` 内，且网关到配置的父代理端口的短时 PCAP 非零；
 - 当前完整结果落盘到 `structured/RUN_ID/verify-closed.json`；
 - 内部 HTTP/HTTPS 请求先暂停，批准后正文哈希一致；
 - 拒绝和客户端断开不会到达 canary。

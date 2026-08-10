@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from controlled_dev_machine.config import (
     ConfigError,
@@ -213,6 +214,16 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
     output = tmp_path / "config" / "host.yaml"
     create_host_config(output)
     generated = output.read_text(encoding="utf-8")
+    generated_config = yaml.safe_load(generated)
+    assert generated_config["upstream"]["port"] == 11450
+    assert generated_config["storage"]["root"] == {
+        "min_free_gib": 50,
+        "min_free_percent": 5,
+    }
+    assert generated_config["storage"]["audit"] == {
+        "min_free_gib": 200,
+        "min_free_percent": 10,
+    }
     assert "expected_exit_cidr: null" in generated
     output.write_text(
         generated.replace("expected_exit_cidr: null", "expected_exit_cidr: 8.8.8.8/32"),

@@ -527,3 +527,199 @@ def test_dns_log_records_the_effective_lease_ttl(tmp_path) -> None:
     assert record["effective_ttl"] == 60
     assert record["lease_grace_seconds"] == 60
     assert record["lease_id"]
+
+
+def test_doh_client_retries_once_on_transient_fixed_path_failure(monkeypatch) -> None:
+    client = DohClient(
+        DohEndpoint(
+            proxy_host="proxy.test",
+            proxy_port=11450,
+            address="1.1.1.1",
+            server_name="cloudflare-dns.com",
+            path="/dns-query",
+        )
+    )
+    attempts = 0
+
+    def query_once(packet: bytes):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("cold tunnel handshake timed out")
+        return packet, {}
+
+    monkeypatch.setattr(client, "_query_once", query_once)
+    assert client.query(b"query") == (b"query", {})
+    assert attempts == 2
+
+
+def test_dns_cached_fallback_cannot_outlive_the_validated_lease(monkeypatch, tmp_path) -> None:
+    now = 1000.0
+    monkeypatch.setattr("controlled_dev_machine.dns_gateway.time.time", lambda: now)
+    first_query, first_response = _response("93.184.216.34")
+
+    class Client:
+        calls = 0
+
+        def query(self, packet: bytes):
+            self.calls += 1
+            if self.calls == 1:
+                assert packet == first_query
+                return first_response, {}
+            raise OSError("temporary DoH failure")
+
+    record_path = tmp_path / "dns.jsonl"
+    registry = LeaseRegistry(max_ttl_seconds=300, expiry_grace_seconds=60)
+    gateway = DnsGateway(
+        Client(),  # type: ignore[arg-type]
+        record_path,
+        lease_registry=registry,
+        allow_public_domains=True,
+    )
+
+    assert gateway.resolve(first_query, "192.0.2.10") == first_response
+    now = 1090.0
+    retry_query = b"\x56\x78" + first_query[2:]
+    cached = gateway.resolve(retry_query, "192.0.2.10")
+    assert cached[:2] == retry_query[:2]
+    assert checked_response(retry_query, cached)[2:] == (("93.184.216.34",), 0)
+    assert registry.authorize("example.com", "93.184.216.34") is not None
+    records = [json.loads(line) for line in record_path.read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["action"] == "cached-pending"
+    assert records[-1]["effective_ttl"] == 0
+    assert records[-1]["lease_grace_seconds"] == 0
+    assert records[-1]["fallback_reason"] == "OSError: temporary DoH failure"
+    assert records[-1]["lease_expires_at"] == "1970-01-01T00:18:40+00:00"
+
+    now = 1121.0
+    expired = gateway.resolve(retry_query, "192.0.2.10")
+    assert struct.unpack("!H", expired[2:4])[0] & 0x000F == 2
+    assert registry.authorize("example.com", "93.184.216.34") is None
+
+
+def test_dns_cached_fallback_rejects_subsecond_remaining_lease(monkeypatch, tmp_path) -> None:
+    now = 1000.0
+    monkeypatch.setattr("controlled_dev_machine.dns_gateway.time.time", lambda: now)
+    query, response = _response("93.184.216.34")
+
+    class Client:
+        calls = 0
+
+        def query(self, _packet: bytes):
+            self.calls += 1
+            if self.calls == 1:
+                return response, {}
+            raise OSError("temporary DoH failure")
+
+    gateway = DnsGateway(
+        Client(),  # type: ignore[arg-type]
+        tmp_path / "dns.jsonl",
+        allow_public_domains=True,
+    )
+    assert gateway.resolve(query, "192.0.2.10") == response
+
+    now = 1119.5
+    fallback = gateway.resolve(query, "192.0.2.10")
+    assert struct.unpack("!H", fallback[2:4])[0] & 0x000F == 2
+
+
+def test_dns_response_cache_is_bounded_and_purges_expired_entries(monkeypatch, tmp_path) -> None:
+    now = 1000.0
+    monkeypatch.setattr("controlled_dev_machine.dns_gateway.time.time", lambda: now)
+    monkeypatch.setattr("controlled_dev_machine.dns_gateway._DNS_CACHE_MAX_ENTRIES", 2)
+    registry = LeaseRegistry(expiry_grace_seconds=0)
+    gateway = DnsGateway(
+        object(),  # type: ignore[arg-type]
+        tmp_path / "dns.jsonl",
+        lease_registry=registry,
+    )
+
+    gateway._cache_response("first.example", 1, b"first", ("1.1.1.1",), 60)
+    gateway._cache_response("second.example", 1, b"second", ("8.8.8.8",), 1)
+    gateway._cache_response("third.example", 1, b"third", ("9.9.9.9",), 60)
+    assert gateway._cached_response("first.example", 1) is None
+    assert len(gateway._response_cache) == 2
+
+    now = 1002.0
+    gateway._cache_response("fourth.example", 1, b"fourth", ("1.0.0.1",), 60)
+    assert gateway._cached_response("second.example", 1) is None
+    assert len(gateway._response_cache) == 2
+
+
+def test_dns_cached_fallback_ttl_stays_zero_across_slow_audit(monkeypatch, tmp_path) -> None:
+    now = 1000.0
+    monkeypatch.setattr("controlled_dev_machine.dns_gateway.time.time", lambda: now)
+    query, response = _response("93.184.216.34")
+
+    class Client:
+        calls = 0
+
+        def query(self, _packet: bytes):
+            self.calls += 1
+            if self.calls == 1:
+                return response, {}
+            raise OSError("temporary DoH failure")
+
+    registry = LeaseRegistry(expiry_grace_seconds=60)
+    gateway = DnsGateway(
+        Client(),  # type: ignore[arg-type]
+        tmp_path / "dns.jsonl",
+        lease_registry=registry,
+        allow_public_domains=True,
+    )
+    assert gateway.resolve(query, "192.0.2.10") == response
+    original_write = gateway._write_record
+
+    def slow_write(record):
+        nonlocal now
+        original_write(record)
+        now += 2.0
+
+    monkeypatch.setattr(gateway, "_write_record", slow_write)
+    now = 1110.0
+    fallback = gateway.resolve(query, "192.0.2.10")
+    assert checked_response(query, fallback)[3] == 0
+    assert registry.authorize("example.com", "93.184.216.34") is not None
+
+    now = 1120.0
+    assert registry.authorize("example.com", "93.184.216.34") is None
+
+
+def test_dns_expired_during_audit_never_records_cached_allow(monkeypatch, tmp_path) -> None:
+    now = 1000.0
+    monkeypatch.setattr("controlled_dev_machine.dns_gateway.time.time", lambda: now)
+    query, response = _response("93.184.216.34")
+
+    class Client:
+        calls = 0
+
+        def query(self, _packet: bytes):
+            self.calls += 1
+            if self.calls == 1:
+                return response, {}
+            raise OSError("temporary DoH failure")
+
+    record_path = tmp_path / "dns.jsonl"
+    gateway = DnsGateway(
+        Client(),  # type: ignore[arg-type]
+        record_path,
+        lease_registry=LeaseRegistry(expiry_grace_seconds=0),
+        allow_public_domains=True,
+    )
+    assert gateway.resolve(query, "192.0.2.10") == response
+    original_write = gateway._write_record
+
+    def slow_write(record):
+        nonlocal now
+        original_write(record)
+        if record["action"] == "cached-pending":
+            now += 3.0
+
+    monkeypatch.setattr(gateway, "_write_record", slow_write)
+    now = 1058.0
+    failed = gateway.resolve(query, "192.0.2.10")
+    assert struct.unpack("!H", failed[2:4])[0] & 0x000F == 2
+    records = [json.loads(line) for line in record_path.read_text(encoding="utf-8").splitlines()]
+    assert records[-2]["action"] == "cached-pending"
+    assert records[-1]["action"] == "servfail"
+    assert all(record["action"] != "cached-allow" for record in records)

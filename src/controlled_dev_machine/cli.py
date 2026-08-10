@@ -24,6 +24,7 @@ from controlled_dev_machine.runtime import (
     compose_start_closed,
     compose_status,
     compose_stop,
+    prepare_parent_guard,
     prepare_runtime,
 )
 from controlled_dev_machine.session_migration import import_claude_session
@@ -52,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="要部署的 strict 或 daily 策略快照",
     )
     subparsers.add_parser("build", help="构建固定版本的目标和网关镜像")
+    subparsers.add_parser("guard", help="在启动父代理前安装仅回环可访问的宿主门禁")
     subparsers.add_parser("start", help="启动当前受控环境")
     subparsers.add_parser("stop", help="停止本实例，不删除持久状态")
     subparsers.add_parser("status", help="显示本实例容器状态")
@@ -167,6 +169,11 @@ def _run(args: argparse.Namespace) -> int:
     if args.command == "build":
         compose_build(config)
         print("目标镜像和策略网关镜像构建完成")
+        return 0
+
+    if args.command == "guard":
+        prepare_parent_guard(config)
+        print("父代理门禁已安装；当前只允许宿主回环访问")
         return 0
 
     if args.command == "start":

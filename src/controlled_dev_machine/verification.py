@@ -968,13 +968,13 @@ def _run_public_web_via_parent(
                 "--show-error",
                 "--fail-with-body",
                 "--connect-timeout",
-                "4",
+                "16",
                 "--max-time",
-                "12",
+                "24",
                 "https://api.ipify.org/",
             ],
         )
-        stdout, stderr = _communicate(process, 14)
+        stdout, stderr = _communicate(process, 26)
         if process.returncode != 0:
             raise DeploymentError(
                 f"目标容器透明 Web 出口查询失败: {stderr.strip() or stdout.strip()}"
