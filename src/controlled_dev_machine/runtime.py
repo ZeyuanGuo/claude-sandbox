@@ -2930,8 +2930,6 @@ def _load_existing_manifest(
     schema_version = raw.get("schema_version")
     if schema_version not in {1, 2, 3, 4}:
         raise DeploymentError(f"不支持迁移运行清单 schema_version={schema_version}")
-    if path == current_path and schema_version == 4:
-        return load_runtime(config)
     try:
         if raw.get("resource_prefix") != config.resource_prefix:
             raise ValueError

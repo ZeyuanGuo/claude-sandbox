@@ -1,7 +1,7 @@
 import json
 import os
 import subprocess
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +31,7 @@ from controlled_dev_machine.runtime import (
     _host_password_hash,
     _legacy_compose_path_for_stop,
     _lifecycle_lock,
+    _load_existing_manifest,
     _pin_built_images,
     _prepare_directories,
     _profile_bundle,
@@ -353,6 +354,25 @@ def test_claude_edits_do_not_invalidate_profile_integrity(tmp_path: Path) -> Non
     digest = _profile_integrity_digest(files)
     files["CLAUDE.md"] = "edited in the container\n"
     assert _profile_integrity_digest(files) == digest
+
+
+def test_init_can_reuse_allocation_after_profile_digest_change(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    manifest = replace(_manifest(config, tmp_path), profile_digest="legacy-digest")
+    current = config.paths.state / "generated" / "current"
+    current.mkdir(parents=True)
+    (current / "runtime.json").write_text(
+        json.dumps(asdict(manifest)),
+        encoding="utf-8",
+    )
+
+    allocation = _load_existing_manifest(config)
+
+    assert allocation is not None
+    assert allocation.created_at == manifest.created_at
+    assert allocation.target_subnet == manifest.target_subnet
+    assert allocation.canary_subnet == manifest.canary_subnet
+    assert allocation.upstream_subnet == manifest.upstream_subnet
 
 
 def test_host_profile_is_merged_without_overriding_sandbox_network(
