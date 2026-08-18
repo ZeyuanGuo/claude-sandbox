@@ -22,11 +22,11 @@
 
 ## 宿主配置与工具同步
 
-容器的整个目标用户 Home 使用宿主固定目录 `~/.local/share/controlled-dev-machine/home` 的读写 bind mount；不使用 Docker anonymous volume 或临时存储。因此容器内 `~/.claude`、会话数据库、history、memory、插件状态和账号状态都能直接在宿主对应目录中备份、迁移或重新挂载。生成的 `CLAUDE.md`、`.bashrc` 和 `.gitconfig` 是只读受控副本，会覆盖 Home 中同名路径，但不会覆盖其余 Claude 状态。
+容器的整个目标用户 Home 使用宿主固定目录 `~/.local/share/controlled-dev-machine/home` 的读写 bind mount；不使用 Docker anonymous volume 或临时存储。因此容器内 `~/.claude`、会话数据库、history、memory、插件状态和账号状态都能直接在宿主对应目录中备份、迁移或重新挂载。全局 `CLAUDE.md` 由仓库配置和宿主提示词生成初始内容，但现在以读写方式挂入容器；`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 仍是只读受控副本。
 
 `host.yaml` 在每次 `init` 时同步下面的行为配置：
 
-- 宿主 `~/.claude/CLAUDE.md` 与沙箱网络约束合并，作为容器只读全局提示词；
+- 宿主 `~/.claude/CLAUDE.md` 与仓库中的沙箱网络约束合并，作为容器可编辑的全局提示词初始内容；
 - 宿主 `.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 生成受控副本；
 - `~/.claude/skills`、`~/.claude/agents` 和 `~/.agents/skills` 读写同路径挂载，便于容器内安装或更新技能与 agent；
 - 目标镜像固定安装 Codex CLI；整棵宿主 `~/.codex` 以同路径读写挂载，因此 Codex 的配置、登录状态、会话和 skills 与宿主共用；
@@ -35,7 +35,9 @@
 
 本机同时用 `profile.conda_root` 声明 `~/miniconda3`。其他服务器可以使用不同 Conda 根目录；未声明时只采用该服务器 `.bashrc` 已初始化的环境，不猜测安装位置。
 
-生成器保留宿主 alias、Conda、NVM 等 shell 行为，但会在最后清除大小写代理变量、Git 代理和专用 CA 路径。网关根证书合入系统、Conda OpenSSL 和 certifi 的标准信任文件，Node 使用系统 CA。profile 源必须位于用户 Home、由该用户拥有且不是符号链接。宿主 profile 变化后必须重新执行 `init`；运行清单保存源摘要和生成结果摘要，旧 profile 不会被静默当成当前配置。
+生成器保留宿主 alias、Conda、NVM 等 shell 行为，但会在最后清除大小写代理变量、Git 代理和专用 CA 路径。网关根证书合入系统、Conda OpenSSL 和 certifi 的标准信任文件，Node 使用系统 CA。profile 源必须位于用户 Home、由该用户拥有且不是符号链接。宿主 profile 变化后必须重新执行 `init`；运行清单保存宿主源摘要和不可编辑 profile 文件摘要，容器内编辑 `CLAUDE.md` 不会被误判为运行文件损坏，并会保留到下一次 `init`。
+
+容器内可以直接编辑 `~/.claude/CLAUDE.md`。它是提示词和工作约定，不是网络强制边界；网络控制仍由网关、DNS、nftables 和审计链路执行。重新执行 `init` 会用仓库配置和宿主 `~/.claude/CLAUDE.md` 重新生成初始版本，因此要把稳定的通用修改纳入发布时，应审阅后更新仓库的 `config/claude/CLAUDE.md` 并提交，而不要把运行时生成目录直接提交。
 
 没有同步整个宿主 `.claude`。沙箱单独保存 Claude 的提供方、账号状态、设备标识和会话历史。此前 API-key 基线使用一个固定模型；私有别名不进入发布仓库，旧结果只作为历史基线。
 

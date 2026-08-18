@@ -44,6 +44,7 @@ _GATEWAY_UID = 1000
 _GATEWAY_GID = 1000
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _LIFECYCLE_LOCK_ROOT = Path("/run/controlled-dev-machine-locks")
+_MUTABLE_PROFILE_FILES = frozenset({"CLAUDE.md"})
 _BUILD_PROXY_VARIABLES = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -366,6 +367,17 @@ def _profile_digest(files: dict[str, str]) -> str:
     return digest.hexdigest()
 
 
+def _profile_integrity_digest(files: dict[str, str]) -> str:
+    """Hash generated profile files that the target is not allowed to edit."""
+    return _profile_digest(
+        {
+            name: content
+            for name, content in files.items()
+            if name not in _MUTABLE_PROFILE_FILES
+        }
+    )
+
+
 def _profile_directory_digest(path: Path) -> str:
     if path.is_symlink() or not path.is_dir():
         raise DeploymentError(f"运行 profile 缺失或类型异常: {path}")
@@ -377,7 +389,7 @@ def _profile_directory_digest(path: Path) -> str:
             files[item.name] = item.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise DeploymentError(f"无法读取运行 profile: {item}") from exc
-    return _profile_digest(files)
+    return _profile_integrity_digest(files)
 
 
 def _host_password_hash(
@@ -475,7 +487,7 @@ def prepare_runtime(
     gateway_build_digest = _gateway_build_digest(root)
     target_build_digest = _target_build_digest(config, root)
     profile_files, profile_source_digest = _profile_bundle(config, root)
-    profile_digest = _profile_digest(profile_files)
+    profile_digest = _profile_integrity_digest(profile_files)
     generated = config.paths.state / "generated"
     generation_root = generated / "generations"
     generation_name = (
@@ -526,6 +538,15 @@ def prepare_runtime(
         os.chown(generation_profile, 0, 0)
         for name, content in profile_files.items():
             _atomic_text(generation_profile / name, content, mode=0o644)
+            if name in _MUTABLE_PROFILE_FILES:
+                # Claude's global instructions are user-editable state. Keep
+                # the generated seed, but let the target user persist edits
+                # in the active generation across container restarts.
+                os.chown(
+                    generation_profile / name,
+                    config.target.uid,
+                    config.target.gid,
+                )
         _atomic_text(
             generation_resolver,
             _target_resolver_content(manifest),
@@ -596,7 +617,11 @@ def render_closed_compose(
         for item in config.mounts
     ]
     profile_mounts = [
-        _bind(profile / "CLAUDE.md", config.target.home / ".claude/CLAUDE.md"),
+        _bind(
+            profile / "CLAUDE.md",
+            config.target.home / ".claude/CLAUDE.md",
+            read_only=False,
+        ),
         _bind(profile / ".bashrc", config.target.home / ".bashrc"),
         _bind(profile / ".profile", config.target.home / ".profile"),
     ]

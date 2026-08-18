@@ -34,6 +34,7 @@ from controlled_dev_machine.runtime import (
     _pin_built_images,
     _prepare_directories,
     _profile_bundle,
+    _profile_integrity_digest,
     _require_deployable_policy,
     _require_gateway_image,
     _require_instance_stopped,
@@ -333,7 +334,7 @@ def test_gateway_is_lazy_and_records_plaintext(tmp_path: Path) -> None:
     assert gateway["healthcheck"]["start_period"] == "20s"
 
 
-def test_claude_runtime_instructions_are_read_only(tmp_path: Path) -> None:
+def test_claude_runtime_instructions_are_writable(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
     compose = render_closed_compose(config, _manifest(config, tmp_path))
     target = compose["services"]["target"]
@@ -341,7 +342,17 @@ def test_claude_runtime_instructions_are_read_only(tmp_path: Path) -> None:
         item for item in target["volumes"] if item["target"].endswith("/.claude/CLAUDE.md")
     )
     assert instruction["source"].endswith("/generated/current/profile/CLAUDE.md")
-    assert instruction["read_only"] is True
+    assert instruction["read_only"] is False
+
+
+def test_claude_edits_do_not_invalidate_profile_integrity(tmp_path: Path) -> None:
+    files = {
+        "CLAUDE.md": "seed\n",
+        ".bashrc": "shell\n",
+    }
+    digest = _profile_integrity_digest(files)
+    files["CLAUDE.md"] = "edited in the container\n"
+    assert _profile_integrity_digest(files) == digest
 
 
 def test_host_profile_is_merged_without_overriding_sandbox_network(

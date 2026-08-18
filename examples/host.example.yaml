@@ -39,7 +39,8 @@ upstream:
   config_path:
 
 # 可选：每次 init 从本机读取这些文本配置，生成受控副本。
-# Claude 提示词会与沙箱网络约束合并；shell 和 Git 配置中的代理会被清除。
+# Claude 提示词会与沙箱网络约束合并，并以读写方式挂入容器，便于在容器内持续编辑；
+# shell 和 Git 配置中的代理会被清除。
 # default_conda_env 是本机选择，不应在通用代码中写死。
 profile:
   # IANA 时区；按本机出口环境填写，发布默认不携带地域信息。

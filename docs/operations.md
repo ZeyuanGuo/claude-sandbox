@@ -96,7 +96,7 @@ bin/sandboxctl config init
 | `~/.ssh` | 同路径 | 只读 | 日常 SSH 配置和密钥 |
 | `~/.condarc` | 同路径 | 读写 | Conda 配置 |
 
-`.claude/CLAUDE.md`、`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 不直接覆盖容器文件，而是由 `init` 生成受控副本并挂入目标 Home；Claude 会话数据库和其他状态留在持久 Home。项目目录、Conda 根目录和其他大型数据目录属于主机特定配置，由操作者在 `host.yaml` 中追加。
+`.claude/CLAUDE.md`、`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 不直接覆盖容器文件，而是由 `init` 生成受控副本并挂入目标 Home；其中全局 `CLAUDE.md` 以读写方式挂入，容器内的编辑会保留到下一次 `init`，其他几个文件仍为只读。Claude 会话数据库和其他状态留在持久 Home。项目目录、Conda 根目录和其他大型数据目录属于主机特定配置，由操作者在 `host.yaml` 中追加。
 
 然后编辑 `~/.config/controlled-dev-machine/host.yaml`：
 
