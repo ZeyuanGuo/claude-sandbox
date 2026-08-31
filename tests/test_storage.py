@@ -59,8 +59,8 @@ def _run_id(when: datetime, suffix: str = "a") -> str:
 
 def test_rotate_audit_deletes_only_expired_closed_data(tmp_path: Path, monkeypatch) -> None:
     config = _config(tmp_path)
-    monkeypatch.setattr("controlled_dev_machine.storage.os.geteuid", lambda: 0)
-    monkeypatch.setattr("controlled_dev_machine.storage._ROTATION_LOCK_ROOT", tmp_path / "locks")
+    monkeypatch.setattr("controlled_dev_machine.storage._geteuid", lambda: 0)
+    monkeypatch.setattr("controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", tmp_path / "locks")
     now = datetime(2026, 9, 1, tzinfo=UTC)
     old_run = _run_id(now - timedelta(hours=100))
     active_run = _run_id(now - timedelta(hours=100), suffix="b")
@@ -114,8 +114,8 @@ def test_rotate_audit_fails_closed_when_active_state_is_missing_and_container_ru
     tmp_path: Path, monkeypatch
 ) -> None:
     config = _config(tmp_path)
-    monkeypatch.setattr("controlled_dev_machine.storage.os.geteuid", lambda: 0)
-    monkeypatch.setattr("controlled_dev_machine.storage._ROTATION_LOCK_ROOT", tmp_path / "locks")
+    monkeypatch.setattr("controlled_dev_machine.storage._geteuid", lambda: 0)
+    monkeypatch.setattr("controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", tmp_path / "locks")
     monkeypatch.setattr("controlled_dev_machine.storage._project_running", lambda _config: True)
 
     with pytest.raises(DeploymentError, match="缺少审计运行清单"):
@@ -124,7 +124,7 @@ def test_rotate_audit_fails_closed_when_active_state_is_missing_and_container_ru
 
 def test_rotate_audit_requires_root(tmp_path: Path, monkeypatch) -> None:
     config = _config(tmp_path)
-    monkeypatch.setattr("controlled_dev_machine.storage.os.geteuid", lambda: 1000)
+    monkeypatch.setattr("controlled_dev_machine.storage._geteuid", lambda: 1000)
 
     with pytest.raises(DeploymentError, match="需要宿主提权"):
         rotate_audit(config)

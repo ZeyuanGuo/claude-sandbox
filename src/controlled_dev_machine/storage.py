@@ -7,10 +7,12 @@ import shutil
 import subprocess
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from os import geteuid as _geteuid
 from pathlib import Path
 
 from controlled_dev_machine.config import HostConfig, StorageThreshold
 from controlled_dev_machine.errors import DeploymentError
+from controlled_dev_machine.runtime import _lifecycle_lock
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,6 @@ class RotationResult:
 
 _RUN_ID_RE = re.compile(r"^(\d{8}T\d{6}\.\d{6}Z)-[0-9a-f]{8}$")
 _ARCHIVE_NAME_RE = re.compile(r"^(\d{8}T\d{6}\.\d{6}Z)-[0-9a-f]{16}\.mitm$")
-_ROTATION_LOCK_ROOT = Path("/run/controlled-dev-machine-locks")
 
 
 def build_storage_report(config: HostConfig) -> StorageReport:
@@ -135,7 +136,7 @@ def _existing_ancestor(path: Path) -> Path:
 
 def rotate_audit(config: HostConfig, *, now: datetime | None = None) -> RotationResult:
     """Delete only closed, expired audit artifacts owned by this instance."""
-    if os.geteuid() != 0:
+    if _geteuid() != 0:
         raise DeploymentError("审计轮转需要宿主提权")
     audit = config.paths.audit
     pcap_root = audit / "pcap"
@@ -146,10 +147,7 @@ def rotate_audit(config: HostConfig, *, now: datetime | None = None) -> Rotation
             raise DeploymentError(f"审计目录类型异常，拒绝清理: {root}")
 
     active_run_id = _active_run_id(config)
-    lock_path = _rotation_lock_path(config)
-    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="ascii") as handle:
-        _lock_exclusive(handle)
+    with _lifecycle_lock(config):
         current = now or datetime.now(UTC)
         deleted: list[dict[str, object]] = []
         skipped: list[dict[str, object]] = []
@@ -303,13 +301,3 @@ def _tree_size(root: Path) -> int:
             except OSError as exc:
                 raise DeploymentError(f"无法读取审计对象大小，拒绝清理: {path}") from exc
     return total
-
-
-def _rotation_lock_path(config: HostConfig) -> Path:
-    return _ROTATION_LOCK_ROOT / f"u{config.target.uid}-storage-rotate.lock"
-
-
-def _lock_exclusive(handle: object) -> None:
-    import fcntl
-
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
