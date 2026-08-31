@@ -127,12 +127,13 @@ sudo sandboxctl status
 sudo sandboxctl shell
 sudo sandboxctl root-shell
 sudo sandboxctl storage plan
+sudo sandboxctl automation install
 sudo sandboxctl audit status
 sudo sandboxctl doctor
 sudo sandboxctl verify-closed
 ```
 
-自动化的 `policy set`、存储清理执行、上游切换和 `target test claude-code` 仍属于后续实现，不把规划入口当成当前可用命令。策略切换目前使用 `stop -> init --policy -> build -> start -> verify-closed`。Claude Code 的历史 API-key 基线已完成严格逐请求发现，并在本机日常策略下通过自动与人工真实任务；公开仓库只提供脱敏后的通用策略。
+自动化的 `policy set`、上游切换和 `target test claude-code` 仍属于后续实现；`storage rotate` 和 `automation install` 已提供，但需在首次验收后安装，且当前只启用不立即启动。策略切换目前使用 `stop -> init --policy -> build -> start -> verify-closed`。Claude Code 的历史 API-key 基线已完成严格逐请求发现，并在本机日常策略下通过自动与人工真实任务；公开仓库只提供脱敏后的通用策略。
 
 `root-shell` 内部使用 `docker exec --user root`。宿主密码明文不进入脚本、配置、镜像或日志；`init` 会读取宿主密码哈希并通过 root-only 运行文件配置容器内 `sudo`。命令只能管理本用户登记的容器、网络和 cgroup；发现目标落到其他范围时必须拒绝执行。
 
@@ -161,7 +162,7 @@ sudo sandboxctl verify-closed
 - 实现 `sandboxctl doctor`、配置校验、计划预览和资源归属检查。
 - 每次 root 操作先解析准确对象，再限制到本用户的容器、网络接口、nftables 表和状态目录。
 - 不执行全局 `iptables -F`、`nft flush ruleset`、`docker system prune`、GPU 模式修改或不带范围的进程终止。
-- 空间不足时只生成定向清理计划。执行命令必须引用这份不可修改的计划，并再次检查路径归属；共享 Docker 对象和其他用户内容只能报告，不能自动删除。
+- 空间不足时先生成定向清理计划；自动轮转只删除本项目中已结束且超过保留期的审计对象，并再次检查路径归属。共享 Docker 对象和其他用户内容只能报告，不能自动删除。
 - 所有创建动作可重复执行；部分失败时回到网络全断状态。
 
 产物：CLI 骨架、配置解析、dry-run 输出、操作审计。
@@ -225,12 +226,12 @@ sudo sandboxctl verify-closed
 
 工作：
 
-- 使用宿主 `nsenter + tcpdump` 在目标和网关网络命名空间保存独立 PCAP；用目标 cgroup 范围的 bpftrace 记录进程执行、连接参数和返回值。tcpdump 通过宿主 root 预打开的 `0600` 文件描述符写入，目标容器不能改写证据。
+- 使用宿主 `nsenter + tcpdump` 在目标和网关网络命名空间保存独立 PCAP；用目标 cgroup 范围的 bpftrace 记录进程执行、连接参数和返回值。tcpdump 由宿主 root 启动，并按 `pcap_roll_size_mib`、`pcap_roll_files` 写入有界循环文件；目标容器不能改写证据。
 - 对实际发现的 OpenSSL 文件、Go ELF 或其他实现逐个启用并验证 eBPF；不使用无 cgroup 限制的全主机捕获。若工具只支持精确 cgroup ID，就跟踪所有实际子 cgroup，不能把父 cgroup 当作自动覆盖整棵子树。
 - 代理保存普通 TLS 请求明文和响应元数据；响应正文专项捕获、eBPF、会话密钥和应用 hook 只作为交叉验证或特殊路径补充。
 - 在 connect/sendmsg 时记录 socket、五元组和进程，再与实际出站包关联；包事件本身不能可靠提供当前进程时，不用猜测 PID。
 - 为每条连接生成统一编号，关联运行编号、策略版本、进程、可执行文件哈希、DNS、代理 flow ID、目标侧 PCAP、出口侧 PCAP 和明文。
-- 完整 PCAP 与明文默认保留 72 小时，结构化记录保留 30 天。PCAP 的 100 GiB 硬上限是所有运行和所有抓包点的合计；明文初始硬上限为 50 GiB，结构化记录初始硬上限为 10 GiB。审计分区默认保留线为 `max(200 GiB, 容量的 10%)`。达到任一硬上限或保留线时停止联网，不能静默提前删除未到期证据。写盘失败、丢包、丢事件或截断时先断网，再暂停目标容器、报警并保留现场。
+- PCAP 和明文归档默认保留 72 小时，结构化记录保留 30 天；PCAP 运行期间还受 `pcap_roll_size_mib`、`pcap_roll_files` 的循环文件上限约束。PCAP 的 100 GiB、明文 50 GiB、结构化记录 10 GiB 是启动前预算检查，审计分区默认保留线为 `max(200 GiB, 容量的 10%)`。`storage rotate` 定时删除已结束且过期的本项目对象；达到硬上限时自动停止联网、写盘失败/丢包/丢事件时暂停目标的持续联锁仍需在重启后的真实运行中验证。
 - 原始明文目录 root-only；普通报告隐藏令牌、Cookie、OAuth 代码和认证头。
 
 产物：审计目录、统一事件格式、轮转规则、脱敏报告和故障监控。

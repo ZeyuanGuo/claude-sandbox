@@ -22,24 +22,25 @@
 
 ## 宿主配置与工具同步
 
-容器的整个目标用户 Home 使用宿主固定目录 `~/.local/share/controlled-dev-machine/home` 的读写 bind mount；不使用 Docker anonymous volume 或临时存储。因此容器内 `~/.claude`、会话数据库、history、memory、插件状态和账号状态都能直接在宿主对应目录中备份、迁移或重新挂载。全局 `CLAUDE.md` 由仓库配置和宿主提示词生成初始内容，但现在以读写方式挂入容器；`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 仍是只读受控副本。
+容器的整个目标用户 Home 使用宿主固定目录 `~/.local/share/controlled-dev-machine/home` 的读写 bind mount；不使用 Docker anonymous volume 或临时存储。因此容器内 `~/.claude` 的会话数据库、history、memory、插件状态和账号状态可以在宿主持久目录中备份。共享行为配置另从宿主 `~/claude_code_config` 分项读写挂载，不把整棵宿主默认 `~/.claude` 交给容器。
 
-`host.yaml` 在每次 `init` 时同步下面的行为配置：
+`host.yaml` 按下面的边界同步行为配置：
 
-- 宿主 `~/.claude/CLAUDE.md` 与仓库中的沙箱网络约束合并，作为容器可编辑的全局提示词初始内容；
+- 宿主 `~/claude_code_config/CLAUDE.md` 直接读写挂载到容器 `~/.claude/CLAUDE.md`；仓库文件只在 `config init` 首次创建该文件时提供初始内容；
+- `~/claude_code_config/settings.json`、`rules`、`skills` 和 `agents` 分别读写挂载到容器 `~/.claude` 下的对应路径；
 - 宿主 `.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 生成受控副本；
-- `~/.claude/skills`、`~/.claude/agents` 和 `~/.agents/skills` 读写同路径挂载，便于容器内安装或更新技能与 agent；
+- `~/.agents/skills` 继续读写同路径挂载；
 - 目标镜像固定安装 Codex CLI；整棵宿主 `~/.codex` 以同路径读写挂载，因此 Codex 的配置、登录状态、会话和 skills 与宿主共用；
 - Git 直接使用宿主 `~/.config/git` 读写目录，Conda 配置直接使用宿主 `.condarc` 读写；SSH 仍使用宿主 `.ssh` 只读目录，避免改写关键私钥；
 - 主机选择的 Conda 根目录以相同绝对路径读写挂载，默认环境由 `profile.default_conda_env` 指定。
 
 本机同时用 `profile.conda_root` 声明 `~/miniconda3`。其他服务器可以使用不同 Conda 根目录；未声明时只采用该服务器 `.bashrc` 已初始化的环境，不猜测安装位置。
 
-生成器保留宿主 alias、Conda、NVM 等 shell 行为，但会在最后清除大小写代理变量、Git 代理和专用 CA 路径。网关根证书合入系统、Conda OpenSSL 和 certifi 的标准信任文件，Node 使用系统 CA。profile 源必须位于用户 Home、由该用户拥有且不是符号链接。宿主 profile 变化后必须重新执行 `init`；运行清单保存宿主源摘要和不可编辑 profile 文件摘要，容器内编辑 `CLAUDE.md` 不会被误判为运行文件损坏，并会保留到下一次 `init`。
+生成器保留宿主 alias、Conda、NVM 等 shell 行为，但会在最后清除大小写代理变量、Git 代理和专用 CA 路径。网关根证书合入系统、Conda OpenSSL 和 certifi 的标准信任文件，Node 使用系统 CA。profile 源必须位于用户 Home、由该用户拥有且不是符号链接。shell、Git 和 tmux 的宿主 profile 变化后必须重新执行 `init`；Claude 共享行为配置使用直接读写挂载，不经过运行代际复制。
 
-容器内可以直接编辑 `~/.claude/CLAUDE.md`。它是提示词和工作约定，不是网络强制边界；网络控制仍由网关、DNS、nftables 和审计链路执行。重新执行 `init` 会用仓库配置和宿主 `~/.claude/CLAUDE.md` 重新生成初始版本，因此要把稳定的通用修改纳入发布时，应审阅后更新仓库的 `config/claude/CLAUDE.md` 并提交，而不要把运行时生成目录直接提交。
+容器内可以直接编辑 `~/.claude/CLAUDE.md`，修改会立即反映到宿主 `~/claude_code_config/CLAUDE.md`。它是提示词和工作约定，不是网络强制边界；网络控制仍由网关、DNS、nftables 和审计链路执行。重新执行 `init` 不覆盖已有共享配置。
 
-没有同步整个宿主 `.claude`。沙箱单独保存 Claude 的提供方、账号状态、设备标识和会话历史。此前 API-key 基线使用一个固定模型；私有别名不进入发布仓库，旧结果只作为历史基线。
+宿主默认 `~/.claude` 不作为共享入口。沙箱单独保存 Claude 的提供方、账号状态、设备标识、会话历史和插件状态；宿主未设置 `CLAUDE_CONFIG_DIR` 时，直接运行 Claude Code 不会自动发现 `~/claude_code_config`。当前共享目录通过文件/目录级挂载提供读写；工具采用临时文件替换或整个目录替换时，需重新核对宿主与容器路径是否仍指向同一对象。此前 API-key 基线使用一个固定模型；私有别名不进入发布仓库，旧结果只作为历史基线。
 
 Codex CLI `0.147.0` 在目标镜像中固定；首次使用仍需在容器中完成自己的登录。登录凭据不进入镜像或仓库，而是写入宿主 `~/.codex`，并通过整棵目录挂载到容器。Codex 的本地命令沙箱配置也随该目录共享；外部网络仍由本项目透明网关控制。
 
@@ -210,9 +211,9 @@ sudo bin/sandboxctl status
 | 证据 | 用途 |
 |---|---|
 | `plaintext/flows.mitm` | HTTP/HTTPS 请求正文、双向头字段、响应状态和传输结果；不缓存响应正文 |
-| `pcap/RUN_ID/target.pcap` | 目标容器实际产生的数据包 |
-| `pcap/RUN_ID/dns.pcap` | 受控 DNS 到目标和父代理的数据包 |
-| `pcap/RUN_ID/gateway.pcap` | 网关到父代理方向的数据包 |
+| `pcap/RUN_ID/target.pcap*` | 目标容器实际产生的数据包；按主机配置循环覆盖 |
+| `pcap/RUN_ID/dns.pcap*` | 受控 DNS 到目标和父代理的数据包；按主机配置循环覆盖 |
+| `pcap/RUN_ID/gateway.pcap*` | 网关到父代理方向的数据包；按主机配置循环覆盖 |
 | `structured/RUN_ID/connect.log` | 目标 cgroup 中的进程执行和连接结果 |
 | `runtime/dns/queries.jsonl` | DNS 原文、解析地址、租约和 DoH 出口标记 |
 

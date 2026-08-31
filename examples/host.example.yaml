@@ -28,6 +28,13 @@ storage:
   pcap_limit_gib: 100
   plaintext_limit_gib: 50
   structured_limit_gib: 10
+  # 自动轮转只删除已结束且超过保留期的本项目审计数据。
+  pcap_retention_hours: 72
+  plaintext_retention_hours: 72
+  structured_retention_days: 30
+  # 每个长期抓包点的有界环形文件预算：4 个文件，tcpdump 每个约 67 MB（配置为 64 MiB）。
+  pcap_roll_size_mib: 64
+  pcap_roll_files: 4
 
 upstream:
   kind: http
@@ -38,14 +45,13 @@ upstream:
   # 只用于记录父代理配置来源；控制器不会启动或解析它。
   config_path:
 
-# 可选：每次 init 从本机读取这些文本配置，生成受控副本。
-# Claude 提示词会与沙箱网络约束合并，并以读写方式挂入容器，便于在容器内持续编辑；
-# shell 和 Git 配置中的代理会被清除。
+# 可选：Claude 提示词从宿主独立目录直接读写挂载。
+# shell 和 Git 配置仍由 init 生成受控副本，其中的代理会被清除。
 # default_conda_env 是本机选择，不应在通用代码中写死。
 profile:
   # IANA 时区；按本机出口环境填写，发布默认不携带地域信息。
   timezone: UTC
-  claude_instructions:
+  claude_instructions: ~/claude_code_config/CLAUDE.md
   bashrc:
   login_profile:
   gitconfig:
@@ -59,10 +65,16 @@ mounts: []
 #   - host_path: ~/project
 #     container_path: /home/alice/project
 #     access: rw
-#   - host_path: ~/.claude/skills
+#   - host_path: ~/claude_code_config/settings.json
+#     container_path: /home/alice/.claude/settings.json
+#     access: rw
+#   - host_path: ~/claude_code_config/rules
+#     container_path: /home/alice/.claude/rules
+#     access: rw
+#   - host_path: ~/claude_code_config/skills
 #     container_path: /home/alice/.claude/skills
 #     access: rw
-#   - host_path: ~/.claude/agents
+#   - host_path: ~/claude_code_config/agents
 #     container_path: /home/alice/.claude/agents
 #     access: rw
 #   - host_path: ~/.agents/skills

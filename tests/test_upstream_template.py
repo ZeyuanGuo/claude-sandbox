@@ -38,6 +38,6 @@ def test_mihomo_user_service_uses_persistent_user_paths() -> None:
     ) in unit
     assert "ExecStart=%h/.local/share/claude-sandbox/mihomo/mihomo" in unit
     assert "-f %h/.config/claude-sandbox/mihomo-11450.yaml" in unit
-    assert "Restart=on-failure" in unit
+    assert "Restart=always" in unit
     assert "WantedBy=default.target" in unit
     assert "DIRECT" not in unit

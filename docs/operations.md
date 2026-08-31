@@ -84,19 +84,23 @@ cd "$HOME/claude-sandbox"
 bin/sandboxctl config init
 ```
 
-`config init` 从实际系统账号填写用户名、UID、GID 和 Home，拒绝覆盖已有文件。它会自动创建 `~/.codex`（不存在时）并以读写方式挂载整棵目录；Codex CLI 随目标镜像安装，首次登录后状态直接保存在宿主该目录。它还会在源文件安全且实际存在时接入常用 shell/Git/tmux/Claude 文本配置，并同路径挂载现有 Claude skills、agents、`~/.config/git`、`~/.ssh` 和 `~/.condarc`。Git、skills、agents 和 Conda 配置读写，以支持日常同步；只有 SSH 关键凭据保持只读。它不会挂载整棵宿主 `~/.claude`，Claude 的账号、会话和设备状态保留在沙箱持久 Home。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
+`config init` 从实际系统账号填写用户名、UID、GID 和 Home，拒绝覆盖已有文件。它创建宿主 `~/claude_code_config`，以仓库中的 `config/claude/CLAUDE.md` 初始化全局提示词，并创建设置、规则、skills 和 agents 的独立入口；这些项目分别读写挂载到容器 `~/.claude` 下。它不会创建或挂载宿主 `~/.claude`，Claude 的账号、会话、历史、插件和设备状态只保留在沙箱持久 Home。
+
+生成器还会自动创建 `~/.codex`（不存在时）并以读写方式挂载整棵目录；Codex CLI 首次登录后的状态直接保存在宿主该目录。它在源文件安全且实际存在时接入常用 shell、Git、tmux、`~/.agents/skills`、`~/.config/git`、`~/.ssh` 和 `~/.condarc`。Git、skills、agents 和 Conda 配置读写；只有 SSH 关键凭据保持只读。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
 
 默认通用挂载由仓库中的 `config init` 固定生成；只有源路径实际存在时才加入：
 
 | 宿主路径 | 容器路径 | 权限 | 用途 |
 |---|---|---|---|
+| `~/claude_code_config/CLAUDE.md` | `~/.claude/CLAUDE.md` | 读写 | Claude 全局提示词 |
+| `~/claude_code_config/settings.json`、`rules`、`skills`、`agents` | `~/.claude` 下对应路径 | 读写 | Claude 的共享行为配置 |
 | `~/.codex` | 同路径 | 读写 | Codex 配置、登录状态、会话和 skills |
-| `~/.claude/skills`、`~/.claude/agents`、`~/.agents/skills` | 同路径 | 读写 | Claude/Codex 可见的通用 skills 与 agents |
+| `~/.agents/skills` | 同路径 | 读写 | Codex 可见的通用 skills |
 | `~/.config/git` | 同路径 | 读写 | Git 凭据存储和配置数据库 |
 | `~/.ssh` | 同路径 | 只读 | 日常 SSH 配置和密钥 |
 | `~/.condarc` | 同路径 | 读写 | Conda 配置 |
 
-`.claude/CLAUDE.md`、`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 不直接覆盖容器文件，而是由 `init` 生成受控副本并挂入目标 Home；其中全局 `CLAUDE.md` 以读写方式挂入，容器内的编辑会保留到下一次 `init`，其他几个文件仍为只读。Claude 会话数据库和其他状态留在持久 Home。项目目录、Conda 根目录和其他大型数据目录属于主机特定配置，由操作者在 `host.yaml` 中追加。
+`CLAUDE.md` 和上表中的 Claude 行为配置直接读写同步；`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 仍由 `init` 生成受控只读副本。宿主不设置 `CLAUDE_CONFIG_DIR`，默认 `~/.claude` 也不作为挂载源，所以宿主直接运行 Claude Code 时不会自动读取容器配置。Claude 凭据、会话数据库和其他运行状态留在持久 Home。项目目录、Conda 根目录和其他大型数据目录属于主机特定配置，由操作者在 `host.yaml` 中追加。
 
 然后编辑 `~/.config/controlled-dev-machine/host.yaml`：
 
@@ -160,13 +164,23 @@ unset HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy
 sudo bin/sandboxctl start
 sudo bin/sandboxctl verify-closed
 systemctl --user enable claude-sandbox-mihomo.service
+sudo bin/sandboxctl automation install
 ```
 
 `guard` 在父代理启动前安装并启用持久 nftables 门禁，此时 `11450` 只允许宿主回环访问；正式 `start` 才原子加入本实例 DNS 和网关的固定来源。这样首次部署也不会在两条命令之间向 LAN、外部或其他容器暴露代理。出口探测结果必须落在 `upstream.expected_exit_cidr` 内；固定出口填写精确 `/32`。`doctor` 任一 `blocked` 都要先修复。`init`、`guard`、`build`、`start` 和 `stop` 对同一实例互斥；运行中执行这些命令会直接拒绝，避免活动容器、门禁、`current` 清单和镜像标签分叉。
 
 基础镜像固定上游 digest，并由 `skopeo` 导入本机 Docker。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 同时核对源码、清单、策略、profile、镜像标签和 image ID。同一标签被重新构建成不同内容时会拒绝启动。构建阶段使用宿主网络；`sudo -E` 会把当前命令已有的标准代理变量临时交给 BuildKit，因此 `127.0.0.1` 上的宿主代理可直接使用。代理值不写入生成的 Compose、镜像或目标运行环境。容器启动后仍没有代理变量，运行流量只走 `11450`。
 
-`start` 会再次核对父代理门禁，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不发布端口，不挂 Docker socket；全部 GPU 可见但不设置独占模式。首次验收前不要配置 linger 或其他无人值守启动方式。
+`start` 会再次核对父代理门禁，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不发布端口，不挂 Docker socket；全部 GPU 可见但不设置独占模式。canary CA 和服务端证书有效期为 30 天；每次 `start` 在证书剩余有效期不足 7 天时先原子更新，再启动容器。
+
+只有首次 `verify-closed` 和实际开发环境检查均通过后才运行 `automation install`。该命令写入并启用本实例的 systemd 自动启动单元和审计轮转定时器，但不会立即启动或重启任何服务。下次开机时，系统级单元先恢复用户服务、检查父代理，再调用现有的 `start`；任一前置检查失败都会停止启动。轮转定时器每 15 分钟调用一次 `storage rotate`。安装后可只读检查配置，不要在生产中的实例上手动启动这些单元：
+
+```bash
+systemctl is-enabled cdm-u$(id -u)-main.service \
+  cdm-u$(id -u)-main-audit-rotate.timer
+systemctl status cdm-u$(id -u)-main.service \
+  cdm-u$(id -u)-main-audit-rotate.timer --no-pager
+```
 
 ### 更换父代理或固定出口
 

@@ -54,7 +54,7 @@ Web 路径：
 - 每次成功解析先同步保存审计记录，再签发 `(域名, IP, TTL, 租约编号)`。TTL 取完整 CNAME 链和终端地址记录中的最小值；实时 DoH 新响应自身的 TTL 为 0 时只返回 DNS 答案、不签出站租约。为兼容应用略长于 DNS TTL 的本地缓存，同一域名和同一已验证公网 IP 在 TTL 后还有 60 秒连接宽限；未解析过的新 IP 没有宽限。现有客户端连接复用同一目标时也不因 TTL 到期抖动；切换 IP、端口或主机名仍重新核验。
 - `canary.test` 是封闭门禁的本地静态记录，不发往公网。
 
-目标不使用 Docker 内置的 `127.0.0.11` 转发，避免 Docker 内置解析器在短 TTL 或双栈查询时把上游瞬时失败转换成 `SERVFAIL`。只读挂载的解析文件由每次 generation 根据固定目标网段生成；DNS 原始请求和响应保存在 `runtime/dns/queries.jsonl`，实际数据包保存在运行编号下的 `dns.pcap`。
+目标不使用 Docker 内置的 `127.0.0.11` 转发，避免 Docker 内置解析器在短 TTL 或双栈查询时把上游瞬时失败转换成 `SERVFAIL`。只读挂载的解析文件由每次 generation 根据固定目标网段生成；DNS 原始请求和响应保存在 `runtime/dns/queries.jsonl`，实际数据包保存在运行编号下的 `dns.pcap*` 循环文件中。
 
 ## Web 策略
 

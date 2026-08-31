@@ -55,6 +55,8 @@ _BUILD_PROXY_VARIABLES = (
     "all_proxy",
     "no_proxy",
 )
+_CANARY_CERT_VALIDITY_DAYS = 30
+_CANARY_CERT_REFRESH_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -103,7 +105,6 @@ def _gateway_build_digest(root: Path) -> str:
         root / "images/gateway/Dockerfile",
         root / "gateway/mitmproxy/cdm_addon.py",
         root / "gateway/mitmproxy/entrypoint.sh",
-        root / "config/claude/CLAUDE.md",
         root / "src/controlled_dev_machine/connect.bt",
         *sorted((root / "src").rglob("*.py")),
     ]
@@ -189,7 +190,6 @@ def _profile_bundle(
     config: HostConfig, root: Path
 ) -> tuple[dict[str, str], str]:
     source_paths = {
-        "claude_instructions": config.profile.claude_instructions,
         "bashrc": config.profile.bashrc,
         "login_profile": config.profile.login_profile,
         "gitconfig": config.profile.gitconfig,
@@ -197,6 +197,8 @@ def _profile_bundle(
     }
     sources: dict[str, str] = {}
     source_digest = hashlib.sha256()
+    if config.profile.claude_instructions is not None:
+        _read_profile_source(config, config.profile.claude_instructions)
     for name, path in source_paths.items():
         source_digest.update(name.encode("utf-8") + b"\0")
         if path is None:
@@ -207,21 +209,11 @@ def _profile_bundle(
         source_digest.update(str(path).encode("utf-8") + b"\0")
         source_digest.update(content.encode("utf-8") + b"\0")
 
-    controlled_path = root / "config/claude/CLAUDE.md"
-    if controlled_path.is_symlink() or not controlled_path.is_file():
-        raise DeploymentError(f"沙箱 Claude 约束文件缺失: {controlled_path}")
-    controlled = controlled_path.read_text(encoding="utf-8").rstrip()
-    source_digest.update(b"controlled_claude\0")
-    source_digest.update(controlled.encode("utf-8") + b"\0")
     environment = config.profile.default_conda_env or ""
     source_digest.update(b"default_conda_env\0" + environment.encode("utf-8") + b"\0")
     conda_root = str(config.profile.conda_root or "")
     source_digest.update(b"conda_root\0" + conda_root.encode("utf-8") + b"\0")
 
-    host_instructions = sources.get("claude_instructions", "").rstrip()
-    instructions = (
-        f"{host_instructions}\n\n{controlled}\n" if host_instructions else f"{controlled}\n"
-    )
     bashrc = sources.get("bashrc", "").rstrip()
     bashrc = _network_neutral_shell(bashrc)
     if bashrc:
@@ -276,7 +268,6 @@ unset REQUESTS_CA_BUNDLE SSL_CERT_FILE
 unset -f proxy_on proxy_off 2>/dev/null || true
 """
     files = {
-        "CLAUDE.md": instructions,
         ".bashrc": bashrc,
         ".profile": login_profile,
     }
@@ -368,7 +359,7 @@ def _profile_digest(files: dict[str, str]) -> str:
 
 
 def _profile_integrity_digest(files: dict[str, str]) -> str:
-    """Hash generated profile files that the target is not allowed to edit."""
+    """Hash profile files whose contents are controlled by the runtime."""
     return _profile_digest(
         {
             name: content
@@ -538,15 +529,6 @@ def prepare_runtime(
         os.chown(generation_profile, 0, 0)
         for name, content in profile_files.items():
             _atomic_text(generation_profile / name, content, mode=0o644)
-            if name in _MUTABLE_PROFILE_FILES:
-                # Claude's global instructions are user-editable state. Keep
-                # the generated seed, but let the target user persist edits
-                # in the active generation across container restarts.
-                os.chown(
-                    generation_profile / name,
-                    config.target.uid,
-                    config.target.gid,
-                )
         _atomic_text(
             generation_resolver,
             _target_resolver_content(manifest),
@@ -617,14 +599,17 @@ def render_closed_compose(
         for item in config.mounts
     ]
     profile_mounts = [
-        _bind(
-            profile / "CLAUDE.md",
-            config.target.home / ".claude/CLAUDE.md",
-            read_only=False,
-        ),
         _bind(profile / ".bashrc", config.target.home / ".bashrc"),
         _bind(profile / ".profile", config.target.home / ".profile"),
     ]
+    if config.profile.claude_instructions is not None:
+        profile_mounts.append(
+            _bind(
+                config.profile.claude_instructions,
+                config.target.home / ".claude/CLAUDE.md",
+                read_only=False,
+            )
+        )
     if config.profile.gitconfig is not None:
         profile_mounts.append(
             _bind(profile / ".gitconfig", config.target.home / ".gitconfig")
@@ -993,6 +978,8 @@ def compose_start_closed(config: HostConfig, *, timeout_seconds: int = 90) -> No
     _check_gpu_cdi(config)
     if _service_container_id(config, manifest, "target"):
         raise DeploymentError("环境已经运行；配置变更时先执行 sandboxctl stop")
+    _ensure_canary_certificates(config)
+    _ensure_upstream_trust_bundle(config)
     _install_host_parent_guard(config, manifest)
     _configure_stopped_host_parent_guard(config, manifest)
     observed_upstream_ip = _check_upstream(config)
@@ -1315,7 +1302,11 @@ def _require_deployable_policy(policy: PolicySnapshot) -> None:
 def _ensure_canary_certificates(config: HostConfig) -> None:
     canary = config.paths.state / "canary"
     expected = (canary / "ca.key", canary / "ca.crt", canary / "server.key", canary / "server.crt")
-    if all(path.is_file() for path in expected):
+    refresh_seconds = _CANARY_CERT_REFRESH_DAYS * 24 * 60 * 60
+    if all(path.is_file() for path in expected) and all(
+        _certificate_valid_for(path, refresh_seconds)
+        for path in (canary / "ca.crt", canary / "server.crt")
+    ):
         return
     with tempfile.TemporaryDirectory(prefix="cert-build-", dir=canary) as temp_text:
         temp = Path(temp_text)
@@ -1328,7 +1319,7 @@ def _ensure_canary_certificates(config: HostConfig) -> None:
                 "rsa:3072",
                 "-sha256",
                 "-days",
-                "30",
+                str(_CANARY_CERT_VALIDITY_DAYS),
                 "-nodes",
                 "-subj",
                 "/CN=CDM Canary Test CA",
@@ -1379,7 +1370,7 @@ def _ensure_canary_certificates(config: HostConfig) -> None:
                 str(temp / "ca.key"),
                 "-CAcreateserial",
                 "-days",
-                "30",
+                str(_CANARY_CERT_VALIDITY_DAYS),
                 "-sha256",
                 "-extfile",
                 str(extensions),
@@ -1391,6 +1382,15 @@ def _ensure_canary_certificates(config: HostConfig) -> None:
             destination = canary / name
             os.replace(temp / name, destination)
             os.chmod(destination, 0o600 if name.endswith(".key") else 0o644)
+
+
+def _certificate_valid_for(path: Path, seconds: int) -> bool:
+    result = _run(
+        ["openssl", "x509", "-checkend", str(seconds), "-noout", "-in", str(path)],
+        check=False,
+        capture=True,
+    )
+    return result.returncode == 0
 
 
 def _ensure_target_trust_bundle(config: HostConfig, manifest: RuntimeManifest) -> None:
@@ -2293,78 +2293,21 @@ def _start_audit(
     commands = (
         (
             "target-pcap",
-            [
-                "nsenter",
-                "--target",
-                str(target_pid),
-                "--net",
-                "--",
-                "tcpdump",
-                "-i",
-                "any",
-                "-U",
-                "-s",
-                "0",
-                "-B",
-                "4096",
-                "-nn",
-                "-Z",
-                "root",
-                "-w",
-                "-",
-            ],
+            _pcap_command(config, target_pid, pcap_root / "target.pcap"),
             pcap_root / "target.tcpdump.log",
-            pcap_root / "target.pcap",
+            None,
         ),
         (
             "gateway-pcap",
-            [
-                "nsenter",
-                "--target",
-                str(gateway_pid),
-                "--net",
-                "--",
-                "tcpdump",
-                "-i",
-                "any",
-                "-U",
-                "-s",
-                "0",
-                "-B",
-                "4096",
-                "-nn",
-                "-Z",
-                "root",
-                "-w",
-                "-",
-            ],
+            _pcap_command(config, gateway_pid, pcap_root / "gateway.pcap"),
             pcap_root / "gateway.tcpdump.log",
-            pcap_root / "gateway.pcap",
+            None,
         ),
         (
             "dns-pcap",
-            [
-                "nsenter",
-                "--target",
-                str(dns_pid),
-                "--net",
-                "--",
-                "tcpdump",
-                "-i",
-                "any",
-                "-U",
-                "-s",
-                "0",
-                "-B",
-                "4096",
-                "-nn",
-                "-Z",
-                "root",
-                "-w",
-                "-",
-            ],
+            _pcap_command(config, dns_pid, pcap_root / "dns.pcap"),
             pcap_root / "dns.tcpdump.log",
-            pcap_root / "dns.pcap",
+            None,
         ),
         (
             "target-connect-ebpf",
@@ -2557,6 +2500,38 @@ def _start_audit(
         state["entries"] = started
         _write_audit_state(config, state)
         raise
+
+
+def _pcap_command(config: HostConfig, pid: int, output: Path) -> list[str]:
+    return [
+        "nsenter",
+        "--target",
+        str(pid),
+        "--net",
+        "--",
+        "tcpdump",
+        "-i",
+        "any",
+        "-U",
+        "-s",
+        "0",
+        "-B",
+        "4096",
+        "-nn",
+        "-Z",
+        "root",
+        "-C",
+        str(_pcap_roll_size_million_bytes(config.storage.pcap_roll_size_mib)),
+        "-W",
+        str(config.storage.pcap_roll_files),
+        "-w",
+        str(output),
+    ]
+
+
+def _pcap_roll_size_million_bytes(size_mib: int) -> int:
+    """tcpdump -C uses decimal megabytes; keep the configured MiB budget close."""
+    return max(1, size_mib * 1024**2 // 1_000_000)
 
 
 def _stop_audit(config: HostConfig) -> None:

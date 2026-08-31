@@ -64,6 +64,11 @@ class StorageConfig:
     pcap_limit_gib: float
     plaintext_limit_gib: float
     structured_limit_gib: float
+    pcap_retention_hours: float
+    plaintext_retention_hours: float
+    structured_retention_days: float
+    pcap_roll_size_mib: int
+    pcap_roll_files: int
 
 
 @dataclass(frozen=True)
@@ -147,8 +152,58 @@ def create_host_config(path: Path) -> None:
     account = invoking_account()
     home = Path(account.pw_dir)
 
+    claude_config = home / "claude_code_config"
+    if claude_config.is_symlink():
+        try:
+            resolved = claude_config.resolve(strict=True)
+            allowed = (home / ".local/share/controlled-dev-machine/home").resolve(
+                strict=True
+            ) / "claude_code_config"
+        except OSError as exc:
+            raise ConfigError(f"Claude 配置目录类型异常: {claude_config}") from exc
+        if resolved != allowed or not resolved.is_dir():
+            raise ConfigError(f"Claude 配置目录类型异常: {claude_config}")
+    elif claude_config.exists() and not claude_config.is_dir():
+        raise ConfigError(f"Claude 配置目录类型异常: {claude_config}")
+    claude_config.mkdir(mode=0o700, exist_ok=True)
+    for directory in ("rules", "skills", "agents"):
+        child = claude_config / directory
+        if child.is_symlink():
+            if directory != "rules":
+                raise ConfigError(f"Claude 配置目录类型异常: {child}")
+            try:
+                resolved_child = child.resolve(strict=True)
+                expected_child = (
+                    home / ".local/share/controlled-dev-machine/home/.claude/rules"
+                ).resolve(strict=True)
+            except OSError as exc:
+                raise ConfigError(f"Claude 配置目录类型异常: {child}") from exc
+            if resolved_child != expected_child or not resolved_child.is_dir():
+                raise ConfigError(f"Claude 配置目录类型异常: {child}")
+            continue
+        if child.exists() and not child.is_dir():
+            raise ConfigError(f"Claude 配置目录类型异常: {child}")
+        child.mkdir(mode=0o700, exist_ok=True)
+    claude_instructions = claude_config / "CLAUDE.md"
+    if claude_instructions.is_symlink() or (
+        claude_instructions.exists() and not claude_instructions.is_file()
+    ):
+        raise ConfigError(f"Claude 配置文件类型异常: {claude_instructions}")
+    if not claude_instructions.exists():
+        seed = (
+            Path(__file__).resolve().parents[2] / "config" / "claude" / "CLAUDE.md"
+        )
+        claude_instructions.write_text(seed.read_text(encoding="utf-8"), encoding="utf-8")
+    claude_settings = claude_config / "settings.json"
+    if claude_settings.is_symlink() or (
+        claude_settings.exists() and not claude_settings.is_file()
+    ):
+        raise ConfigError(f"Claude 配置文件类型异常: {claude_settings}")
+    if not claude_settings.exists():
+        claude_settings.write_text("{}\n", encoding="utf-8")
+
     profile_candidates = {
-        "claude_instructions": home / ".claude" / "CLAUDE.md",
+        "claude_instructions": claude_instructions,
         "bashrc": home / ".bashrc",
         "login_profile": home / ".profile",
         "gitconfig": home / ".gitconfig",
@@ -169,22 +224,36 @@ def create_host_config(path: Path) -> None:
         codex_home.mkdir(mode=0o700)
 
     mounts = []
-    for relative, access in (
-        (".claude/skills", "rw"),
-        (".claude/agents", "rw"),
-        (".agents/skills", "rw"),
-        (".codex", "rw"),
-        (".config/git", "rw"),
-        (".ssh", "ro"),
-        (".condarc", "rw"),
+    for host_relative, container_relative, access in (
+        ("claude_code_config/settings.json", ".claude/settings.json", "rw"),
+        ("claude_code_config/rules", ".claude/rules", "rw"),
+        ("claude_code_config/skills", ".claude/skills", "rw"),
+        ("claude_code_config/agents", ".claude/agents", "rw"),
+        (".agents/skills", ".agents/skills", "rw"),
+        (".codex", ".codex", "rw"),
+        (".config/git", ".config/git", "rw"),
+        (".ssh", ".ssh", "ro"),
+        (".condarc", ".condarc", "rw"),
     ):
-        source = home / relative
-        if source.is_symlink() or not (source.is_file() or source.is_dir()):
+        source = home / host_relative
+        if source.is_symlink():
+            if host_relative != "claude_code_config/rules":
+                continue
+            try:
+                resolved_source = source.resolve(strict=True)
+                expected_source = (
+                    home / ".local/share/controlled-dev-machine/home/.claude/rules"
+                ).resolve(strict=True)
+            except OSError:
+                continue
+            if resolved_source != expected_source:
+                continue
+        if not (source.is_file() or source.is_dir()):
             continue
         mounts.append(
             {
-                "host_path": f"~/{relative}",
-                "container_path": str(home / relative),
+                "host_path": f"~/{host_relative}",
+                "container_path": str(home / container_relative),
                 "access": access,
             }
         )
@@ -211,6 +280,11 @@ def create_host_config(path: Path) -> None:
             "pcap_limit_gib": 100,
             "plaintext_limit_gib": 50,
             "structured_limit_gib": 10,
+            "pcap_retention_hours": 72,
+            "plaintext_retention_hours": 72,
+            "structured_retention_days": 30,
+            "pcap_roll_size_mib": 64,
+            "pcap_roll_files": 4,
         },
         "upstream": {
             "kind": "http",
@@ -308,6 +382,26 @@ def load_host_config(path: Path) -> HostConfig:
         ),
         structured_limit_gib=_positive_number(
             storage_raw.get("structured_limit_gib"), "storage.structured_limit_gib"
+        ),
+        pcap_retention_hours=_positive_number(
+            storage_raw.get("pcap_retention_hours", 72),
+            "storage.pcap_retention_hours",
+        ),
+        plaintext_retention_hours=_positive_number(
+            storage_raw.get("plaintext_retention_hours", 72),
+            "storage.plaintext_retention_hours",
+        ),
+        structured_retention_days=_positive_number(
+            storage_raw.get("structured_retention_days", 30),
+            "storage.structured_retention_days",
+        ),
+        pcap_roll_size_mib=_positive_int(
+            storage_raw.get("pcap_roll_size_mib", 64),
+            "storage.pcap_roll_size_mib",
+        ),
+        pcap_roll_files=_positive_int(
+            storage_raw.get("pcap_roll_files", 4),
+            "storage.pcap_roll_files",
         ),
     )
 
@@ -435,6 +529,12 @@ def _positive_number(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
         raise ConfigError(f"{name} 必须是正数")
     return float(value)
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"{name} 必须是正整数")
+    return value
 
 
 def _absolute_path(value: Any, name: str) -> Path:

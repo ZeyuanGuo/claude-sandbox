@@ -32,9 +32,12 @@ from controlled_dev_machine.runtime import (
     _legacy_compose_path_for_stop,
     _lifecycle_lock,
     _load_existing_manifest,
+    _pcap_command,
+    _pcap_roll_size_million_bytes,
     _pin_built_images,
     _prepare_directories,
     _profile_bundle,
+    _profile_directory_digest,
     _profile_integrity_digest,
     _require_deployable_policy,
     _require_gateway_image,
@@ -335,25 +338,69 @@ def test_gateway_is_lazy_and_records_plaintext(tmp_path: Path) -> None:
     assert gateway["healthcheck"]["start_period"] == "20s"
 
 
-def test_claude_runtime_instructions_are_writable(tmp_path: Path) -> None:
+def test_claude_runtime_instructions_use_direct_writable_mount(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
+    instructions = config.target.home / "claude_code_config" / "CLAUDE.md"
+    instructions.parent.mkdir()
+    instructions.write_text("Use Chinese.\n", encoding="utf-8")
+    config = replace(
+        config,
+        profile=replace(config.profile, claude_instructions=instructions),
+    )
     compose = render_closed_compose(config, _manifest(config, tmp_path))
     target = compose["services"]["target"]
     instruction = next(
         item for item in target["volumes"] if item["target"].endswith("/.claude/CLAUDE.md")
     )
-    assert instruction["source"].endswith("/generated/current/profile/CLAUDE.md")
+    assert instruction["source"] == str(instructions)
     assert instruction["read_only"] is False
 
 
-def test_claude_edits_do_not_invalidate_profile_integrity(tmp_path: Path) -> None:
-    files = {
-        "CLAUDE.md": "seed\n",
-        ".bashrc": "shell\n",
-    }
-    digest = _profile_integrity_digest(files)
-    files["CLAUDE.md"] = "edited in the container\n"
-    assert _profile_integrity_digest(files) == digest
+def test_claude_edits_do_not_change_generated_profile_digest(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    config = replace(
+        config,
+        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+    )
+    instructions = config.target.home / "claude_code_config" / "CLAUDE.md"
+    instructions.parent.mkdir()
+    instructions.write_text("seed\n", encoding="utf-8")
+    config = replace(
+        config,
+        profile=replace(config.profile, claude_instructions=instructions),
+    )
+
+    files_before, digest_before = _profile_bundle(config, Path.cwd())
+    instructions.write_text("edited in the container\n", encoding="utf-8")
+    files_after, digest_after = _profile_bundle(config, Path.cwd())
+
+    assert files_before == files_after
+    assert digest_before == digest_after
+
+
+def test_profile_directory_digest_keeps_legacy_mutable_prompt_compatibility(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / ".bashrc").write_text("shell\n", encoding="utf-8")
+    (profile / ".profile").write_text("login\n", encoding="utf-8")
+    prompt = profile / "CLAUDE.md"
+    prompt.write_text("old prompt\n", encoding="utf-8")
+
+    assert _profile_directory_digest(profile) == _profile_integrity_digest(
+        {
+            ".bashrc": "shell\n",
+            ".profile": "login\n",
+            "CLAUDE.md": "old prompt\n",
+        }
+    )
+    first = _profile_directory_digest(profile)
+    prompt.write_text("edited prompt\n", encoding="utf-8")
+    assert _profile_directory_digest(profile) == first
+
+    (profile / ".bashrc").write_text("changed shell\n", encoding="utf-8")
+    assert _profile_directory_digest(profile) != first
 
 
 def test_init_can_reuse_allocation_after_profile_digest_change(tmp_path: Path) -> None:
@@ -375,7 +422,7 @@ def test_init_can_reuse_allocation_after_profile_digest_change(tmp_path: Path) -
     assert allocation.upstream_subnet == manifest.upstream_subnet
 
 
-def test_host_profile_is_merged_without_overriding_sandbox_network(
+def test_host_profile_uses_direct_claude_mount_and_neutral_shell(
     tmp_path: Path,
 ) -> None:
     config = _host_config(tmp_path)
@@ -383,7 +430,7 @@ def test_host_profile_is_merged_without_overriding_sandbox_network(
         config,
         target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
     )
-    host_prompt = config.target.home / ".claude" / "CLAUDE.md"
+    host_prompt = config.target.home / "claude_code_config" / "CLAUDE.md"
     host_prompt.parent.mkdir()
     host_bashrc = config.target.home / ".bashrc"
     host_prompt.write_text("# Host instructions\n\nUse Chinese.\n", encoding="utf-8")
@@ -404,8 +451,7 @@ def test_host_profile_is_merged_without_overriding_sandbox_network(
         ),
     )
     files, source_digest = _profile_bundle(config, Path.cwd())
-    assert "# Host instructions" in files["CLAUDE.md"]
-    assert "# Controlled development environment" in files["CLAUDE.md"]
+    assert "CLAUDE.md" not in files
     assert "127.0.0.1:11430" not in files[".bashrc"]
     assert "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY" in files[".bashrc"]
     assert "conda activate \"$CDM_DEFAULT_CONDA_ENV\"" in files[".bashrc"]
@@ -425,6 +471,11 @@ def test_host_profile_is_merged_without_overriding_sandbox_network(
     profile_targets = {item["target"] for item in target["volumes"]}
     assert str(config.target.home / ".bashrc") in profile_targets
     assert str(config.target.home / ".profile") in profile_targets
+    instruction = next(
+        item for item in target["volumes"] if item["target"].endswith("/.claude/CLAUDE.md")
+    )
+    assert instruction["source"] == str(host_prompt)
+    assert instruction["read_only"] is False
 
 
 def test_start_rejects_profile_source_changed_after_init(tmp_path: Path) -> None:
@@ -836,6 +887,16 @@ def test_audit_probe_requires_an_explicit_ready_marker(tmp_path: Path) -> None:
         )
 
 
+def test_long_running_pcap_uses_a_bounded_ring(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    command = _pcap_command(config, 123, tmp_path / "target.pcap")
+    assert command[command.index("-C") + 1] == "67"
+    assert command[command.index("-W") + 1] == "4"
+    assert command[command.index("-w") + 1] == str(tmp_path / "target.pcap")
+    assert command[-1] != "-"
+    assert _pcap_roll_size_million_bytes(64) == 67
+
+
 def test_ebpf_readiness_requires_observed_syscall_canaries(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -985,6 +1046,14 @@ def test_gateway_build_digest_covers_gateway_and_controller_sources(tmp_path: Pa
     audit_source = tmp_path / "src/controlled_dev_machine/connect.bt"
     audit_source.write_text("tracepoint:syscalls:sys_enter_connect {}\n", encoding="utf-8")
     assert _gateway_build_digest(tmp_path) != original
+
+
+def test_gateway_build_digest_ignores_claude_config_seed(tmp_path: Path) -> None:
+    _gateway_source_tree(tmp_path)
+    original = _gateway_build_digest(tmp_path)
+    seed = tmp_path / "config/claude/CLAUDE.md"
+    seed.write_text("Updated config init seed.\n", encoding="utf-8")
+    assert _gateway_build_digest(tmp_path) == original
 
 
 def test_gateway_image_label_must_match_current_sources(tmp_path: Path, monkeypatch) -> None:

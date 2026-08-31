@@ -146,7 +146,7 @@ def test_host_profile_paths_and_default_environment_are_host_specific(
         + """
 profile:
   timezone: Etc/UTC
-  claude_instructions: ~/.claude/CLAUDE.md
+  claude_instructions: ~/claude_code_config/CLAUDE.md
   bashrc: ~/.bashrc
   conda_root: ~/miniconda3
   default_conda_env: sandbox-env
@@ -155,7 +155,7 @@ profile:
     )
     config = load_host_config(path)
     assert config.profile.claude_instructions == Path(
-        "/home/alice/.claude/CLAUDE.md"
+        "/home/alice/claude_code_config/CLAUDE.md"
     )
     assert config.profile.bashrc == Path("/home/alice/.bashrc")
     assert config.profile.conda_root == Path("/home/alice/miniconda3")
@@ -191,14 +191,24 @@ profile:
         load_host_config(path)
 
 
+def test_storage_retention_values_must_be_positive(tmp_path: Path) -> None:
+    path = _config(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "  pcap_limit_gib: 100", "  pcap_limit_gib: 100\n  pcap_retention_hours: 0"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="pcap_retention_hours"):
+        load_host_config(path)
+
+
 def test_config_init_uses_invoking_identity_and_existing_common_files(
     tmp_path: Path, monkeypatch
 ) -> None:
     home = tmp_path / "home" / "alice"
     (home / ".config" / "git").mkdir(parents=True)
     (home / ".ssh").mkdir()
-    (home / ".claude" / "skills").mkdir(parents=True)
-    (home / ".claude" / "agents").mkdir()
     (home / ".agents" / "skills").mkdir(parents=True)
     (home / ".condarc").write_text("channels: [defaults]\n", encoding="utf-8")
     (home / ".bashrc").write_text("export EDITOR=vim\n", encoding="utf-8")
@@ -208,7 +218,8 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
     )
     monkeypatch.setattr(
         "controlled_dev_machine.config._safe_profile_candidate",
-        lambda path, _uid, _gid: path == home / ".bashrc",
+        lambda path, _uid, _gid: path
+        in {home / ".bashrc", home / "claude_code_config" / "CLAUDE.md"},
     )
 
     output = tmp_path / "config" / "host.yaml"
@@ -224,6 +235,11 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
         "min_free_gib": 200,
         "min_free_percent": 10,
     }
+    assert generated_config["storage"]["pcap_retention_hours"] == 72
+    assert generated_config["storage"]["plaintext_retention_hours"] == 72
+    assert generated_config["storage"]["structured_retention_days"] == 30
+    assert generated_config["storage"]["pcap_roll_size_mib"] == 64
+    assert generated_config["storage"]["pcap_roll_files"] == 4
     assert "expected_exit_cidr: null" in generated
     output.write_text(
         generated.replace("expected_exit_cidr: null", "expected_exit_cidr: 8.8.8.8/32"),
@@ -235,20 +251,73 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
     assert config.target.name == "alice"
     assert config.target.home == home
     assert config.profile.bashrc == home / ".bashrc"
-    assert config.profile.claude_instructions is None
+    assert config.profile.claude_instructions == (
+        home / "claude_code_config" / "CLAUDE.md"
+    )
     assert config.profile.timezone == "UTC"
     assert config.upstream.expected_exit_cidr == "8.8.8.8/32"
     mounts = {mount.host_path: mount.read_only for mount in config.mounts}
     assert mounts[home / ".config" / "git"] is False
     assert mounts[home / ".ssh"] is True
-    assert mounts[home / ".claude" / "skills"] is False
-    assert mounts[home / ".claude" / "agents"] is False
+    assert mounts[home / "claude_code_config" / "settings.json"] is False
+    assert mounts[home / "claude_code_config" / "rules"] is False
+    assert mounts[home / "claude_code_config" / "skills"] is False
+    assert mounts[home / "claude_code_config" / "agents"] is False
     assert mounts[home / ".agents" / "skills"] is False
     assert mounts[home / ".codex"] is False
     assert mounts[home / ".condarc"] is False
     assert (home / ".codex").is_dir()
+    assert not (home / ".claude").exists()
+    assert (home / "claude_code_config" / "CLAUDE.md").read_text(
+        encoding="utf-8"
+    ) == (Path.cwd() / "config" / "claude" / "CLAUDE.md").read_text(
+        encoding="utf-8"
+    )
+    assert (home / "claude_code_config" / "settings.json").read_text(
+        encoding="utf-8"
+    ) == "{}\n"
 
     with pytest.raises(ConfigError, match="拒绝覆盖"):
+        create_host_config(output)
+
+
+def test_config_init_accepts_only_the_migrated_claude_symlink(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home" / "alice"
+    persistent = home / ".local/share/controlled-dev-machine/home/claude_code_config"
+    persistent.mkdir(parents=True)
+    (home / "claude_code_config").symlink_to(persistent, target_is_directory=True)
+    account = SimpleNamespace(pw_name="alice", pw_uid=1000, pw_gid=1000, pw_dir=str(home))
+    monkeypatch.setattr("controlled_dev_machine.config.invoking_account", lambda: account)
+    monkeypatch.setattr(
+        "controlled_dev_machine.config._safe_profile_candidate",
+        lambda path, _uid, _gid: path == home / "claude_code_config" / "CLAUDE.md",
+    )
+
+    output = tmp_path / "config" / "host.yaml"
+    create_host_config(output)
+    generated = output.read_text(encoding="utf-8")
+
+    assert "~/claude_code_config/rules" in generated
+    assert (persistent / "CLAUDE.md").is_file()
+
+
+def test_config_init_does_not_mount_a_private_file_symlink(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home" / "alice"
+    claude_config = home / "claude_code_config"
+    claude_config.mkdir(parents=True)
+    private = home / ".local/share/controlled-dev-machine/home/.claude"
+    private.mkdir(parents=True)
+    (private / ".credentials.json").write_text("secret", encoding="utf-8")
+    (claude_config / "settings.json").symlink_to(private / ".credentials.json")
+    account = SimpleNamespace(pw_name="alice", pw_uid=1000, pw_gid=1000, pw_dir=str(home))
+    monkeypatch.setattr("controlled_dev_machine.config.invoking_account", lambda: account)
+
+    output = tmp_path / "config" / "host.yaml"
+    with pytest.raises(ConfigError, match="Claude 配置文件类型异常"):
         create_host_config(output)
 
 

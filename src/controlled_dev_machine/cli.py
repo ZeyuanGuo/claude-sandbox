@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
+from controlled_dev_machine.automation import install_automation
 from controlled_dev_machine.config import (
     create_host_config,
     default_config_path,
@@ -28,7 +29,7 @@ from controlled_dev_machine.runtime import (
     prepare_runtime,
 )
 from controlled_dev_machine.session_migration import import_claude_session
-from controlled_dev_machine.storage import build_storage_report
+from controlled_dev_machine.storage import build_storage_report, rotate_audit
 from controlled_dev_machine.traffic_analysis import analyze_review_payload
 from controlled_dev_machine.verification import run_closed_gate
 
@@ -61,12 +62,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("root-shell", help="从宿主以 root 进入目标容器")
     subparsers.add_parser("verify-closed", help="运行无公网出口的封闭门禁检查")
 
+    automation_parser = subparsers.add_parser("automation", help="安装自动启动与审计轮转")
+    automation_sub = automation_parser.add_subparsers(
+        dest="automation_command", required=True
+    )
+    automation_sub.add_parser("install", help="写入并启用本实例的 systemd 自动化 unit")
+
     doctor_parser = subparsers.add_parser("doctor", help="只读检查当前主机")
     doctor_parser.add_argument("--json", action="store_true", help="输出 JSON")
 
     storage_parser = subparsers.add_parser("storage", help="只读存储检查")
     storage_sub = storage_parser.add_subparsers(dest="storage_command", required=True)
     storage_sub.add_parser("plan", help="生成占用与清理候选报告，不执行删除")
+    storage_sub.add_parser("rotate", help="删除已结束且超过保留期的本项目审计数据")
 
     audit_parser = subparsers.add_parser("audit", help="审计状态")
     audit_sub = audit_parser.add_subparsers(dest="audit_command", required=True)
@@ -189,6 +197,14 @@ def _run(args: argparse.Namespace) -> int:
         print("本实例已停止；持久 Home、策略、证据和证书均保留")
         return 0
 
+    if args.command == "automation" and args.automation_command == "install":
+        paths = install_automation(config)
+        print("已安装并启用自动化 unit:")
+        for path in paths:
+            print(path)
+        print("当前运行实例未重启；自动启动和轮转从下次 systemd 启动/计时器触发时生效")
+        return 0
+
     if args.command == "status":
         print(compose_status(config), end="")
         return 0
@@ -220,8 +236,12 @@ def _run(args: argparse.Namespace) -> int:
         return 0 if overall_level(checks).value < 2 else 1
 
     if args.command == "storage":
-        report = build_storage_report(config)
-        print(json.dumps(report.as_json(), indent=2, sort_keys=True, ensure_ascii=False))
+        if args.storage_command == "plan":
+            report = build_storage_report(config)
+            print(json.dumps(report.as_json(), indent=2, sort_keys=True, ensure_ascii=False))
+        else:
+            result = rotate_audit(config)
+            print(json.dumps(result.as_json(), indent=2, sort_keys=True, ensure_ascii=False))
         return 0
 
     if args.command == "audit" and args.audit_command == "status":

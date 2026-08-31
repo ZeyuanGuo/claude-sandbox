@@ -11,9 +11,9 @@
 | 记录 | 内容 |
 |---|---|
 | `plaintext/flows.mitm` | mitmproxy 的请求正文、双向头字段、响应状态和 flow 元数据；停止时归档 |
-| `pcap/RUN_ID/target.pcap` | 目标网络命名空间中实际出现的数据包 |
-| `pcap/RUN_ID/dns.pcap` | 受控 DNS、目标和父代理方向的数据包 |
-| `pcap/RUN_ID/gateway.pcap` | 透明网关、TLS 终止和父代理方向的数据包 |
+| `pcap/RUN_ID/target.pcap*` | 目标网络命名空间中实际出现的数据包；按主机配置循环覆盖 |
+| `pcap/RUN_ID/dns.pcap*` | 受控 DNS、目标和父代理方向的数据包；按主机配置循环覆盖 |
+| `pcap/RUN_ID/gateway.pcap*` | 透明网关、TLS 终止和父代理方向的数据包；按主机配置循环覆盖 |
 | `structured/RUN_ID/connect.log` | 目标 cgroup 中的 `execve`、`connect`、`sendto`、`sendmsg` 调用和返回值 |
 | `structured/RUN_ID/verify-closed.json` | 该运行最近一次完整封闭验收结果 |
 | `runtime/dns/queries.jsonl` | DNS 查询与响应原文、地址、TTL、60 秒连接宽限、租约编号和 DoH 出口标记 |
@@ -53,11 +53,13 @@ API-key 功能基线中，目标业务只访问模型接口、Anthropic 域名�
 - mitmproxy 退出后，目标因为没有其他 Web 路径而无法联网；
 - 启动审计失败时会停止容器和网络，不留下无审计运行；
 - 任一登记 PCAP/eBPF 探针退出，或目标、DNS、网关进程身份改变后，watchdog 停止续期；三处 nftables 的放行项在 5 秒内过期。
+- 三个长期 PCAP 分别使用 `storage.pcap_roll_size_mib` 和 `storage.pcap_roll_files` 限定循环文件大小与数量；
+- `storage rotate` 跳过当前运行，只删除本项目中已结束且超过配置保留期的 PCAP、明文归档和结构化记录；安装自动化后由 systemd 定时器执行。
 
 尚未实现：
 
-- 对丢包、丢事件、磁盘上限和保留期的持续自动联锁；
-- 自动轮转和删除过期原始证据。
+- 对 PCAP 丢包、eBPF 丢事件和明文流文件增长的持续自动联锁；
+- 按内容识别媒体或其他二进制正文并单独删除；当前保留或删除仍以记录类型、运行编号和保留期为准。
 
 因此运行期间要检查：
 
@@ -70,8 +72,8 @@ sudo bin/sandboxctl storage plan
 
 ## 数据管理
 
-主机配置声明 PCAP、明文、结构化记录的预算和分区保留线；`doctor` 与 `storage plan` 用它们做启动前检查。当前不会自动删除超过保留期的数据。
+主机配置声明 PCAP、明文、结构化记录的预算、分区保留线、保留期和 PCAP 循环文件上限；`doctor` 与 `storage plan` 用预算和分区保留线做启动前检查。`storage rotate` 只处理可由运行编号或归档文件名确认时间的本项目对象：当前运行、当前 `plaintext/flows.mitm`、符号链接、异常文件名和异常目录类型一律跳过或报错。自动化安装后，定时器每 15 分钟执行一次；实际删除范围由 `host.yaml` 中的保留期决定。
 
-清理前必须列出精确路径或 Docker ID、大小、归属、活动引用和恢复方式。只处理本项目拥有且可恢复或已过期的对象，不运行无范围的 `docker system prune`，不删除共享镜像、其他用户文件或仍被报告引用的证据。
+自动轮转只处理上述已登记审计目录，不运行无范围的 `docker system prune`，也不删除共享镜像或其他用户文件。需要长期引用的证据必须在保留期到期前导出到独立的长期目录；自动轮转不会分析报告引用。
 
 请求明文会包含 API key、OAuth 令牌、Cookie、项目源码和完整对话。正式报告只保存目标、类型、长度、哈希和结论，不复制秘密值。

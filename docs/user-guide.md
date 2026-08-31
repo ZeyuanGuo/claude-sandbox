@@ -22,7 +22,7 @@ codex
 
 容器 Home 固定映射到宿主配置的 `paths.persistent_home`，不是临时卷。Claude 的会话、历史、memory、账号状态和其他持久文件因此长期保存；容器内的 `~/.claude` 位于这棵持久 Home 中。不要把宿主原生 `~/.claude` 整棵目录覆盖进去，两套 Claude 账号/会话状态应保持隔离。Codex 则相反：整棵宿主 `~/.codex` 读写挂载到容器同路径，容器和宿主共用 Codex 配置、登录状态、会话和 skills。
 
-默认配置生成器会自动创建并读写挂载宿主的 `~/.codex`，并在这些路径实际存在时同路径接入宿主的 skills、agents、`~/.config/git` 和 `.condarc`：这些普通配置和数据可读写，`.ssh` 仍只读以保护关键私钥。每台服务器只挂载实际存在且愿意交给目标软件的项目；不维护另一份沙箱凭据。
+默认配置生成器会创建宿主 `~/claude_code_config`，把 Claude 的提示词、设置、规则、skills 和 agents 分项读写挂载到容器 `~/.claude`，但不共享凭据、会话、历史和插件状态。宿主默认 `~/.claude` 不作为挂载源，直接运行 Claude Code 时不会自动读取共享目录。生成器也会自动创建并读写挂载宿主的 `~/.codex`，并在这些路径实际存在时同路径接入 `~/.agents/skills`、`~/.config/git` 和 `.condarc`；`.ssh` 仍只读以保护关键私钥。
 
 文件、Git、Python、GPU、Skill、子 agent、MCP 和 Web 等开发流程已在 API-key 基线中验证。当前账号模式尚未完成整套验收；遇到阻断时按下文处理。退出 Claude 或 shell 不会停止沙箱，也不会删除会话。
 
@@ -100,7 +100,7 @@ sudo bin/sandboxctl review reject REQUEST_ID --reason '目标或正文无法解�
 2. 从 `plaintext/flows.mitm` 汇总新增域名、方法、路径类型、状态码和请求量，区分健康检查与业务请求。
 3. 从 `structured/RUN_ID/connect.log` 检查发起进程、失败直连、DNS、UDP 和非 Web 尝试。
 4. 在解密后的请求正文中检查任务外文件、凭据、主机特征、异常大上传和无法解释的编码或二次加密。响应正文默认不保存。
-5. 用 `pcap/RUN_ID/target.pcap`、`dns.pcap` 和 `gateway.pcap` 确认解析与 Web 流量都走受控路径；无法对应的流量保持阻断或切回严格策略复现。
+5. 用 `pcap/RUN_ID/target.pcap*`、`dns.pcap*` 和 `gateway.pcap*` 确认解析与 Web 流量都走受控路径；这些文件会按主机配置循环覆盖，无法对应的流量保持阻断或切回严格策略复现。
 
 这些原始文件只能从宿主提权读取。详细字段解释、证据边界和报告要求见 [默认审计](audit.md)；Claude 已知业务流量和机器信息结论见 [Claude Code 使用与审计手册](targets/claude-code.md)。
 
