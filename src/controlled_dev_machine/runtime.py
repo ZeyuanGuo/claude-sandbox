@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
@@ -2327,9 +2327,11 @@ def _start_audit(
         ),
     )
     started: list[dict[str, object]] = []
+    started_processes: list[subprocess.Popen[bytes]] = []
     try:
         for kind, command, error_log, capture_path in commands:
             process = _spawn_audit_process(command, error_log, capture_path)
+            started_processes.append(process)
             starttime = _proc_starttime(process.pid)
             entry = {
                 "kind": kind,
@@ -2503,9 +2505,9 @@ def _start_audit(
             raise DeploymentError("网络审计监督未在期限内续期防火墙")
     except Exception as exc:
         cleanup_errors: list[str] = []
-        for entry in reversed(started):
+        for process in reversed(started_processes):
             try:
-                _terminate_owned_process(entry)
+                _terminate_spawned_audit_process(process)
             except Exception as cleanup_exc:
                 cleanup_errors.append(str(cleanup_exc))
         if cleanup_errors:
@@ -2615,6 +2617,21 @@ def _same_file(left: Path, right: Path) -> bool:
         return left.samefile(right)
     except OSError:
         return False
+
+
+def _terminate_spawned_audit_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        process.wait()
+        return
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGINT)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        if process.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=2)
 
 
 def _stop_audit(config: HostConfig) -> None:

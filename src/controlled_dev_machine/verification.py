@@ -53,7 +53,7 @@ def run_closed_gate(config: HostConfig, *, timeout_seconds: float = 15.0) -> dic
     checks: list[dict[str, Any]] = []
     checks.append(_run_environment_neutral(config))
     if policy.web_default == "review":
-        checks.append(_run_public_dns_via_proxy(config, audit))
+        checks.append(_run_public_dns_via_proxy(config, audit, timeout_seconds))
     checks.append(_run_dns_via_gateway(config, policy.web_default))
     _expect_command_failure(
         config,
@@ -117,7 +117,7 @@ def run_closed_gate(config: HostConfig, *, timeout_seconds: float = 15.0) -> dic
             )
         )
     checks.append(_run_policy_digest_fault(config, store, timeout_seconds, audit))
-    checks.append(_run_public_web_via_parent(config, audit))
+    checks.append(_run_public_web_via_parent(config, audit, timeout_seconds))
     checks.append(_run_review_store_fault(config, store, timeout_seconds))
     for scheme in ("http", "https"):
         checks.append(_run_approved_request(config, store, scheme, timeout_seconds))
@@ -331,6 +331,7 @@ def _run_dns_via_gateway(config: HostConfig, web_default: str) -> dict[str, Any]
 def _run_public_dns_via_proxy(
     config: HostConfig,
     audit: dict[str, Any],
+    timeout_seconds: float,
 ) -> dict[str, Any]:
     if config.upstream.kind != "http" or config.upstream.port is None:
         raise DeploymentError("严格 DNS 验收要求 HTTP 父代理")
@@ -367,6 +368,7 @@ def _run_public_dns_via_proxy(
         capture,
         packet_error="公网 DNS 查询没有经父代理发出",
         packet_expectation="nonzero",
+        packet_timeout_seconds=timeout_seconds,
     )
     matching = [record for record in _dns_records(config) if record.get("name") == hostname]
     if not matching or any(record.get("action") != "allow" for record in matching):
@@ -938,6 +940,7 @@ def _run_public_review_before_upstream(
 def _run_public_web_via_parent(
     config: HostConfig,
     audit: dict[str, Any],
+    timeout_seconds: float,
 ) -> dict[str, Any]:
     if config.upstream.kind != "http" or config.upstream.port is None:
         raise DeploymentError("透明 Web 出口验收要求 HTTP 父代理")
@@ -991,6 +994,7 @@ def _run_public_web_via_parent(
         capture,
         packet_error="目标容器透明 Web 请求没有产生父代理数据包",
         packet_expectation="nonzero",
+        packet_timeout_seconds=timeout_seconds,
     )
     return {
         "name": "target-public-web-via-parent",
@@ -1358,15 +1362,18 @@ def _finish_gateway_capture(
     *,
     packet_error: str,
     packet_expectation: str = "zero",
+    packet_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Close the capture before parsing, then enforce the packet expectation."""
     if packet_expectation not in {"zero", "nonzero"}:
         raise DeploymentError(f"无效的抓包期望: {packet_expectation}")
+    if packet_expectation == "nonzero" and packet_timeout_seconds is None:
+        raise DeploymentError("非零抓包期望缺少等待期限")
     process = capture.process
     stopped_at: str | None = None
     try:
         if packet_expectation == "nonzero" and process.poll() is None:
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + packet_timeout_seconds
             # tcpdump writes classic pcap; an empty file has only its 24-byte header.
             while (
                 process.poll() is None

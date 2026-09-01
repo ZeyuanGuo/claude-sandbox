@@ -946,7 +946,7 @@ def test_audit_start_write_failure_terminates_started_probe(
     manifest = _manifest(config, tmp_path)
     alias_root = tmp_path / "run-alias"
     writes = 0
-    terminated: list[dict[str, object]] = []
+    terminated: list[int] = []
     commands: list[list[str]] = []
 
     class Process:
@@ -984,15 +984,15 @@ def test_audit_start_write_failure_terminates_started_probe(
     monkeypatch.setattr("controlled_dev_machine.runtime._write_audit_state", write_state)
     monkeypatch.setattr("controlled_dev_machine.runtime._spawn_audit_process", spawn)
     monkeypatch.setattr(
-        "controlled_dev_machine.runtime._terminate_owned_process", terminated.append
+        "controlled_dev_machine.runtime._terminate_spawned_audit_process",
+        lambda process: terminated.append(process.pid),
     )
 
     with pytest.raises(OSError, match="disk full"):
         _start_audit(config, manifest, observed_upstream_ip="204.1.123.50")
 
     assert writes == 2
-    assert len(terminated) == 1
-    assert terminated[0]["kind"] == "target-pcap"
+    assert terminated == [321]
     assert Path(commands[0][commands[0].index("-w") + 1]).is_relative_to(alias_root)
 
 
