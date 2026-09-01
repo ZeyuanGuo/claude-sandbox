@@ -33,12 +33,15 @@ from controlled_dev_machine.runtime import (
     _lifecycle_lock,
     _load_existing_manifest,
     _pcap_command,
+    _pcap_output_alias,
     _pcap_roll_size_million_bytes,
     _pin_built_images,
     _prepare_directories,
+    _prepare_pcap_output_alias,
     _profile_bundle,
     _profile_directory_digest,
     _profile_integrity_digest,
+    _remove_pcap_output_alias,
     _require_deployable_policy,
     _require_gateway_image,
     _require_instance_stopped,
@@ -46,6 +49,8 @@ from controlled_dev_machine.runtime import (
     _require_policy_files,
     _require_profile_sources,
     _require_target_image,
+    _start_audit,
+    _stop_audit,
     _stopped_host_parent_guard_script,
     _target_build_digest,
     _wait_audit_probe_ready,
@@ -895,6 +900,120 @@ def test_long_running_pcap_uses_a_bounded_ring(tmp_path: Path) -> None:
     assert command[command.index("-w") + 1] == str(tmp_path / "target.pcap")
     assert command[-1] != "-"
     assert _pcap_roll_size_million_bytes(64) == 67
+
+
+def test_pcap_output_alias_binds_registered_audit_root(tmp_path: Path, monkeypatch) -> None:
+    config = _host_config(tmp_path)
+    source = config.paths.audit / "pcap"
+    source.mkdir(parents=True)
+    alias_root = tmp_path / "run-alias"
+    mounted: set[Path] = set()
+    commands: list[list[str]] = []
+    monkeypatch.setattr("controlled_dev_machine.runtime._PCAP_OUTPUT_ROOT", alias_root)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._path_is_mountpoint",
+        lambda path: path in mounted,
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._same_file",
+        lambda left, right: left in mounted and right == source,
+    )
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        if command[0] == "mount":
+            mounted.add(Path(command[-1]))
+        elif command[0] == "umount":
+            mounted.remove(Path(command[-1]))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("controlled_dev_machine.runtime._run", run)
+
+    alias = _prepare_pcap_output_alias(config)
+    assert alias == _pcap_output_alias(config)
+    assert not alias.is_relative_to(config.target.home)
+    assert commands[0] == ["mount", "--bind", "--", str(source), str(alias)]
+
+    _remove_pcap_output_alias(config)
+    assert commands[-1] == ["umount", "--", str(alias)]
+    assert not alias.exists()
+
+
+def test_audit_start_write_failure_terminates_started_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    alias_root = tmp_path / "run-alias"
+    writes = 0
+    terminated: list[dict[str, object]] = []
+    commands: list[list[str]] = []
+
+    class Process:
+        pid = 321
+
+        def poll(self):
+            return None
+
+    def write_state(_config, _state):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("disk full")
+
+    def spawn(command, _error_log, _capture_path):
+        commands.append(command)
+        return Process()
+
+    monkeypatch.setattr("controlled_dev_machine.runtime.shutil.which", lambda _name: "/bin/tool")
+    monkeypatch.setattr("controlled_dev_machine.runtime._service_pid", lambda *_args: 100)
+    monkeypatch.setattr("controlled_dev_machine.runtime._proc_starttime", lambda pid: pid)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime.process_identity", lambda _pid: {"pid": "identity"}
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._target_cgroup_path", lambda _pid: "/target"
+    )
+    monkeypatch.setattr("controlled_dev_machine.runtime._bpftrace_cgroup_id", lambda _path: 1)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._prepare_pcap_output_alias",
+        lambda _config: alias_root,
+    )
+    monkeypatch.setattr("controlled_dev_machine.runtime._mkdir", lambda *_args: None)
+    monkeypatch.setattr("controlled_dev_machine.runtime._secure_empty_file", lambda _path: None)
+    monkeypatch.setattr("controlled_dev_machine.runtime._write_audit_state", write_state)
+    monkeypatch.setattr("controlled_dev_machine.runtime._spawn_audit_process", spawn)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._terminate_owned_process", terminated.append
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        _start_audit(config, manifest, observed_upstream_ip="204.1.123.50")
+
+    assert writes == 2
+    assert len(terminated) == 1
+    assert terminated[0]["kind"] == "target-pcap"
+    assert Path(commands[0][commands[0].index("-w") + 1]).is_relative_to(alias_root)
+
+
+def test_audit_stop_keeps_state_when_alias_unmount_fails(tmp_path: Path, monkeypatch) -> None:
+    config = _host_config(tmp_path)
+    path = config.paths.state / "audit-active.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"entries": []}), encoding="utf-8")
+
+    def fail_unmount(_config):
+        raise DeploymentError("unmount failed")
+
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._remove_pcap_output_alias",
+        fail_unmount,
+    )
+
+    with pytest.raises(DeploymentError, match="unmount failed"):
+        _stop_audit(config)
+
+    assert path.exists()
 
 
 def test_ebpf_readiness_requires_observed_syscall_canaries(

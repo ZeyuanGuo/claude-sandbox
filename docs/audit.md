@@ -54,6 +54,7 @@ API-key 功能基线中，目标业务只访问模型接口、Anthropic 域名�
 - 启动审计失败时会停止容器和网络，不留下无审计运行；
 - 任一登记 PCAP/eBPF 探针退出，或目标、DNS、网关进程身份改变后，watchdog 停止续期；三处 nftables 的放行项在 5 秒内过期。
 - 三个长期 PCAP 分别使用 `storage.pcap_roll_size_mib` 和 `storage.pcap_roll_files` 限定循环文件大小与数量；
+- 宿主通过 `/run/controlled-dev-machine-pcap/INSTANCE` 对已登记 PCAP 目录建立绑定挂载，使 `tcpdump` 在不放宽 Home 和审计目录权限的情况下写入循环文件；停止审计时卸载该路径；
 - `storage rotate` 跳过当前运行，只删除本项目中已结束且超过配置保留期的 PCAP、明文归档和结构化记录；安装自动化后由 systemd 定时器执行。
 
 尚未实现：

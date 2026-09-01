@@ -44,6 +44,7 @@ _GATEWAY_UID = 1000
 _GATEWAY_GID = 1000
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _LIFECYCLE_LOCK_ROOT = Path("/run/controlled-dev-machine-locks")
+_PCAP_OUTPUT_ROOT = Path("/run/controlled-dev-machine-pcap")
 _MUTABLE_PROFILE_FILES = frozenset({"CLAUDE.md"})
 _BUILD_PROXY_VARIABLES = (
     "HTTP_PROXY",
@@ -2247,8 +2248,11 @@ def _start_audit(
     *,
     observed_upstream_ip: str | None = None,
 ) -> None:
-    if shutil.which("nsenter") is None or shutil.which("tcpdump") is None:
-        raise DeploymentError("缺少 nsenter 或 tcpdump，拒绝启动未审计的目标容器")
+    if any(
+        shutil.which(command) is None
+        for command in ("nsenter", "tcpdump", "mount", "mountpoint", "umount")
+    ):
+        raise DeploymentError("缺少 nsenter、tcpdump 或绑定挂载命令，拒绝启动未审计的目标容器")
     if shutil.which("bpftrace") is None:
         raise DeploymentError("缺少 bpftrace，拒绝启动未审计的目标容器")
     target_pid = _service_pid(config, manifest, "target")
@@ -2271,6 +2275,7 @@ def _start_audit(
     cgroup_id = _bpftrace_cgroup_id(cgroup_path)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
     pcap_root = config.paths.audit / "pcap" / run_id
+    pcap_output_root = _prepare_pcap_output_alias(config) / run_id
     structured_root = config.paths.audit / "structured" / run_id
     _mkdir(pcap_root, 0o700, 0, 0)
     _mkdir(structured_root, 0o700, 0, 0)
@@ -2293,19 +2298,19 @@ def _start_audit(
     commands = (
         (
             "target-pcap",
-            _pcap_command(config, target_pid, pcap_root / "target.pcap"),
+            _pcap_command(config, target_pid, pcap_output_root / "target.pcap"),
             pcap_root / "target.tcpdump.log",
             None,
         ),
         (
             "gateway-pcap",
-            _pcap_command(config, gateway_pid, pcap_root / "gateway.pcap"),
+            _pcap_command(config, gateway_pid, pcap_output_root / "gateway.pcap"),
             pcap_root / "gateway.tcpdump.log",
             None,
         ),
         (
             "dns-pcap",
-            _pcap_command(config, dns_pid, pcap_root / "dns.pcap"),
+            _pcap_command(config, dns_pid, pcap_output_root / "dns.pcap"),
             pcap_root / "dns.tcpdump.log",
             None,
         ),
@@ -2496,9 +2501,17 @@ def _start_audit(
             time.sleep(0.1)
         else:
             raise DeploymentError("网络审计监督未在期限内续期防火墙")
-    except Exception:
-        state["entries"] = started
-        _write_audit_state(config, state)
+    except Exception as exc:
+        cleanup_errors: list[str] = []
+        for entry in reversed(started):
+            try:
+                _terminate_owned_process(entry)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
+        if cleanup_errors:
+            raise DeploymentError(
+                "审计启动失败，且探针清理未完成: " + "; ".join(cleanup_errors)
+            ) from exc
         raise
 
 
@@ -2534,21 +2547,91 @@ def _pcap_roll_size_million_bytes(size_mib: int) -> int:
     return max(1, size_mib * 1024**2 // 1_000_000)
 
 
+def _pcap_output_alias(config: HostConfig) -> Path:
+    return _PCAP_OUTPUT_ROOT / config.resource_prefix
+
+
+def _prepare_pcap_output_alias(config: HostConfig) -> Path:
+    source = config.paths.audit / "pcap"
+    if source.is_symlink() or not source.is_dir():
+        raise DeploymentError(f"PCAP 审计目录类型异常: {source}")
+    root = _PCAP_OUTPUT_ROOT
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise DeploymentError(f"PCAP 写入目录类型异常: {root}")
+    root.mkdir(mode=0o700, exist_ok=True)
+    metadata = root.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise DeploymentError(f"PCAP 写入目录权限异常: {root}")
+
+    alias = _pcap_output_alias(config)
+    if alias.is_symlink() or (alias.exists() and not alias.is_dir()):
+        raise DeploymentError(f"PCAP 写入路径类型异常: {alias}")
+    if not alias.exists():
+        alias.mkdir(mode=0o700)
+    if _path_is_mountpoint(alias):
+        if not _same_file(alias, source):
+            raise DeploymentError(f"PCAP 写入路径指向其他目录: {alias}")
+        return alias
+    if any(alias.iterdir()):
+        raise DeploymentError(f"PCAP 写入路径不是空目录: {alias}")
+    _run(["mount", "--bind", "--", str(source), str(alias)])
+    if not _path_is_mountpoint(alias) or not _same_file(alias, source):
+        _run(["umount", "--", str(alias)], check=False)
+        raise DeploymentError(f"PCAP 写入路径绑定失败: {alias}")
+    return alias
+
+
+def _remove_pcap_output_alias(config: HostConfig) -> None:
+    source = config.paths.audit / "pcap"
+    alias = _pcap_output_alias(config)
+    if alias.is_symlink() or (alias.exists() and not alias.is_dir()):
+        raise DeploymentError(f"PCAP 写入路径类型异常: {alias}")
+    if not alias.exists():
+        return
+    if _path_is_mountpoint(alias):
+        if not _same_file(alias, source):
+            raise DeploymentError(f"PCAP 写入路径指向其他目录: {alias}")
+        _run(["umount", "--", str(alias)])
+    if any(alias.iterdir()):
+        raise DeploymentError(f"PCAP 写入路径卸载后不是空目录: {alias}")
+    alias.rmdir()
+
+
+def _path_is_mountpoint(path: Path) -> bool:
+    result = _run(
+        ["mountpoint", "--quiet", "--", str(path)],
+        check=False,
+        capture=True,
+    )
+    return result.returncode == 0
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
+
+
 def _stop_audit(config: HostConfig) -> None:
     path = _active_audit_path(config)
-    if not path.exists():
-        return
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-        entries = state.get("entries", [])
-        if not isinstance(entries, list):
-            raise ValueError("entries is not a list")
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        raise DeploymentError(f"审计运行清单损坏，拒绝猜测并停止: {path}") from exc
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise DeploymentError(f"审计运行清单包含异常进程项: {path}")
-        _terminate_owned_process(entry)
+    if path.exists():
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            entries = state.get("entries", [])
+            if not isinstance(entries, list):
+                raise ValueError("entries is not a list")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise DeploymentError(f"审计运行清单损坏，拒绝猜测并停止: {path}") from exc
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise DeploymentError(f"审计运行清单包含异常进程项: {path}")
+            _terminate_owned_process(entry)
+    _remove_pcap_output_alias(config)
     path.unlink(missing_ok=True)
 
 
@@ -2632,6 +2715,7 @@ def _spawn_audit_process(
             stdout=subprocess.DEVNULL if capture_descriptor is None else capture_descriptor,
             stderr=descriptor,
             start_new_session=True,
+            umask=0o077,
         )
     finally:
         os.close(descriptor)

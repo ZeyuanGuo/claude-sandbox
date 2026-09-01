@@ -1365,6 +1365,15 @@ def _finish_gateway_capture(
     process = capture.process
     stopped_at: str | None = None
     try:
+        if packet_expectation == "nonzero" and process.poll() is None:
+            deadline = time.monotonic() + 3
+            # tcpdump writes classic pcap; an empty file has only its 24-byte header.
+            while (
+                process.poll() is None
+                and capture.pcap_path.stat().st_size <= 24
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGINT)
         process.wait(timeout=5)
