@@ -58,6 +58,7 @@ from controlled_dev_machine.runtime import (
     audit_status,
     compose_shell,
     compose_start_closed,
+    compose_stop,
     prepare_parent_guard,
     render_closed_compose,
 )
@@ -1014,6 +1015,39 @@ def test_audit_stop_keeps_state_when_alias_unmount_fails(tmp_path: Path, monkeyp
         _stop_audit(config)
 
     assert path.exists()
+
+
+def test_compose_stop_finishes_container_cleanup_after_audit_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    events: list[str] = []
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr("controlled_dev_machine.runtime._disable_target_route", lambda *_args: None)
+
+    def fail_stop(_config):
+        raise DeploymentError("audit cleanup failed")
+
+    monkeypatch.setattr("controlled_dev_machine.runtime._stop_audit", fail_stop)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._compose_path",
+        lambda *_args, **_kwargs: events.append("compose-down"),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._configure_stopped_host_parent_guard",
+        lambda *_args: events.append("stopped-guard"),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._archive_current_flow",
+        lambda _config: events.append("archive"),
+    )
+
+    with pytest.raises(DeploymentError, match="audit cleanup failed"):
+        compose_stop(config)
+
+    assert events == ["compose-down", "stopped-guard"]
 
 
 def test_ebpf_readiness_requires_observed_syscall_canaries(

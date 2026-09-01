@@ -1012,9 +1012,15 @@ def compose_start_closed(config: HostConfig, *, timeout_seconds: int = 90) -> No
         _enable_target_route(config, manifest)
     except Exception:
         _disable_target_route(config, manifest)
-        _stop_audit(config)
+        cleanup_error: Exception | None = None
+        try:
+            _stop_audit(config)
+        except Exception as exc:
+            cleanup_error = exc
         _compose(config, manifest, "down", "--remove-orphans", check=False)
         _configure_stopped_host_parent_guard(config, manifest)
+        if cleanup_error is not None:
+            raise cleanup_error from None
         raise
 
 
@@ -1067,10 +1073,16 @@ def compose_stop(config: HostConfig) -> None:
             raise exc
     if manifest is not None:
         _disable_target_route(config, manifest)
-    _stop_audit(config)
+    cleanup_error: Exception | None = None
+    try:
+        _stop_audit(config)
+    except Exception as exc:
+        cleanup_error = exc
     _compose_path(config, compose_path, "down", "--remove-orphans")
     if manifest is not None:
         _configure_stopped_host_parent_guard(config, manifest)
+    if cleanup_error is not None:
+        raise cleanup_error
     _archive_current_flow(config)
 
 
