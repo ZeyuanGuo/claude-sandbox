@@ -7,7 +7,9 @@ def test_sbc_wrapper_resolves_repository_and_defaults_to_shell() -> None:
     assert "while [ -L \"$SCRIPT_PATH\" ]" in script
     assert 'if [ "$#" -eq 0 ]; then' in script
     assert "set -- shell" in script
-    assert 'sbd) set -- doctor "$@"' in script
-    assert 'sbr) set -- recover "$@"' in script
-    assert 'sba) set -- audit restart "$@"' in script
+    assert 'if [ "$#" -eq 1 ]' in script
+    assert "sbc doctor" in script
+    assert "sbc recover" in script
+    assert "sbc audit restart" in script
     assert 'exec sudo "$REPO_ROOT/bin/sandboxctl" "$@"' in script
+    assert 'case "$COMMAND_NAME"' not in script

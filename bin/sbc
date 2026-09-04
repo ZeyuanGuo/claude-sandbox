@@ -2,7 +2,6 @@
 set -eu
 
 # Resolve this script when it is called through ~/.local/bin/sbc.
-COMMAND_NAME=$(basename -- "$0")
 SCRIPT_PATH=$0
 while [ -L "$SCRIPT_PATH" ]; do
     SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
@@ -15,14 +14,30 @@ done
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
+if [ "$#" -eq 1 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; then
+    cat <<'EOF'
+受控开发机命令入口
+
+用法：
+  sbc                         进入受控开发机 shell
+  sbc doctor                  只读诊断宿主、容器、审计和目标网络
+  sbc doctor --json           以 JSON 输出诊断结果
+  sbc recover                 自动启动环境，或恢复运行中容器的审计和网络
+  sbc audit restart           只恢复当前实例审计和目标网络，不重启容器
+  sbc status                  查看本实例容器状态
+  sbc audit status            查看当前审计进程和 PCAP 状态
+  sbc verify-closed           验证无公网出口的封闭门禁
+
+说明：
+  这是唯一入口；具体操作由后面的参数决定，不需要先进入仓库目录。
+  其他 sandboxctl 子命令也可以直接写成：sbc <子命令> [参数]
+  每个子命令的详细参数：sbc <子命令> --help
+EOF
+    exit 0
+fi
+
 if [ "$#" -eq 0 ]; then
     set -- shell
 fi
-
-case "$COMMAND_NAME" in
-    sbd) set -- doctor "$@" ;;
-    sbr) set -- recover "$@" ;;
-    sba) set -- audit restart "$@" ;;
-esac
 
 exec sudo "$REPO_ROOT/bin/sandboxctl" "$@"

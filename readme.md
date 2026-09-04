@@ -6,36 +6,27 @@
 
 ## 最短命令
 
-下面的命令不要求先进入仓库目录。重新打开 shell 后即可使用；当前主机已经配置好这些别名：
+下面只有一个命令入口，不要求先进入仓库目录。重新打开 shell 后即可使用；具体操作由参数决定：
 
 ```bash
-sbc                 # 进入受控开发机 shell；也可把参数转发给 sandboxctl
-sbd                 # 快速诊断宿主、容器、审计和目标网络
-sbr                 # 自动选择完整启动或只恢复运行中容器的审计
-sba                 # 只恢复当前实例审计和目标网络，不重启容器
+sbc                         # 进入受控开发机 shell
+sbc doctor                  # 快速诊断宿主、容器、审计和目标网络
+sbc doctor --json           # 以 JSON 输出诊断结果
+sbc recover                 # 自动启动环境，或恢复运行中容器的审计和网络
+sbc audit restart           # 只恢复当前实例审计和目标网络，不重启容器
+sbc status                  # 查看本实例容器状态
+sbc audit status            # 查看当前审计进程和 PCAP 状态
 ```
 
-等价的完整调用是：
+`sbc` 没有参数时等价于进入 shell；带参数时直接转发给 `sandboxctl`。帮助信息直接运行 `sbc --help`，某个子命令的详细参数运行 `sbc <子命令> --help`。这些命令只管理当前用户登记的受控开发机。
 
-```bash
-sbc doctor
-sbd --json
-sbc recover
-sbc audit restart
-```
-
-`sbc` 没有参数时等价于进入 shell；带参数时直接转发给 `sandboxctl`。这些入口只管理当前用户登记的受控开发机。`sbd` 只读；`sbr` 和 `sba` 可能修改当前实例的运行状态，但不会操作其他用户的容器。
-
-如果新主机还没有别名，把下面四行加入目标账号的 `~/.bashrc`，然后重新打开 shell：
+如果新主机还没有 `sbc`，把下面一行加入目标账号的 `~/.bashrc`，然后重新打开 shell：
 
 ```bash
 alias sbc="$HOME/claude-sandbox/bin/sbc"
-alias sbd="$HOME/claude-sandbox/bin/sbc doctor"
-alias sbr="$HOME/claude-sandbox/bin/sbc recover"
-alias sba="$HOME/claude-sandbox/bin/sbc audit restart"
 ```
 
-出现网络故障时先运行 `sbd`；根据输出执行建议，通常是 `sba` 或 `sbr`。完整验收仍需显式运行 `sbc verify-closed`。
+出现网络故障时先运行 `sbc doctor`；根据输出执行建议，通常是 `sbc audit restart` 或 `sbc recover`。完整验收仍需显式运行 `sbc verify-closed`。
 
 ## 平时使用
 
