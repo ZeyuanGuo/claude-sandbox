@@ -59,9 +59,12 @@ claude --resume NEW_SESSION_ID
 
 ```bash
 cd "$HOME/claude-sandbox"
+sudo bin/sandboxctl doctor
 sudo bin/sandboxctl status
 sudo bin/sandboxctl audit status
 ```
+
+重启或断网后的第一条命令始终是 `sudo bin/sandboxctl doctor`。如果它报告基础审计失活而四个容器仍在运行，执行 `sudo bin/sandboxctl audit restart`；如果容器缺失，执行 `sudo bin/sandboxctl recover`。这些恢复命令不会扩大到其他用户的容器或进程。
 
 正常状态应满足：四个服务运行，DNS、网关和 canary 为 `healthy`；`audit status` 的 `active` 为 `true`；五个探针/监督进程和三个 `namespaces` 项均为 `alive: true`；出口落在 `host.yaml` 的 `upstream.expected_exit_cidr` 内。
 

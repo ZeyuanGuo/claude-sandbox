@@ -62,7 +62,7 @@ ExecStartPre=/usr/bin/loginctl enable-linger {name}
 ExecStartPre=/usr/bin/systemctl --machine={name}@.host --user start claude-sandbox-mihomo.service
 ExecStartPre=/usr/bin/curl --fail --silent --show-error --max-time 15 \
   --proxy http://{proxy_host}:{port} https://api.ipify.org
-ExecStart={repo}/bin/sandboxctl --config {config_path} start
+ExecStart={repo}/bin/sandboxctl --config {config_path} recover
 ExecStop={repo}/bin/sandboxctl --config {config_path} stop
 TimeoutStartSec=180
 TimeoutStopSec=120

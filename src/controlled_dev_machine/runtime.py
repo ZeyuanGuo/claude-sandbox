@@ -187,9 +187,7 @@ def _locked_lifecycle(function: Callable[..., Any]) -> Callable[..., Any]:
     return wrapped
 
 
-def _profile_bundle(
-    config: HostConfig, root: Path
-) -> tuple[dict[str, str], str]:
+def _profile_bundle(config: HostConfig, root: Path) -> tuple[dict[str, str], str]:
     source_paths = {
         "bashrc": config.profile.bashrc,
         "login_profile": config.profile.login_profile,
@@ -362,11 +360,7 @@ def _profile_digest(files: dict[str, str]) -> str:
 def _profile_integrity_digest(files: dict[str, str]) -> str:
     """Hash profile files whose contents are controlled by the runtime."""
     return _profile_digest(
-        {
-            name: content
-            for name, content in files.items()
-            if name not in _MUTABLE_PROFILE_FILES
-        }
+        {name: content for name, content in files.items() if name not in _MUTABLE_PROFILE_FILES}
     )
 
 
@@ -384,9 +378,7 @@ def _profile_directory_digest(path: Path) -> str:
     return _profile_integrity_digest(files)
 
 
-def _host_password_hash(
-    username: str, shadow_path: Path = Path("/etc/shadow")
-) -> str:
+def _host_password_hash(username: str, shadow_path: Path = Path("/etc/shadow")) -> str:
     try:
         content = shadow_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -397,9 +389,7 @@ def _host_password_hash(
             continue
         password_hash = fields[1]
         if not password_hash or password_hash.startswith(("!", "*")):
-            raise DeploymentError(
-                f"宿主用户 {username} 没有可用于容器 sudo 的密码"
-            )
+            raise DeploymentError(f"宿主用户 {username} 没有可用于容器 sudo 的密码")
         return password_hash
     raise DeploymentError(f"宿主密码信息中找不到用户 {username}")
 
@@ -568,9 +558,7 @@ def prepare_runtime(
     return manifest
 
 
-def render_closed_compose(
-    config: HostConfig, manifest: RuntimeManifest
-) -> dict[str, Any]:
+def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict[str, Any]:
     root = Path(manifest.repo_root)
     proxy_ca = config.paths.state / "proxy-ca"
     canary = config.paths.state / "canary"
@@ -578,9 +566,7 @@ def render_closed_compose(
     dns_control = config.paths.state / "dns-control"
     target_trust = config.paths.state / "target-trust"
     target_resolver = config.paths.state / "generated/current/target-resolv.conf"
-    target_password_hash = (
-        config.paths.state / "generated/current/target-password-hash"
-    )
+    target_password_hash = config.paths.state / "generated/current/target-password-hash"
     plaintext = config.paths.audit / "plaintext"
     review = config.paths.review
     profile = config.paths.state / "generated" / "current" / "profile"
@@ -612,16 +598,10 @@ def render_closed_compose(
             )
         )
     if config.profile.gitconfig is not None:
-        profile_mounts.append(
-            _bind(profile / ".gitconfig", config.target.home / ".gitconfig")
-        )
+        profile_mounts.append(_bind(profile / ".gitconfig", config.target.home / ".gitconfig"))
     if config.profile.tmux_config is not None:
-        profile_mounts.append(
-            _bind(profile / ".tmux.conf", config.target.home / ".tmux.conf")
-        )
-    conda_trust_mounts = _conda_trust_mounts(
-        config, target_trust / "ca-certificates.crt"
-    )
+        profile_mounts.append(_bind(profile / ".tmux.conf", config.target.home / ".tmux.conf"))
+    conda_trust_mounts = _conda_trust_mounts(config, target_trust / "ca-certificates.crt")
     upstream_enabled = config.upstream.kind == "http"
     upstream_port = config.upstream.port if upstream_enabled else 9
     dns_policy_args = _dns_policy_args(manifest)
@@ -631,12 +611,8 @@ def render_closed_compose(
     }
     gateway_extra_hosts = [f"canary.test:{manifest.canary_address}"]
     if upstream_enabled:
-        gateway_networks["upstream_net"] = {
-            "ipv4_address": manifest.gateway_upstream_address
-        }
-        gateway_extra_hosts.append(
-            f"upstream.cdm.test:{manifest.upstream_gateway_address}"
-        )
+        gateway_networks["upstream_net"] = {"ipv4_address": manifest.gateway_upstream_address}
+        gateway_extra_hosts.append(f"upstream.cdm.test:{manifest.upstream_gateway_address}")
     dns_address = _target_dns_address(manifest)
     services: dict[str, Any] = {
         "canary": {
@@ -711,11 +687,7 @@ def render_closed_compose(
             "networks": {
                 "target_net": {"ipv4_address": dns_address},
                 **(
-                    {
-                        "upstream_net": {
-                            "ipv4_address": manifest.dns_upstream_address
-                        }
-                    }
+                    {"upstream_net": {"ipv4_address": manifest.dns_upstream_address}}
                     if upstream_enabled
                     else {}
                 ),
@@ -1134,9 +1106,7 @@ def audit_status(config: HostConfig) -> dict[str, object]:
     processes: list[dict[str, object]] = []
     for entry in entries:
         processes.append(process_status(entry, name_field="kind"))
-    namespace_status = [
-        process_status(namespace, name_field="name") for namespace in namespaces
-    ]
+    namespace_status = [process_status(namespace, name_field="name") for namespace in namespaces]
     expected_processes = {
         "target-pcap",
         "gateway-pcap",
@@ -1166,6 +1136,51 @@ def audit_status(config: HostConfig) -> dict[str, object]:
         "processes": processes,
         "namespaces": namespace_status,
     }
+
+
+@_locked_lifecycle
+def restart_audit(config: HostConfig) -> None:
+    """Restart only this instance's audit probes and restore its target route."""
+    _require_root()
+    manifest = load_runtime(config)
+    for service in ("canary", "dns", "gateway", "target"):
+        if not _service_container_id(config, manifest, service):
+            raise DeploymentError(f"服务未运行，不能只恢复审计: {service}")
+    if not _service_healthy(config, manifest, "canary"):
+        raise DeploymentError("canary 容器未 healthy，不能恢复审计")
+    if not _service_healthy(config, manifest, "dns"):
+        raise DeploymentError("DNS 容器未 healthy，不能恢复审计")
+    if not _service_healthy(config, manifest, "gateway"):
+        raise DeploymentError("网关容器未 healthy，不能恢复审计")
+    _require_policy_files(manifest)
+    _disable_target_route(config, manifest)
+    _stop_audit(config)
+    try:
+        observed_upstream_ip = _check_upstream(config)
+        _configure_host_parent_guard(config, manifest)
+        _configure_infrastructure_network(config, manifest)
+        _configure_target_network(config, manifest)
+        _start_audit(config, manifest, observed_upstream_ip=observed_upstream_ip)
+        _enable_target_route(config, manifest)
+    except Exception:
+        _disable_target_route(config, manifest)
+        with suppress(Exception):
+            _stop_audit(config)
+        raise
+
+
+def recover_runtime(config: HostConfig) -> str:
+    """Start a stopped instance or restore audit around live containers."""
+    manifest = load_runtime(config)
+    services = ("canary", "dns", "gateway", "target")
+    running = [service for service in services if _service_container_id(config, manifest, service)]
+    if not running:
+        compose_start_closed(config)
+        return "started"
+    if set(running) != set(services):
+        raise DeploymentError("受控容器只恢复了一部分，拒绝猜测；先运行 sandboxctl doctor 查看现场")
+    restart_audit(config)
+    return "audit_restarted"
 
 
 def compose_shell(config: HostConfig, *, root: bool) -> int:
@@ -1301,9 +1316,7 @@ def _store_policy(config: HostConfig, source: Path, policy: PolicySnapshot) -> P
 
 def _require_deployable_policy(policy: PolicySnapshot) -> None:
     if policy.deployment != "active":
-        raise DeploymentError(
-            f"策略 {policy.policy_id} 标记为 {policy.deployment}，不能部署"
-        )
+        raise DeploymentError(f"策略 {policy.policy_id} 标记为 {policy.deployment}，不能部署")
     if policy.mode == "strict" and policy.web_default not in {"block", "review"}:
         raise DeploymentError("strict 策略必须默认阻断或逐请求审核")
     if policy.mode == "daily" and policy.web_default != "allow_audited_public":
@@ -1449,11 +1462,7 @@ def _conda_trust_mounts(config: HostConfig, bundle: Path) -> list[dict[str, Any]
     for environment_root in environment_roots:
         candidates.append(environment_root / "ssl" / "cacert.pem")
         candidates.extend(
-            sorted(
-                environment_root.glob(
-                    "lib/python*/site-packages/certifi/cacert.pem"
-                )
-            )
+            sorted(environment_root.glob("lib/python*/site-packages/certifi/cacert.pem"))
         )
     targets: list[Path] = []
     for candidate in candidates:
@@ -1561,16 +1570,10 @@ def _target_dns_address(manifest: RuntimeManifest) -> str:
 
 
 def _target_resolver_content(manifest: RuntimeManifest) -> str:
-    return (
-        f"nameserver {_target_dns_address(manifest)}\n"
-        "search .\n"
-        "options edns0 trust-ad ndots:0\n"
-    )
+    return f"nameserver {_target_dns_address(manifest)}\nsearch .\noptions edns0 trust-ad ndots:0\n"
 
 
-def _configure_infrastructure_network(
-    config: HostConfig, manifest: RuntimeManifest
-) -> None:
+def _configure_infrastructure_network(config: HostConfig, manifest: RuntimeManifest) -> None:
     if config.upstream.kind != "http" or config.upstream.port is None:
         raise DeploymentError("透明网络要求本机 HTTP 父代理")
     gateway_pid = _service_pid(config, manifest, "gateway")
@@ -1637,16 +1640,12 @@ table inet cdm_control {{
     _verify_nft_table(dns_pid)
 
 
-def _configure_host_parent_guard(
-    config: HostConfig, manifest: RuntimeManifest
-) -> None:
+def _configure_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) -> None:
     if config.upstream.kind != "http" or config.upstream.port is None:
         raise DeploymentError("宿主父代理防火墙要求本机 HTTP 父代理")
     bridge = _upstream_bridge_name(config, manifest)
     table = _host_parent_table(manifest)
-    sources = ", ".join(
-        (manifest.gateway_upstream_address, manifest.dns_upstream_address)
-    )
+    sources = ", ".join((manifest.gateway_upstream_address, manifest.dns_upstream_address))
     _apply_host_nft(
         table,
         f"""
@@ -1669,18 +1668,14 @@ table inet {table} {{
         raise DeploymentError("宿主父代理防火墙没有默认拒绝规则")
 
 
-def _configure_stopped_host_parent_guard(
-    config: HostConfig, manifest: RuntimeManifest
-) -> None:
+def _configure_stopped_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) -> None:
     if config.upstream.kind != "http" or config.upstream.port is None:
         raise DeploymentError("宿主父代理防火墙要求本机 HTTP 父代理")
     table = _host_parent_table(manifest)
     _apply_host_nft(table, _stopped_host_parent_guard_script(config, manifest))
 
 
-def _stopped_host_parent_guard_script(
-    config: HostConfig, manifest: RuntimeManifest
-) -> str:
+def _stopped_host_parent_guard_script(config: HostConfig, manifest: RuntimeManifest) -> str:
     if config.upstream.port is None:
         raise DeploymentError("宿主父代理端口未配置")
     table = _host_parent_table(manifest)
@@ -1991,11 +1986,7 @@ def _upstream_network(subnet: str) -> dict[str, Any]:
         "driver": "bridge",
         "internal": True,
         "enable_ipv6": False,
-        "ipam": {
-            "config": [
-                {"subnet": subnet, "gateway": str(next(network.hosts()))}
-            ]
-        },
+        "ipam": {"config": [{"subnet": subnet, "gateway": str(next(network.hosts()))}]},
     }
 
 
@@ -2032,9 +2023,7 @@ def _service_healthy(config: HostConfig, manifest: RuntimeManifest, service: str
 def _require_gateway_image(config: HostConfig, manifest: RuntimeManifest) -> None:
     current_digest = _gateway_build_digest(Path(manifest.repo_root))
     if current_digest != manifest.gateway_build_digest:
-        raise DeploymentError(
-            "网关源码已变化；重新执行 sandboxctl init、build 后再启动"
-        )
+        raise DeploymentError("网关源码已变化；重新执行 sandboxctl init、build 后再启动")
     result = _docker(
         config,
         "image",
@@ -2046,9 +2035,7 @@ def _require_gateway_image(config: HostConfig, manifest: RuntimeManifest) -> Non
         check=False,
     )
     if result.returncode != 0 or result.stdout.strip() != manifest.gateway_build_digest:
-        raise DeploymentError(
-            "网关镜像不存在或构建摘要不符；重新执行 sandboxctl build 后再启动"
-        )
+        raise DeploymentError("网关镜像不存在或构建摘要不符；重新执行 sandboxctl build 后再启动")
     _require_pinned_image_id(config, manifest, "gateway", manifest.gateway_image)
 
 
@@ -2057,9 +2044,7 @@ def _require_target_image(config: HostConfig, manifest: RuntimeManifest) -> None
         raise DeploymentError("目标镜像缺少构建摘要；重新执行 sandboxctl init、build")
     current_digest = _target_build_digest(config, Path(manifest.repo_root))
     if current_digest != manifest.target_build_digest:
-        raise DeploymentError(
-            "目标镜像构建输入已变化；重新执行 sandboxctl init、build 后再启动"
-        )
+        raise DeploymentError("目标镜像构建输入已变化；重新执行 sandboxctl init、build 后再启动")
     result = _docker(
         config,
         "image",
@@ -2071,15 +2056,15 @@ def _require_target_image(config: HostConfig, manifest: RuntimeManifest) -> None
         check=False,
     )
     if result.returncode != 0 or result.stdout.strip() != manifest.target_build_digest:
-        raise DeploymentError(
-            "目标镜像不存在或构建摘要不符；重新执行 sandboxctl build 后再启动"
-        )
+        raise DeploymentError("目标镜像不存在或构建摘要不符；重新执行 sandboxctl build 后再启动")
     _require_pinned_image_id(config, manifest, "target", manifest.target_image)
 
 
 def _image_record_path(config: HostConfig, manifest: RuntimeManifest) -> Path:
-    return config.paths.state / "images" / (
-        f"{manifest.target_build_digest}-{manifest.gateway_build_digest}.json"
+    return (
+        config.paths.state
+        / "images"
+        / (f"{manifest.target_build_digest}-{manifest.gateway_build_digest}.json")
     )
 
 
@@ -2123,9 +2108,7 @@ def _pin_built_images(config: HostConfig, manifest: RuntimeManifest) -> None:
         if not isinstance(previous, dict) or any(
             previous.get(key) != record[key] for key in immutable_keys
         ):
-            raise DeploymentError(
-                "同一构建摘要已经登记了不同的镜像内容；恢复旧镜像或更换构建输入"
-            )
+            raise DeploymentError("同一构建摘要已经登记了不同的镜像内容；恢复旧镜像或更换构建输入")
         return
     _atomic_text(path, json.dumps(record, indent=2, sort_keys=True) + "\n", mode=0o600)
 
@@ -2246,12 +2229,8 @@ def _check_upstream(config: HostConfig) -> str | None:
     return str(address)
 
 
-def _service_container_id(
-    config: HostConfig, manifest: RuntimeManifest, service: str
-) -> str:
-    return _compose(
-        config, manifest, "ps", "-q", service, capture=True, check=False
-    ).stdout.strip()
+def _service_container_id(config: HostConfig, manifest: RuntimeManifest, service: str) -> str:
+    return _compose(config, manifest, "ps", "-q", service, capture=True, check=False).stdout.strip()
 
 
 def _start_audit(
@@ -2375,9 +2354,7 @@ def _start_audit(
                         _proc_starttime(process.pid) if process.poll() is None else None
                     )
                     current_identity = (
-                        process_identity(process.pid)
-                        if current_starttime == starttime
-                        else None
+                        process_identity(process.pid) if current_starttime == starttime else None
                     )
                 except (DeploymentError, OSError):
                     current_identity = None
@@ -2472,10 +2449,7 @@ def _start_audit(
         watchdog_process = _spawn_audit_process(
             [
                 sys.executable,
-                str(
-                    Path(manifest.repo_root)
-                    / "src/controlled_dev_machine/network_watchdog.py"
-                ),
+                str(Path(manifest.repo_root) / "src/controlled_dev_machine/network_watchdog.py"),
                 "--config",
                 str(watchdog_config),
                 "--ready",
@@ -2490,10 +2464,7 @@ def _start_audit(
             "starttime": _proc_starttime(watchdog_process.pid),
             "command": [
                 sys.executable,
-                str(
-                    Path(manifest.repo_root)
-                    / "src/controlled_dev_machine/network_watchdog.py"
-                ),
+                str(Path(manifest.repo_root) / "src/controlled_dev_machine/network_watchdog.py"),
                 "--config",
                 str(watchdog_config),
                 "--ready",
@@ -2735,9 +2706,7 @@ def _spawn_audit_process(
     try:
         process_command = list(command)
         if capture_path is not None:
-            capture_descriptor = os.open(
-                capture_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-            )
+            capture_descriptor = os.open(capture_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         process = subprocess.Popen(
             process_command,
             stdin=subprocess.DEVNULL,
@@ -2949,9 +2918,7 @@ def _docker(
     capture: bool = False,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    return _run(
-        ["docker", *args], capture=capture, check=check, env=_docker_env(config)
-    )
+    return _run(["docker", *args], capture=capture, check=check, env=_docker_env(config))
 
 
 def _docker_env(config: HostConfig) -> dict[str, str]:
@@ -3110,9 +3077,7 @@ def _activate_generation(config: HostConfig, generation: Path) -> None:
         "target-password-hash",
     }
     if {
-        item.name
-        for item in generation.iterdir()
-        if item.is_file() and not item.is_symlink()
+        item.name for item in generation.iterdir() if item.is_file() and not item.is_symlink()
     } != required:
         raise DeploymentError("运行 generation 文件集合不完整")
     temporary = generated / f".current.{uuid.uuid4().hex}"

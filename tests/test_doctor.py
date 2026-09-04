@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5,6 +6,10 @@ from controlled_dev_machine.doctor import (
     Check,
     CheckLevel,
     _docker_engine_check,
+    _parse_claude_auth,
+    _runtime_compose_check,
+    _target_claude_check,
+    _target_network_check,
     _upstream_check,
     run_doctor,
 )
@@ -30,9 +35,7 @@ def test_doctor_requires_every_command_used_by_deploy_and_runtime(monkeypatch) -
     monkeypatch.setattr(
         "controlled_dev_machine.doctor._docker_engine_check", lambda _c: _pass("engine")
     )
-    monkeypatch.setattr(
-        "controlled_dev_machine.doctor._architecture_check", lambda: _pass("arch")
-    )
+    monkeypatch.setattr("controlled_dev_machine.doctor._architecture_check", lambda: _pass("arch"))
     monkeypatch.setattr(
         "controlled_dev_machine.doctor._docker_compose_check", lambda: _pass("compose")
     )
@@ -86,3 +89,85 @@ def test_doctor_blocks_unimplemented_tun_upstream() -> None:
 
     assert check.level == CheckLevel.BLOCKED
     assert "尚未实现" in check.message
+
+
+def test_parse_claude_auth_keeps_status_fields_only() -> None:
+    parsed = _parse_claude_auth(
+        [
+            '{"loggedIn":true,"authMethod":"claude.ai",'
+            '"email":"person@example.com","organizationId":"secret"}',
+        ]
+    )
+
+    assert parsed == {
+        "parsed": True,
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+    }
+    assert "person@example.com" not in str(parsed)
+
+
+def test_runtime_compose_check_returns_target_container(monkeypatch) -> None:
+    config = SimpleNamespace(docker=SimpleNamespace(socket=Path("/run/docker.sock")))
+    manifest = SimpleNamespace(resource_prefix="cdm-u1000-main", compose_path="/tmp/compose.yaml")
+    output = """[
+      {"Service":"canary","Name":"canary-1","State":"running","Health":"healthy"},
+      {"Service":"dns","Name":"dns-1","State":"running","Health":"healthy"},
+      {"Service":"gateway","Name":"gateway-1","State":"running","Health":"healthy"},
+      {"Service":"target","Name":"target-1","State":"running","Health":""}
+    ]"""
+    monkeypatch.setattr(
+        "controlled_dev_machine.doctor._docker_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, output, ""),
+    )
+
+    check, target = _runtime_compose_check(config, manifest)
+
+    assert check.level == CheckLevel.PASS
+    assert target == "target-1"
+    assert check.facts["services"]["gateway"]["health"] == "healthy"
+
+
+def test_target_network_check_distinguishes_dns_failure(monkeypatch) -> None:
+    config = SimpleNamespace(docker=SimpleNamespace(socket=Path("/run/docker.sock")))
+    result = subprocess.CompletedProcess(
+        [],
+        0,
+        "ping_dns=\nping_http=000\nping_exit=6\nanthropic_dns=\n"
+        "anthropic_http=000\nanthropic_exit=6\n",
+        "Could not resolve host",
+    )
+    monkeypatch.setattr("controlled_dev_machine.doctor._docker_run", lambda *_a, **_k: result)
+
+    check = _target_network_check(config, "target-1")
+
+    assert check.level == CheckLevel.BLOCKED
+    assert check.facts["ping_dns"] is False
+    assert check.facts["anthropic_dns"] is False
+    assert "Could not resolve host" in check.facts["detail"]
+
+
+def test_target_claude_check_does_not_expose_auth_identity(monkeypatch) -> None:
+    config = SimpleNamespace(
+        docker=SimpleNamespace(socket=Path("/run/docker.sock")),
+        target=SimpleNamespace(uid=1000, gid=1000),
+    )
+    result = subprocess.CompletedProcess(
+        [],
+        0,
+        "/usr/local/bin/claude\n2.1.258\n"
+        '{"loggedIn":true,"authMethod":"claude.ai",'
+        '"email":"person@example.com","organizationId":"secret"}\n',
+        "",
+    )
+    monkeypatch.setattr("controlled_dev_machine.doctor._docker_run", lambda *_a, **_k: result)
+
+    check = _target_claude_check(config, "target-1")
+
+    assert check.level == CheckLevel.PASS
+    assert check.facts["auth"] == {
+        "parsed": True,
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+    }
+    assert "person@example.com" not in str(check.facts)

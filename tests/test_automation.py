@@ -29,7 +29,8 @@ def test_automation_units_use_target_home_and_do_not_start_immediately(tmp_path:
 
     assert f"Environment=HOME={config.target.home}" in service
     assert "systemctl --machine=alice@.host --user start claude-sandbox-mihomo.service" in service
-    assert "ExecStart=/srv/claude-sandbox/bin/sandboxctl" in service
+    assert "ExecStart=/srv/claude-sandbox/bin/sandboxctl --config" in service
+    assert "sandboxctl --config " in service and " recover\n" in service
     assert "storage rotate" in rotate
     assert "OnBootSec=15min" in timer
     assert "ExecStart" not in timer

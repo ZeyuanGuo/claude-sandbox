@@ -129,6 +129,8 @@ sudo sandboxctl root-shell
 sudo sandboxctl storage plan
 sudo sandboxctl automation install
 sudo sandboxctl audit status
+sudo sandboxctl audit restart
+sudo sandboxctl recover
 sudo sandboxctl doctor
 sudo sandboxctl verify-closed
 ```

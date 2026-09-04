@@ -27,6 +27,8 @@ from controlled_dev_machine.runtime import (
     compose_stop,
     prepare_parent_guard,
     prepare_runtime,
+    recover_runtime,
+    restart_audit,
 )
 from controlled_dev_machine.session_migration import import_claude_session
 from controlled_dev_machine.storage import build_storage_report, rotate_audit
@@ -56,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("build", help="构建固定版本的目标和网关镜像")
     subparsers.add_parser("guard", help="在启动父代理前安装仅回环可访问的宿主门禁")
     subparsers.add_parser("start", help="启动当前受控环境")
+    subparsers.add_parser("recover", help="启动已停止环境，或恢复运行中容器的审计和网络")
     subparsers.add_parser("stop", help="停止本实例，不删除持久状态")
     subparsers.add_parser("status", help="显示本实例容器状态")
     subparsers.add_parser("shell", help="以普通用户进入目标容器")
@@ -63,9 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("verify-closed", help="运行无公网出口的封闭门禁检查")
 
     automation_parser = subparsers.add_parser("automation", help="安装自动启动与审计轮转")
-    automation_sub = automation_parser.add_subparsers(
-        dest="automation_command", required=True
-    )
+    automation_sub = automation_parser.add_subparsers(dest="automation_command", required=True)
     automation_sub.add_parser("install", help="写入并启用本实例的 systemd 自动化 unit")
 
     doctor_parser = subparsers.add_parser("doctor", help="只读检查当前主机")
@@ -79,6 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser = subparsers.add_parser("audit", help="审计状态")
     audit_sub = audit_parser.add_subparsers(dest="audit_command", required=True)
     audit_sub.add_parser("status", help="显示当前 PCAP/eBPF 审计进程")
+    audit_sub.add_parser("restart", help="只重启本实例审计并恢复目标网络，不重启容器")
 
     session_parser = subparsers.add_parser("session", help="Claude 会话操作")
     session_sub = session_parser.add_subparsers(dest="session_command", required=True)
@@ -192,6 +194,14 @@ def _run(args: argparse.Namespace) -> int:
             print("受控环境已启动；外部请求必须经本机上游代理")
         return 0
 
+    if args.command == "recover":
+        result = recover_runtime(config)
+        if result == "started":
+            print("受控环境已启动")
+        else:
+            print("运行中容器的审计和目标网络已恢复；容器未重启")
+        return 0
+
     if args.command == "stop":
         compose_stop(config)
         print("本实例已停止；持久 Home、策略、证据和证书均保留")
@@ -233,6 +243,8 @@ def _run(args: argparse.Namespace) -> int:
         else:
             for check in checks:
                 print(f"{check.level.name:<7} {check.name}: {check.message}")
+                if check.action:
+                    print(f"          建议: {check.action}")
         return 0 if overall_level(checks).value < 2 else 1
 
     if args.command == "storage":
@@ -246,6 +258,11 @@ def _run(args: argparse.Namespace) -> int:
 
     if args.command == "audit" and args.audit_command == "status":
         print(json.dumps(audit_status(config), indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+
+    if args.command == "audit" and args.audit_command == "restart":
+        restart_audit(config)
+        print("本实例审计已恢复；目标容器未重启")
         return 0
 
     if args.command == "session" and args.session_command == "import":
@@ -271,9 +288,7 @@ def _run(args: argparse.Namespace) -> int:
         return 0
     if args.review_command == "show":
         record = store.get(args.request_id)
-        result: dict[str, object] = {
-            "record": asdict(record) if args.raw else _safe_record(record)
-        }
+        result: dict[str, object] = {"record": asdict(record) if args.raw else _safe_record(record)}
         if args.raw:
             headers, body = store.raw(args.request_id)
             result["headers"] = list(headers)
@@ -310,9 +325,7 @@ def _run(args: argparse.Namespace) -> int:
         print(json.dumps(_safe_record(record), indent=2, sort_keys=True, ensure_ascii=False))
         return 0
     if args.review_command == "approve-once":
-        record = store.approve_once(
-            args.request_id, ttl_seconds=args.ttl, reason=args.reason
-        )
+        record = store.approve_once(args.request_id, ttl_seconds=args.ttl, reason=args.reason)
     elif args.review_command == "reject":
         record = store.reject(args.request_id, reason=args.reason)
     elif args.review_command == "consume":

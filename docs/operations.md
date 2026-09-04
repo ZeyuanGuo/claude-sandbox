@@ -173,7 +173,35 @@ sudo bin/sandboxctl automation install
 
 `start` 会再次核对父代理门禁，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不发布端口，不挂 Docker socket；全部 GPU 可见但不设置独占模式。canary CA 和服务端证书有效期为 30 天；每次 `start` 在证书剩余有效期不足 7 天时先原子更新，再启动容器。
 
-只有首次 `verify-closed` 和实际开发环境检查均通过后才运行 `automation install`。该命令写入并启用本实例的 systemd 自动启动单元和审计轮转定时器，但不会立即启动或重启任何服务。下次开机时，系统级单元先恢复用户服务、检查父代理，再调用现有的 `start`；任一前置检查失败都会停止启动。轮转定时器每 15 分钟调用一次 `storage rotate`。安装后可只读检查配置，不要在生产中的实例上手动启动这些单元：
+### 重启后快速诊断
+
+重启、断网或 Claude 窗口仍在但请求失败时，先只运行这一条命令：
+
+```bash
+sudo bin/sandboxctl doctor
+```
+
+它在只读模式下检查宿主前置条件、运行清单与代码摘要、镜像内容、四个容器、systemd 自动化、父代理、基础审计、三处 PCAP、目标容器内的 `ping0.cc` 与 `api.anthropic.com` DNS/HTTPS，以及 Claude 版本和登录状态。每个非通过项会同时显示事实和下一条建议命令；机器或后续工具读取结构化结果时使用 `sudo bin/sandboxctl doctor --json`。该命令不会重启、重建、清理或修改正在运行的容器。
+
+优先按诊断项执行最小修复：
+
+```bash
+# 容器仍在运行，只是基础审计失活或目标网络被 watchdog 收回
+sudo bin/sandboxctl audit restart
+
+# 不确定容器是否被 Docker 保留；由 recover 自动选择启动或只恢复审计
+sudo bin/sandboxctl recover
+
+# 父代理用户服务未 active
+systemctl --user restart claude-sandbox-mihomo.service
+
+# 自动启动或审计轮转 unit 未启用
+sudo bin/sandboxctl automation install
+```
+
+`audit restart` 只作用于当前实例：它不停止或重建容器，不接触其他用户的进程；只有四个服务都已运行且 DNS、网关、canary healthy 时才会执行。源码、策略或镜像摘要不一致时，doctor 会把它标为“下次启动前需重建”；届时在确认当前任务可以中断后再执行 `stop -> init -> build -> start`。完整网络门禁验收仍需显式运行 `sudo bin/sandboxctl verify-closed`，doctor 不会自动运行这项可能耗时较长的检查。
+
+只有首次 `verify-closed` 和实际开发环境检查均通过后才运行 `automation install`。该命令写入并启用本实例的 systemd 自动启动单元和审计轮转定时器，但不会立即启动或重启任何服务。下次开机时，系统级单元先恢复用户服务、检查父代理，再调用 `recover`：容器已被 Docker 保留时只恢复审计和目标网络，容器不存在时才走完整 `start`；任一前置检查失败都会停止启动。轮转定时器每 15 分钟调用一次 `storage rotate`。安装后可只读检查配置，不要在生产中的实例上手动启动这些单元：
 
 ```bash
 systemctl is-enabled cdm-u$(id -u)-main.service \

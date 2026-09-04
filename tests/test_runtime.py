@@ -60,15 +60,15 @@ from controlled_dev_machine.runtime import (
     compose_start_closed,
     compose_stop,
     prepare_parent_guard,
+    recover_runtime,
     render_closed_compose,
+    restart_audit,
 )
 
 
 @pytest.fixture(autouse=True)
 def _use_test_lifecycle_lock(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", tmp_path / "locks"
-    )
+    monkeypatch.setattr("controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", tmp_path / "locks")
 
 
 def _host_config(tmp_path: Path):
@@ -178,22 +178,14 @@ def test_target_has_no_publication_or_audit_mount(tmp_path: Path) -> None:
     assert str(config.paths.audit) not in sources
     assert str(config.docker.socket) not in sources
     password_hash = next(
-        item
-        for item in target["volumes"]
-        if item["target"] == "/run/cdm/target-password-hash"
+        item for item in target["volumes"] if item["target"] == "/run/cdm/target-password-hash"
     )
     assert password_hash["read_only"] is True
-    assert password_hash["source"].endswith(
-        "/generated/current/target-password-hash"
-    )
-    resolver = next(
-        item for item in target["volumes"] if item["target"] == "/etc/resolv.conf"
-    )
+    assert password_hash["source"].endswith("/generated/current/target-password-hash")
+    resolver = next(item for item in target["volumes"] if item["target"] == "/etc/resolv.conf")
     assert resolver == {
         "type": "bind",
-        "source": str(
-            config.paths.state / "generated/current/target-resolv.conf"
-        ),
+        "source": str(config.paths.state / "generated/current/target-resolv.conf"),
         "target": "/etc/resolv.conf",
         "read_only": True,
         "bind": {"create_host_path": False},
@@ -204,9 +196,7 @@ def test_target_home_uses_fixed_persistent_host_bind(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
     compose = render_closed_compose(config, _manifest(config, tmp_path))
     target = compose["services"]["target"]
-    home = next(
-        item for item in target["volumes"] if item["target"] == str(config.target.home)
-    )
+    home = next(item for item in target["volumes"] if item["target"] == str(config.target.home))
     assert home == {
         "type": "bind",
         "source": str(config.paths.persistent_home),
@@ -223,8 +213,7 @@ def test_target_home_uses_fixed_persistent_host_bind(tmp_path: Path) -> None:
 def test_host_password_hash_selects_only_target_user(tmp_path: Path) -> None:
     shadow = tmp_path / "shadow"
     shadow.write_text(
-        "root:$y$root-hash:1:2:3:4:5:6:7\n"
-        "alice:$y$alice-hash:1:2:3:4:5:6:7\n",
+        "root:$y$root-hash:1:2:3:4:5:6:7\nalice:$y$alice-hash:1:2:3:4:5:6:7\n",
         encoding="utf-8",
     )
 
@@ -282,9 +271,7 @@ def test_daily_runtime_resolves_public_domains(tmp_path: Path) -> None:
     assert _dns_policy_args(manifest) == ["--allow-public-domains"]
 
 
-def test_dns_public_resolution_is_independent_of_web_rules(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_dns_public_resolution_is_independent_of_web_rules(tmp_path: Path, monkeypatch) -> None:
     config = _host_config(tmp_path)
     manifest = _manifest(config, tmp_path)
     rules = (
@@ -328,9 +315,10 @@ def test_gateway_is_lazy_and_records_plaintext(tmp_path: Path) -> None:
         "canary": {"condition": "service_healthy"},
         "dns": {"condition": "service_healthy"},
     }
-    assert gateway["environment"]["CDM_EXPECTED_POLICY_DIGEST"] == _manifest(
-        config, tmp_path
-    ).policy_digest
+    assert (
+        gateway["environment"]["CDM_EXPECTED_POLICY_DIGEST"]
+        == _manifest(config, tmp_path).policy_digest
+    )
     assert gateway["environment"]["CDM_GATEWAY_BUILD_DIGEST"] == "b" * 64
     assert gateway["environment"]["CDM_CANARY_ADDRESS"] == "172.28.0.19"
     assert gateway["build"]["args"]["GATEWAY_BUILD_DIGEST"] == "b" * 64
@@ -440,9 +428,7 @@ def test_host_profile_uses_direct_claude_mount_and_neutral_shell(
     host_prompt.parent.mkdir()
     host_bashrc = config.target.home / ".bashrc"
     host_prompt.write_text("# Host instructions\n\nUse Chinese.\n", encoding="utf-8")
-    host_bashrc.write_text(
-        "export HTTPS_PROXY=http://127.0.0.1:11430\n", encoding="utf-8"
-    )
+    host_bashrc.write_text("export HTTPS_PROXY=http://127.0.0.1:11430\n", encoding="utf-8")
     config = replace(
         config,
         profile=HostProfile(
@@ -460,7 +446,7 @@ def test_host_profile_uses_direct_claude_mount_and_neutral_shell(
     assert "CLAUDE.md" not in files
     assert "127.0.0.1:11430" not in files[".bashrc"]
     assert "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY" in files[".bashrc"]
-    assert "conda activate \"$CDM_DEFAULT_CONDA_ENV\"" in files[".bashrc"]
+    assert 'conda activate "$CDM_DEFAULT_CONDA_ENV"' in files[".bashrc"]
     assert "$CDM_CONDA_ROOT/etc/profile.d/conda.sh" in files[".bashrc"]
     assert "$HOME/miniconda3" not in files[".bashrc"]
     assert "unset REQUESTS_CA_BUNDLE SSL_CERT_FILE" in files[".profile"]
@@ -471,9 +457,7 @@ def test_host_profile_uses_direct_claude_mount_and_neutral_shell(
     assert target["environment"]["CDM_DEFAULT_CONDA_ENV"] == "sandbox-env"
     assert target["environment"]["TZ"] == "Etc/UTC"
     assert target["build"]["args"]["TARGET_TIMEZONE"] == "Etc/UTC"
-    assert target["environment"]["CDM_CONDA_ROOT"] == str(
-        config.target.home / "conda"
-    )
+    assert target["environment"]["CDM_CONDA_ROOT"] == str(config.target.home / "conda")
     profile_targets = {item["target"] for item in target["volumes"]}
     assert str(config.target.home / ".bashrc") in profile_targets
     assert str(config.target.home / ".profile") in profile_targets
@@ -566,9 +550,7 @@ def test_target_dns_queries_only_reach_project_dns(tmp_path: Path) -> None:
     compose = render_closed_compose(config, _manifest(config, tmp_path))
     target = compose["services"]["target"]
     assert "dns" not in target
-    resolver = next(
-        item for item in target["volumes"] if item["target"] == "/etc/resolv.conf"
-    )
+    resolver = next(item for item in target["volumes"] if item["target"] == "/etc/resolv.conf")
     assert resolver["source"].endswith("/generated/current/target-resolv.conf")
     assert resolver["read_only"] is True
     dns = compose["services"]["dns"]
@@ -663,30 +645,22 @@ def test_upstream_exit_must_match_host_configured_range(tmp_path: Path, monkeypa
     )
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            [], 0, stdout="8.8.8.8\n", stderr=""
-        ),
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout="8.8.8.8\n", stderr=""),
     )
     assert _check_upstream(config) == "8.8.8.8"
 
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            [], 0, stdout="9.9.9.9\n", stderr=""
-        ),
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout="9.9.9.9\n", stderr=""),
     )
     with pytest.raises(DeploymentError, match="不在声明范围"):
         _check_upstream(config)
 
 
-def test_host_parent_guard_allows_only_project_infrastructure(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_host_parent_guard_allows_only_project_infrastructure(tmp_path: Path, monkeypatch) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(
-            kind="http", host="127.0.0.1", port=11440, config_path=None
-        ),
+        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
     )
     manifest = _manifest(config, tmp_path)
     scripts: list[tuple[str, str]] = []
@@ -712,8 +686,7 @@ def test_host_parent_guard_allows_only_project_infrastructure(
     assert table == _host_parent_table(manifest)
     assert 'iifname "lo" tcp dport 11440 accept' in script
     assert (
-        'iifname "br-123456789012" ip saddr { 172.28.0.34, 172.28.0.35 } '
-        "tcp dport 11440 accept"
+        'iifname "br-123456789012" ip saddr { 172.28.0.34, 172.28.0.35 } tcp dport 11440 accept'
     ) in script
     assert 'iifname "br-123456789012" drop' in script
     assert "tcp dport 11440 drop" in script
@@ -722,9 +695,7 @@ def test_host_parent_guard_allows_only_project_infrastructure(
 def test_stopped_parent_guard_keeps_the_parent_proxy_loopback_only(tmp_path: Path) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(
-            kind="http", host="127.0.0.1", port=11440, config_path=None
-        ),
+        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
     )
     script = _stopped_host_parent_guard_script(config, _manifest(config, tmp_path))
 
@@ -737,18 +708,14 @@ def test_stopped_parent_guard_keeps_the_parent_proxy_loopback_only(tmp_path: Pat
 def test_parent_guard_service_reloads_in_one_nft_transaction(tmp_path: Path) -> None:
     initial = tmp_path / "guard.nft"
     reload = tmp_path / "guard.reload.nft"
-    script = _host_parent_guard_runner_script(
-        "/usr/sbin/nft", "cdm_parent_test", initial, reload
-    )
+    script = _host_parent_guard_runner_script("/usr/sbin/nft", "cdm_parent_test", initial, reload)
 
     assert "delete table" not in script
     assert f"exec $NFT -f {reload}" in script
     assert f"exec $NFT -f {initial}" in script
 
 
-def test_repeated_start_exits_before_changing_host_state(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_repeated_start_exits_before_changing_host_state(tmp_path: Path, monkeypatch) -> None:
     config = _host_config(tmp_path)
     manifest = _manifest(config, tmp_path)
     touched: list[str] = []
@@ -788,9 +755,7 @@ def test_repeated_start_exits_before_changing_host_state(
     assert touched == []
 
 
-def test_prepare_parent_guard_installs_loopback_only_state(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_prepare_parent_guard_installs_loopback_only_state(tmp_path: Path, monkeypatch) -> None:
     config = _host_config(tmp_path)
     manifest = _manifest(config, tmp_path)
     touched: list[str] = []
@@ -838,9 +803,7 @@ def _audit_state() -> dict[str, object]:
     }
 
 
-def test_audit_status_requires_exact_probe_and_namespace_sets(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_audit_status_requires_exact_probe_and_namespace_sets(tmp_path: Path, monkeypatch) -> None:
     config = _host_config(tmp_path)
     path = config.paths.state / "audit-active.json"
     path.parent.mkdir(parents=True)
@@ -940,9 +903,7 @@ def test_pcap_output_alias_binds_registered_audit_root(tmp_path: Path, monkeypat
     assert not alias.exists()
 
 
-def test_audit_start_write_failure_terminates_started_probe(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_audit_start_write_failure_terminates_started_probe(tmp_path: Path, monkeypatch) -> None:
     config = _host_config(tmp_path)
     manifest = _manifest(config, tmp_path)
     alias_root = tmp_path / "run-alias"
@@ -1017,6 +978,88 @@ def test_audit_stop_keeps_state_when_alias_unmount_fails(tmp_path: Path, monkeyp
     assert path.exists()
 
 
+def test_recover_runtime_starts_missing_instance_or_restarts_only_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._service_container_id",
+        lambda *_args: "",
+    )
+    started: list[str] = []
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime.compose_start_closed",
+        lambda _config: started.append("start"),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime.restart_audit",
+        lambda _config: started.append("audit"),
+    )
+
+    assert recover_runtime(config) == "started"
+    assert started == ["start"]
+
+    active = {"canary", "dns", "gateway", "target"}
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._service_container_id",
+        lambda _config, _manifest, service: service if service in active else "",
+    )
+    assert recover_runtime(config) == "audit_restarted"
+    assert started == ["start", "audit"]
+
+
+def test_restart_audit_reconfigures_network_without_container_restart(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    events: list[str] = []
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._service_container_id",
+        lambda _config, _manifest, service: service,
+    )
+    monkeypatch.setattr("controlled_dev_machine.runtime._service_healthy", lambda *_args: True)
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_policy_files", lambda *_args: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._disable_target_route",
+        lambda *_args: events.append("disable"),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._stop_audit", lambda *_args: events.append("stop")
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._check_upstream", lambda *_args: "204.1.123.50"
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._configure_host_parent_guard",
+        lambda *_args: events.append("guard"),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._configure_infrastructure_network",
+        lambda *_args: events.append("infra"),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._configure_target_network",
+        lambda *_args: events.append("target-net"),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._start_audit",
+        lambda *_args, **_kwargs: events.append("start-audit"),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._enable_target_route",
+        lambda *_args: events.append("enable"),
+    )
+
+    restart_audit.__wrapped__(config)
+
+    assert events == ["disable", "stop", "guard", "infra", "target-net", "start-audit", "enable"]
+
+
 def test_compose_stop_finishes_container_cleanup_after_audit_error(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1050,9 +1093,7 @@ def test_compose_stop_finishes_container_cleanup_after_audit_error(
     assert events == ["compose-down", "stopped-guard"]
 
 
-def test_ebpf_readiness_requires_observed_syscall_canaries(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_ebpf_readiness_requires_observed_syscall_canaries(tmp_path: Path, monkeypatch) -> None:
     class Process:
         returncode = 0
 
@@ -1109,14 +1150,10 @@ def test_ebpf_readiness_requires_observed_syscall_canaries(
         )
 
 
-def test_transparent_firewalls_allow_only_the_controlled_paths(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_transparent_firewalls_allow_only_the_controlled_paths(tmp_path: Path, monkeypatch) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(
-            kind="http", host="127.0.0.1", port=11440, config_path=None
-        ),
+        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
     )
     manifest = _manifest(config, tmp_path)
     pids = {"gateway": 101, "dns": 102, "target": 103}
@@ -1134,9 +1171,7 @@ def test_transparent_firewalls_allow_only_the_controlled_paths(
         "controlled_dev_machine.runtime._apply_nft",
         lambda pid, script: scripts.__setitem__(pid, script),
     )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._verify_nft_table", lambda _pid: None
-    )
+    monkeypatch.setattr("controlled_dev_machine.runtime._verify_nft_table", lambda _pid: None)
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._transparent_tcp_ports",
         lambda _manifest: (80, 443, 18680),
@@ -1315,9 +1350,7 @@ def test_lifecycle_lock_is_global_for_the_user(tmp_path: Path, monkeypatch) -> N
     config = _host_config(tmp_path)
     alternate = replace(config, instance="second")
     lock_root = tmp_path / "locks"
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", lock_root
-    )
+    monkeypatch.setattr("controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", lock_root)
     with (
         _lifecycle_lock(config),
         pytest.raises(DeploymentError, match="生命周期操作"),
@@ -1455,8 +1488,7 @@ def test_compose_shell_forwards_terminal_capabilities(
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._compose",
         lambda _config, _manifest, *args, **kwargs: (
-            compose_calls.append((args, kwargs))
-            or subprocess.CompletedProcess(args, 0)
+            compose_calls.append((args, kwargs)) or subprocess.CompletedProcess(args, 0)
         ),
     )
 
