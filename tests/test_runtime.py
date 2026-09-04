@@ -1329,6 +1329,16 @@ def test_ssh_firewalls_use_explicit_tailscale_targets_without_proxy_redirect(
     docker_user_rules = [command for command in commands if "DOCKER-USER" in command]
     assert any("-S" in command for command in docker_user_rules)
     assert sum("-I" in command for command in docker_user_rules) == 8
+    assert [
+        "ip",
+        "route",
+        "replace",
+        "172.28.0.3/32",
+        "via",
+        "172.28.0.34",
+        "dev",
+        "br-test",
+    ] in commands
 
 
 def test_existing_runtime_does_not_take_ssh_settings_before_init(

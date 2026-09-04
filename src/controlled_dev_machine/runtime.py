@@ -1809,6 +1809,18 @@ def _configure_host_ssh_forward_rules(
     iptables = shutil.which("iptables")
     if iptables is None:
         raise DeploymentError("Tailscale SSH 转发要求宿主提供 iptables")
+    _run(
+        [
+            "ip",
+            "route",
+            "replace",
+            f"{manifest.target_address}/32",
+            "via",
+            manifest.gateway_upstream_address,
+            "dev",
+            bridge,
+        ]
+    )
     comment = _host_ssh_forward_comment(manifest)
     for address in manifest.ssh_allowed_addresses:
         for port in manifest.ssh_ports:
