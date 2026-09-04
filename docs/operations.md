@@ -124,7 +124,7 @@ ssh:
   ports: [22, 10090]
 ```
 
-`ssh.allowed_addresses` 只能填写 `100.64.0.0/10` 中、已经从宿主逐一验证过的地址；不能填写整个网段或公网地址。先在宿主用 `ssh -G <主机别名>` 检查最终 HostName、端口、用户、密钥和 `ProxyJump`，再用短命令 `ssh -o BatchMode=yes -o ConnectTimeout=5 <主机别名> true` 验证登录。SSH 开关、接口、地址和端口会写入运行清单快照；只改 `host.yaml` 不会改变当前运行实例，`recover` 和 `audit restart` 也继续使用旧快照。用户确认可以中断后，使用当前策略执行 `stop -> init --policy <当前策略> -> start`，不需要为这项改动重新构建镜像。随后从容器分别验证宿主 SSH 和已登记 Tailscale 目标，并确认未登记地址仍失败。
+`ssh.allowed_addresses` 只能填写 `100.64.0.0/10` 中、已经从宿主逐一验证过的地址；不能填写整个网段或公网地址。先在宿主用 `ssh -G <主机别名>` 检查最终 HostName、端口、用户、密钥和 `ProxyJump`，再用短命令 `ssh -o BatchMode=yes -o ConnectTimeout=5 <主机别名> true` 验证登录。SSH 开关、接口、地址和端口会写入运行清单快照；只改 `host.yaml` 不会改变当前运行实例，`recover` 和 `audit restart` 也继续使用旧快照。用户确认可以中断后，使用当前策略执行 `stop -> init --policy <当前策略> -> build -> start`。控制器源码属于构建摘要输入，因此即使 SSH 转发不向镜像新增文件，这次代码更新后仍必须重新构建。随后从容器分别验证宿主 SSH 和已登记 Tailscale 目标，并确认未登记地址仍失败。
 
 编辑完成后再校验：
 
