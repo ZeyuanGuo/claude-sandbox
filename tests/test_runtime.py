@@ -10,6 +10,7 @@ import pytest
 from controlled_dev_machine.config import (
     HostProfile,
     ProjectMount,
+    SshConfig,
     UpstreamConfig,
     load_host_config,
 )
@@ -41,6 +42,7 @@ from controlled_dev_machine.runtime import (
     _profile_bundle,
     _profile_directory_digest,
     _profile_integrity_digest,
+    _remove_host_ssh_forward_rules,
     _remove_pcap_output_alias,
     _require_deployable_policy,
     _require_gateway_image,
@@ -705,6 +707,38 @@ def test_stopped_parent_guard_keeps_the_parent_proxy_loopback_only(tmp_path: Pat
     assert "172.28.0.35" not in script
 
 
+def test_stopped_state_removes_only_this_instance_ssh_forward_rules(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    commands: list[list[str]] = []
+    rules = "\n".join(
+        (
+            "-N DOCKER-USER",
+            "-A DOCKER-USER -s 172.28.0.3 -m comment "
+            '--comment cdm-u1000-main-ssh -j ACCEPT',
+            "-A DOCKER-USER -s 172.17.0.2 -m comment --comment unrelated -j ACCEPT",
+        )
+    )
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=rules)
+
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime.shutil.which", lambda _name: "/sbin/iptables"
+    )
+    monkeypatch.setattr("controlled_dev_machine.runtime._run", run)
+
+    _remove_host_ssh_forward_rules(manifest)
+
+    deletes = [command for command in commands if "-D" in command]
+    assert len(deletes) == 1
+    assert "cdm-u1000-main-ssh" in deletes[0]
+    assert "unrelated" not in deletes[0]
+
+
 def test_parent_guard_service_reloads_in_one_nft_transaction(tmp_path: Path) -> None:
     initial = tmp_path / "guard.nft"
     reload = tmp_path / "guard.reload.nft"
@@ -1204,6 +1238,124 @@ def test_transparent_firewalls_allow_only_the_controlled_paths(tmp_path: Path, m
     assert "tcp dport @audit_tcp_ports accept" in target
     assert "policy drop" in target
     assert any(command[-3:] == ["default", "via", "172.28.0.2"] for command in commands)
+
+
+def test_ssh_firewalls_use_explicit_tailscale_targets_without_proxy_redirect(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = replace(
+        _host_config(tmp_path),
+        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
+        ssh=SshConfig(
+            enabled=True,
+            interface="tailscale0",
+            allowed_addresses=("100.72.7.86", "100.117.92.79"),
+            ports=(22, 10090),
+        ),
+    )
+    manifest = replace(
+        _manifest(config, tmp_path),
+        ssh_enabled=True,
+        ssh_interface="tailscale0",
+        ssh_allowed_addresses=("100.72.7.86", "100.117.92.79"),
+        ssh_ports=(22, 10090),
+    )
+    pids = {"gateway": 101, "dns": 102, "target": 103}
+    scripts: dict[int, str] = {}
+    commands: list[list[str]] = []
+    host_script: list[str] = []
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._service_pid",
+        lambda _config, _manifest, service: pids[service],
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._container_host_address",
+        lambda _pid, _host: "172.30.0.1",
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._apply_nft",
+        lambda pid, script: scripts.__setitem__(pid, script),
+    )
+    monkeypatch.setattr("controlled_dev_machine.runtime._verify_nft_table", lambda _pid: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._transparent_tcp_ports",
+        lambda _manifest: (80, 443),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._run",
+        lambda command, **_kwargs: commands.append(command),
+    )
+
+    _configure_infrastructure_network(config, manifest)
+    _configure_target_network(config, manifest)
+
+    gateway = scripts[101]
+    assert "audit_ssh_addresses" in gateway
+    assert "ip daddr @audit_ssh_addresses" in gateway
+    assert "tcp dport @audit_ssh_ports accept" in gateway
+    assert "redirect to :8080" in gateway
+    assert any(
+        any("net.ipv4.ip_forward=1" in part for part in command) for command in commands
+    )
+    assert sum(any(part == "route" for part in command) for command in commands) == 2
+
+    target = scripts[103]
+    assert "ip daddr @audit_ssh_addresses" in target
+    assert "tcp dport @audit_ssh_ports accept" in target
+
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._upstream_bridge_name",
+        lambda _config, _manifest: "br-test",
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._network_interface_exists", lambda _interface: True
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._apply_host_nft",
+        lambda _table, script: host_script.append(script),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._run",
+        lambda command, **_kwargs: (
+            commands.append(command)
+            or SimpleNamespace(returncode=0, stdout="tcp dport 11440 drop\n")
+        ),
+    )
+    _configure_host_parent_guard(config, manifest)
+    assert "set ssh_addresses" in host_script[0]
+    assert 'oifname "tailscale0"' in host_script[0]
+    assert "tcp dport @ssh_ports accept" in host_script[0]
+    assert "masquerade" in host_script[0]
+    docker_user_rules = [command for command in commands if "DOCKER-USER" in command]
+    assert any("-S" in command for command in docker_user_rules)
+    assert sum("-I" in command for command in docker_user_rules) == 8
+
+
+def test_existing_runtime_does_not_take_ssh_settings_before_init(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = replace(
+        _host_config(tmp_path),
+        ssh=SshConfig(
+            enabled=True,
+            interface="tailscale0",
+            allowed_addresses=("100.72.7.86",),
+            ports=(22,),
+        ),
+    )
+    manifest = _manifest(config, tmp_path)
+    scripts: list[str] = []
+    monkeypatch.setattr("controlled_dev_machine.runtime._service_pid", lambda *_args: 103)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._apply_nft",
+        lambda _pid, script: scripts.append(script),
+    )
+    monkeypatch.setattr("controlled_dev_machine.runtime._verify_nft_table", lambda _pid: None)
+
+    _configure_target_network(config, manifest)
+
+    assert manifest.ssh_enabled is False
+    assert "audit_ssh" not in scripts[0]
 
 
 def _gateway_source_tree(root: Path) -> None:

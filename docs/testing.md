@@ -16,7 +16,7 @@ sudo bin/sandboxctl verify-closed
 
 - 容器没有代理变量或专用 CA 路径，普通系统 DNS 只能经过受控 DNS；
 - 普通公网 DNS 经父代理解析；危险地址、异常查询类型和解析失败在本地拒绝；
-- TCP/22、普通 UDP/443 和外部 DNS 被拒绝，目的 IP 与 DNS 租约不符时网关返回本地 403；
+- 公网和未登记目标的 TCP/22、普通 UDP/443 和外部 DNS 被拒绝；精确登记的 Tailscale SSH 地址/端口作为单独路径验证，目的 IP 与 DNS 租约不符时网关返回本地 403；
 - 短 TTL 到期后，同一域名和同一已验证公网 IP 在 60 秒宽限内仍可建连，未解析过的 IP 继续拒绝；
 - 透明端口上的原始 TCP、请求 Upgrade、应用层 `CONNECT` 和上游 `101 Switching Protocols` 被阻断；
 - 策略摘要不一致时请求本地失败，网关变为不健康；
@@ -28,6 +28,8 @@ sudo bin/sandboxctl verify-closed
 - 拒绝和客户端断开不会到达 canary。
 
 负向测试使用隔离 canary 或保留测试地址，不访问真实内网、云元数据或第三方服务。只要某项产生了未预期的外部包，就停止后续放行。
+
+启用 SSH 配置后，正向测试只使用 `ssh.allowed_addresses` 中的目标和 `ssh.ports` 中的端口，并从容器执行一次无副作用的 `true`；负向测试至少包含一个未登记的 Tailscale 地址或端口、一个公网 TCP/22 和容器到宿主的未登记端口。SSH 不经过策略网关，没有明文 flow；以 cgroup `connect()`、目标/网关 PCAP、返回码和宿主 Tailscale 连接状态共同判断。
 
 ## 第二步：证明正文和连接可以对应
 

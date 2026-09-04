@@ -87,6 +87,10 @@ class RuntimeManifest:
     profile_digest: str = ""
     profile_source_digest: str = ""
     target_build_digest: str = ""
+    ssh_enabled: bool = False
+    ssh_interface: str = "tailscale0"
+    ssh_allowed_addresses: tuple[str, ...] = ()
+    ssh_ports: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -407,6 +411,10 @@ def load_runtime(config: HostConfig) -> RuntimeManifest:
     _require_current_generation(config)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
+        if "ssh_allowed_addresses" in raw:
+            raw["ssh_allowed_addresses"] = tuple(raw["ssh_allowed_addresses"])
+        if "ssh_ports" in raw:
+            raw["ssh_ports"] = tuple(raw["ssh_ports"])
         manifest = RuntimeManifest(**raw)
     except FileNotFoundError as exc:
         raise DeploymentError("运行环境尚未初始化；先执行 sandboxctl init") from exc
@@ -414,6 +422,7 @@ def load_runtime(config: HostConfig) -> RuntimeManifest:
         raise DeploymentError(f"运行清单损坏: {path}") from exc
     if manifest.schema_version != 4 or manifest.resource_prefix != config.resource_prefix:
         raise DeploymentError("运行清单与当前主机配置不一致")
+    _validate_manifest_ssh(manifest)
     expected = config.paths.state / "generated" / "current" / "compose.closed.yaml"
     if Path(manifest.compose_path) != expected:
         raise DeploymentError("运行清单中的 Compose 路径不属于当前实例")
@@ -430,6 +439,30 @@ def load_runtime(config: HostConfig) -> RuntimeManifest:
         if _profile_directory_digest(profile_path) != manifest.profile_digest:
             raise DeploymentError("运行 profile 与运行清单摘要不一致")
     return manifest
+
+
+def _validate_manifest_ssh(manifest: RuntimeManifest) -> None:
+    if not isinstance(manifest.ssh_enabled, bool):
+        raise DeploymentError("运行清单中的 SSH 开关无效")
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", manifest.ssh_interface) is None:
+        raise DeploymentError("运行清单中的 SSH 网络接口无效")
+    if manifest.ssh_enabled and (
+        not manifest.ssh_allowed_addresses or not manifest.ssh_ports
+    ):
+        raise DeploymentError("运行清单中的 SSH 地址或端口为空")
+    tailscale_network = ipaddress.ip_network("100.64.0.0/10")
+    for value in manifest.ssh_allowed_addresses:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise DeploymentError("运行清单中的 SSH 地址无效") from exc
+        if not isinstance(address, ipaddress.IPv4Address) or address not in tailscale_network:
+            raise DeploymentError("运行清单中的 SSH 地址不属于 Tailscale IPv4 范围")
+    if any(
+        not isinstance(port, int) or isinstance(port, bool) or port < 1 or port > 65535
+        for port in manifest.ssh_ports
+    ):
+        raise DeploymentError("运行清单中的 SSH 端口无效")
 
 
 @_locked_lifecycle
@@ -501,6 +534,10 @@ def prepare_runtime(
         profile_digest=profile_digest,
         profile_source_digest=profile_source_digest,
         target_build_digest=target_build_digest,
+        ssh_enabled=config.ssh.enabled,
+        ssh_interface=config.ssh.interface,
+        ssh_allowed_addresses=config.ssh.allowed_addresses,
+        ssh_ports=config.ssh.ports,
         **addresses,
     )
     generation_policy = generation / "policy.active.yaml"
@@ -1583,6 +1620,19 @@ def _configure_infrastructure_network(config: HostConfig, manifest: RuntimeManif
     if dns_upstream_address != upstream_address:
         raise DeploymentError("网关与 DNS 看到的父代理地址不一致")
     tcp_ports = _nft_port_set(_transparent_tcp_ports(manifest))
+    ssh_sets = ""
+    ssh_forward = ""
+    if manifest.ssh_enabled:
+        ssh_sets = """
+  set audit_ssh_addresses { type ipv4_addr; flags timeout; timeout 5s; }
+  set audit_ssh_ports { type inet_service; flags timeout; timeout 5s; }
+"""
+        ssh_forward = f"""
+    ip saddr @audit_ssh_addresses ip daddr {manifest.target_address}
+      tcp sport @audit_ssh_ports ct state established,related accept
+    ip saddr {manifest.target_address} ip daddr @audit_ssh_addresses
+      tcp dport @audit_ssh_ports accept
+"""
     _apply_nft(
         gateway_pid,
         f"""
@@ -1590,6 +1640,7 @@ table inet cdm_control {{
   set audit_parent_addresses {{ type ipv4_addr; flags timeout; timeout 5s; }}
   set audit_canary_addresses {{ type ipv4_addr; flags timeout; timeout 5s; }}
   set audit_target_addresses {{ type ipv4_addr; flags timeout; timeout 5s; }}
+{ssh_sets}
   chain prerouting {{
     type nat hook prerouting priority dstnat; policy accept;
     ip saddr {manifest.target_address} tcp dport {{ {tcp_ports} }} redirect to :8080
@@ -1602,6 +1653,7 @@ table inet cdm_control {{
   }}
   chain forward {{
     type filter hook forward priority filter; policy drop;
+{ssh_forward}
   }}
   chain output {{
     type filter hook output priority filter; policy drop;
@@ -1638,6 +1690,42 @@ table inet cdm_control {{
     )
     _verify_nft_table(gateway_pid)
     _verify_nft_table(dns_pid)
+    if manifest.ssh_enabled:
+        _configure_gateway_ssh_route(manifest, gateway_pid, upstream_address)
+
+
+def _configure_gateway_ssh_route(
+    manifest: RuntimeManifest, gateway_pid: int, upstream_address: str
+) -> None:
+    """Route the exact Tailscale SSH destinations through the host bridge."""
+    _run(
+        [
+            "nsenter",
+            "--target",
+            str(gateway_pid),
+            "--net",
+            "--",
+            "sysctl",
+            "-w",
+            "net.ipv4.ip_forward=1",
+        ]
+    )
+    for address in manifest.ssh_allowed_addresses:
+        _run(
+            [
+                "nsenter",
+                "--target",
+                str(gateway_pid),
+                "--net",
+                "--",
+                "ip",
+                "route",
+                "replace",
+                f"{address}/32",
+                "via",
+                upstream_address,
+            ]
+        )
 
 
 def _configure_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) -> None:
@@ -1646,17 +1734,50 @@ def _configure_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) 
     bridge = _upstream_bridge_name(config, manifest)
     table = _host_parent_table(manifest)
     sources = ", ".join((manifest.gateway_upstream_address, manifest.dns_upstream_address))
+    ssh_sets = ""
+    ssh_input_rule = ""
+    ssh_chains = ""
+    if manifest.ssh_enabled:
+        ssh_addresses = _nft_ipv4_set(manifest.ssh_allowed_addresses)
+        ssh_ports = _nft_port_set(manifest.ssh_ports)
+        ssh_sets = f"""
+  set ssh_addresses {{ type ipv4_addr; elements = {{ {ssh_addresses} }} }}
+  set ssh_ports {{ type inet_service; elements = {{ {ssh_ports} }} }}
+"""
+        ssh_input_rule = f"""
+    iifname "{bridge}" ip saddr {manifest.target_address}
+      ip daddr @ssh_addresses tcp dport @ssh_ports accept
+"""
+        ssh_chains = f"""
+  chain forward {{
+    type filter hook forward priority -20; policy accept;
+    iifname "{manifest.ssh_interface}" oifname "{bridge}" ip saddr @ssh_addresses
+      ip daddr {manifest.target_address} tcp sport @ssh_ports ct state established,related accept
+    iifname "{bridge}" oifname "{manifest.ssh_interface}" ip saddr {manifest.target_address}
+      ip daddr @ssh_addresses tcp dport @ssh_ports accept
+    iifname "{bridge}" oifname "{manifest.ssh_interface}" ip saddr {manifest.target_address}
+      ip daddr @ssh_addresses tcp dport @ssh_ports drop
+  }}
+  chain postrouting {{
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "{manifest.ssh_interface}" ip saddr {manifest.target_address}
+      ip daddr @ssh_addresses tcp dport @ssh_ports masquerade
+  }}
+"""
     _apply_host_nft(
         table,
         f"""
 table inet {table} {{
+{ssh_sets}
   chain input {{
     type filter hook input priority -20; policy accept;
     iifname "lo" tcp dport {config.upstream.port} accept
     iifname "{bridge}" ip saddr {{ {sources} }} tcp dport {config.upstream.port} accept
+{ssh_input_rule}
     iifname "{bridge}" drop
     tcp dport {config.upstream.port} drop
   }}
+{ssh_chains}
 }}
 """,
     )
@@ -1666,13 +1787,124 @@ table inet {table} {{
     )
     if f"tcp dport {config.upstream.port} drop" not in result.stdout:
         raise DeploymentError("宿主父代理防火墙没有默认拒绝规则")
+    _configure_host_ssh_forward_rules(manifest, bridge)
 
 
 def _configure_stopped_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) -> None:
     if config.upstream.kind != "http" or config.upstream.port is None:
         raise DeploymentError("宿主父代理防火墙要求本机 HTTP 父代理")
+    _remove_host_ssh_forward_rules(manifest)
     table = _host_parent_table(manifest)
     _apply_host_nft(table, _stopped_host_parent_guard_script(config, manifest))
+
+
+def _configure_host_ssh_forward_rules(
+    manifest: RuntimeManifest, bridge: str
+) -> None:
+    _remove_host_ssh_forward_rules(manifest)
+    if not manifest.ssh_enabled:
+        return
+    if not _network_interface_exists(manifest.ssh_interface):
+        raise DeploymentError(f"SSH 网络接口不存在: {manifest.ssh_interface}")
+    iptables = shutil.which("iptables")
+    if iptables is None:
+        raise DeploymentError("Tailscale SSH 转发要求宿主提供 iptables")
+    comment = _host_ssh_forward_comment(manifest)
+    for address in manifest.ssh_allowed_addresses:
+        for port in manifest.ssh_ports:
+            _run(
+                [
+                    iptables,
+                    "-w",
+                    "-I",
+                    "DOCKER-USER",
+                    "1",
+                    "-i",
+                    bridge,
+                    "-o",
+                    manifest.ssh_interface,
+                    "-s",
+                    manifest.target_address,
+                    "-d",
+                    address,
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    str(port),
+                    "-m",
+                    "comment",
+                    "--comment",
+                    comment,
+                    "-j",
+                    "ACCEPT",
+                ]
+            )
+            _run(
+                [
+                    iptables,
+                    "-w",
+                    "-I",
+                    "DOCKER-USER",
+                    "1",
+                    "-i",
+                    manifest.ssh_interface,
+                    "-o",
+                    bridge,
+                    "-s",
+                    address,
+                    "-d",
+                    manifest.target_address,
+                    "-p",
+                    "tcp",
+                    "--sport",
+                    str(port),
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "ESTABLISHED,RELATED",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    comment,
+                    "-j",
+                    "ACCEPT",
+                ]
+            )
+
+
+def _remove_host_ssh_forward_rules(manifest: RuntimeManifest) -> None:
+    iptables = shutil.which("iptables")
+    if iptables is None:
+        return
+    result = _run(
+        [iptables, "-w", "-S", "DOCKER-USER"],
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        return
+    comment = _host_ssh_forward_comment(manifest)
+    for line in result.stdout.splitlines():
+        try:
+            rule = shlex.split(line)
+        except ValueError as exc:
+            raise DeploymentError("无法解析宿主 DOCKER-USER 规则") from exc
+        if not rule or rule[0] != "-A":
+            continue
+        if "--comment" not in rule:
+            continue
+        index = rule.index("--comment")
+        if index + 1 >= len(rule) or rule[index + 1] != comment:
+            continue
+        _run([iptables, "-w", "-D", *rule[1:]])
+
+
+def _host_ssh_forward_comment(manifest: RuntimeManifest) -> str:
+    return f"{manifest.resource_prefix}-ssh"
+
+
+def _network_interface_exists(interface: str) -> bool:
+    return Path("/sys/class/net", interface).is_dir()
 
 
 def _stopped_host_parent_guard_script(config: HostConfig, manifest: RuntimeManifest) -> str:
@@ -1697,6 +1929,8 @@ def _install_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) ->
     systemctl = shutil.which("systemctl")
     if nft is None or systemctl is None:
         raise DeploymentError("持久父代理门禁要求宿主提供 nft 和 systemctl")
+    if manifest.ssh_enabled and shutil.which("iptables") is None:
+        raise DeploymentError("Tailscale SSH 转发要求宿主提供 iptables")
 
     guard_root = Path("/etc/controlled-dev-machine")
     _mkdir(guard_root, 0o755, 0, 0)
@@ -1726,6 +1960,11 @@ def _install_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) ->
         _host_parent_guard_runner_script(nft, table, nft_path, reload_path),
         mode=0o755,
     )
+    forwarding_preflight = (
+        "ExecStartPre=/usr/bin/sysctl -w net.ipv4.ip_forward=1\n"
+        if manifest.ssh_enabled
+        else ""
+    )
     _atomic_text(
         unit_path,
         (
@@ -1736,10 +1975,11 @@ def _install_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) ->
             "Before=network-pre.target docker.service\n\n"
             "[Service]\n"
             "Type=oneshot\n"
-            f"ExecStart={runner_path}\n"
-            "RemainAfterExit=yes\n\n"
-            "[Install]\n"
-            "WantedBy=multi-user.target\n"
+            + forwarding_preflight
+            + f"ExecStart={runner_path}\n"
+            + "RemainAfterExit=yes\n\n"
+            + "[Install]\n"
+            + "WantedBy=multi-user.target\n"
         ),
         mode=0o644,
     )
@@ -1762,6 +2002,7 @@ def _host_parent_guard_runner_script(
 
 
 def _remove_host_parent_guard(manifest: RuntimeManifest) -> None:
+    _remove_host_ssh_forward_rules(manifest)
     table = _host_parent_table(manifest)
     result = _run(
         ["nft", "list", "table", "inet", table],
@@ -1810,12 +2051,25 @@ def _apply_host_nft(table: str, script: str) -> None:
 
 def _configure_target_network(config: HostConfig, manifest: RuntimeManifest) -> None:
     target_pid = _service_pid(config, manifest, "target")
+    ssh_rules = ""
+    ssh_sets = ""
+    if manifest.ssh_enabled:
+        ssh_sets = """
+  set audit_ssh_addresses { type ipv4_addr; flags timeout; timeout 5s; }
+  set audit_ssh_ports { type inet_service; flags timeout; timeout 5s; }
+"""
+        ssh_rules = """
+    ip daddr @audit_ssh_addresses tcp dport @audit_ssh_ports accept
+"""
     _apply_nft(
         target_pid,
         """
 table inet cdm_control {
   set audit_tcp_ports { type inet_service; flags timeout; timeout 5s; }
   set audit_dns_addresses { type ipv4_addr; flags timeout; timeout 5s; }
+"""
+        + ssh_sets
+        + """
   chain input {
     type filter hook input priority filter; policy drop;
     iifname "lo" accept
@@ -1827,6 +2081,9 @@ table inet cdm_control {
     ip daddr @audit_dns_addresses udp dport 53 accept
     ip daddr @audit_dns_addresses tcp dport 53 accept
     tcp dport @audit_tcp_ports accept
+"""
+        + ssh_rules
+        + """
   }
 }
 """,
@@ -1893,6 +2150,21 @@ def _nft_port_set(ports: tuple[int, ...]) -> str:
     if not ports or any(port < 1 or port > 65535 for port in ports):
         raise DeploymentError("透明网络 TCP 端口集合无效")
     return ", ".join(str(port) for port in ports)
+
+
+def _nft_ipv4_set(addresses: tuple[str, ...]) -> str:
+    if not addresses:
+        raise DeploymentError("IPv4 地址集合不能为空")
+    normalized: list[str] = []
+    for value in addresses:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise DeploymentError(f"IPv4 地址集合包含无效地址: {value}") from exc
+        if not isinstance(address, ipaddress.IPv4Address):
+            raise DeploymentError(f"IPv4 地址集合包含非 IPv4 地址: {value}")
+        normalized.append(str(address))
+    return ", ".join(normalized)
 
 
 def _container_host_address(pid: int, hostname: str) -> str:
@@ -2368,6 +2640,64 @@ def _start_audit(
         dns_upstream_address = _container_host_address(dns_pid, "upstream.cdm.test")
         target_network = ipaddress.ip_network(manifest.target_subnet)
         dns_address = str(list(target_network.hosts())[3])
+        target_watchdog_sets = [
+            {
+                "name": "audit_tcp_ports",
+                "kind": "port",
+                "values": list(_transparent_tcp_ports(manifest)),
+            },
+            {
+                "name": "audit_dns_addresses",
+                "kind": "ipv4",
+                "values": [dns_address],
+            },
+        ]
+        gateway_watchdog_sets = [
+            {
+                "name": "audit_parent_addresses",
+                "kind": "ipv4",
+                "values": [upstream_address],
+            },
+            {
+                "name": "audit_canary_addresses",
+                "kind": "ipv4",
+                "values": [manifest.canary_address],
+            },
+            {
+                "name": "audit_target_addresses",
+                "kind": "ipv4",
+                "values": [manifest.target_address],
+            },
+        ]
+        if manifest.ssh_enabled:
+            target_watchdog_sets.extend(
+                (
+                    {
+                        "name": "audit_ssh_addresses",
+                        "kind": "ipv4",
+                        "values": list(manifest.ssh_allowed_addresses),
+                    },
+                    {
+                        "name": "audit_ssh_ports",
+                        "kind": "port",
+                        "values": list(manifest.ssh_ports),
+                    },
+                )
+            )
+            gateway_watchdog_sets.extend(
+                (
+                    {
+                        "name": "audit_ssh_addresses",
+                        "kind": "ipv4",
+                        "values": list(manifest.ssh_allowed_addresses),
+                    },
+                    {
+                        "name": "audit_ssh_ports",
+                        "kind": "port",
+                        "values": list(manifest.ssh_ports),
+                    },
+                )
+            )
         watchdog = {
             "schema_version": 2,
             "lease_seconds": 5,
@@ -2385,41 +2715,14 @@ def _start_audit(
                     "pid": target_pid,
                     "starttime": namespaces[0]["starttime"],
                     "identity": namespaces[0]["identity"],
-                    "sets": [
-                        {
-                            "name": "audit_tcp_ports",
-                            "kind": "port",
-                            "values": list(_transparent_tcp_ports(manifest)),
-                        },
-                        {
-                            "name": "audit_dns_addresses",
-                            "kind": "ipv4",
-                            "values": [dns_address],
-                        },
-                    ],
+                    "sets": target_watchdog_sets,
                 },
                 {
                     "name": "gateway",
                     "pid": gateway_pid,
                     "starttime": namespaces[1]["starttime"],
                     "identity": namespaces[1]["identity"],
-                    "sets": [
-                        {
-                            "name": "audit_parent_addresses",
-                            "kind": "ipv4",
-                            "values": [upstream_address],
-                        },
-                        {
-                            "name": "audit_canary_addresses",
-                            "kind": "ipv4",
-                            "values": [manifest.canary_address],
-                        },
-                        {
-                            "name": "audit_target_addresses",
-                            "kind": "ipv4",
-                            "values": [manifest.target_address],
-                        },
-                    ],
+                    "sets": gateway_watchdog_sets,
                 },
                 {
                     "name": "dns",

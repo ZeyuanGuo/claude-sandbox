@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import pwd
 import re
@@ -88,6 +89,14 @@ class UpstreamConfig:
 
 
 @dataclass(frozen=True)
+class SshConfig:
+    enabled: bool
+    interface: str
+    allowed_addresses: tuple[str, ...]
+    ports: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class HostProfile:
     claude_instructions: Path | None
     bashrc: Path | None
@@ -110,6 +119,7 @@ class HostConfig:
     storage: StorageConfig
     mounts: tuple[ProjectMount, ...]
     upstream: UpstreamConfig
+    ssh: SshConfig
     profile: HostProfile
 
     @property
@@ -233,6 +243,7 @@ def create_host_config(path: Path) -> None:
         (".codex", ".codex", "rw"),
         (".config/git", ".config/git", "rw"),
         (".ssh", ".ssh", "ro"),
+        (".local/share/gamma-ssh", ".local/share/gamma-ssh", "ro"),
         (".condarc", ".condarc", "rw"),
     ):
         source = home / host_relative
@@ -292,6 +303,12 @@ def create_host_config(path: Path) -> None:
             "port": 11450,
             "expected_exit_cidr": None,
             "config_path": None,
+        },
+        "ssh": {
+            "enabled": False,
+            "interface": "tailscale0",
+            "allowed_addresses": [],
+            "ports": [22, 10090],
         },
         "profile": profile,
         "mounts": mounts,
@@ -443,6 +460,66 @@ def load_host_config(path: Path) -> HostConfig:
         expected_exit_cidr=expected_exit_cidr,
     )
 
+    ssh_raw = _mapping(
+        root.get(
+            "ssh",
+            {
+                "enabled": False,
+                "interface": "tailscale0",
+                "allowed_addresses": [],
+                "ports": [22, 10090],
+            },
+        ),
+        "ssh",
+    )
+    ssh_enabled = ssh_raw.get("enabled", False)
+    if not isinstance(ssh_enabled, bool):
+        raise ConfigError("ssh.enabled 必须是布尔值")
+    ssh_interface = _string(ssh_raw.get("interface", "tailscale0"), "ssh.interface")
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", ssh_interface) is None:
+        raise ConfigError("ssh.interface 必须是有效的网络接口名")
+    address_values = ssh_raw.get("allowed_addresses", [])
+    if not isinstance(address_values, list) or not all(
+        isinstance(value, str) for value in address_values
+    ):
+        raise ConfigError("ssh.allowed_addresses 必须是 IPv4 地址列表")
+    allowed_addresses: list[str] = []
+    for index, value in enumerate(address_values):
+        try:
+            address = ipaddress.ip_address(value.strip())
+        except ValueError as exc:
+            raise ConfigError(f"ssh.allowed_addresses[{index}] 必须是 IPv4 地址") from exc
+        if not isinstance(address, ipaddress.IPv4Address):
+            raise ConfigError(f"ssh.allowed_addresses[{index}] 必须是 IPv4 地址")
+        if address not in ipaddress.ip_network("100.64.0.0/10"):
+            raise ConfigError("ssh.allowed_addresses 只能使用 Tailscale IPv4 地址范围")
+        normalized = str(address)
+        if normalized in allowed_addresses:
+            raise ConfigError(f"ssh.allowed_addresses 不能重复: {normalized}")
+        allowed_addresses.append(normalized)
+    if ssh_enabled and not allowed_addresses:
+        raise ConfigError("启用 SSH 时必须填写 ssh.allowed_addresses")
+    port_values = ssh_raw.get("ports", [22, 10090])
+    if not isinstance(port_values, list) or not all(
+        isinstance(value, int) and not isinstance(value, bool) for value in port_values
+    ):
+        raise ConfigError("ssh.ports 必须是整数列表")
+    ports: list[int] = []
+    for value in port_values:
+        if value < 1 or value > 65535:
+            raise ConfigError("ssh.ports 必须在 1 到 65535 之间")
+        if value in ports:
+            raise ConfigError(f"ssh.ports 不能重复: {value}")
+        ports.append(value)
+    if ssh_enabled and not ports:
+        raise ConfigError("启用 SSH 时必须填写 ssh.ports")
+    ssh = SshConfig(
+        enabled=ssh_enabled,
+        interface=ssh_interface,
+        allowed_addresses=tuple(allowed_addresses),
+        ports=tuple(ports),
+    )
+
     profile_raw = _mapping(root.get("profile", {}), "profile")
     environment_value = profile_raw.get("default_conda_env")
     default_conda_env = (
@@ -496,6 +573,7 @@ def load_host_config(path: Path) -> HostConfig:
         storage=storage,
         mounts=mounts,
         upstream=upstream,
+        ssh=ssh,
         profile=profile,
     )
 

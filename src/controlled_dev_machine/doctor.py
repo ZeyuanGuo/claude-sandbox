@@ -60,6 +60,7 @@ def run_doctor(config: HostConfig) -> tuple[Check, ...]:
         _systemd_check(),
         _filesystem_check("root_storage", Path("/"), config.storage.root),
         _filesystem_check("audit_storage", config.paths.audit, config.storage.audit),
+        _ssh_host_check(config),
     ]
     for command, required in (
         ("docker", True),
@@ -73,6 +74,7 @@ def run_doctor(config: HostConfig) -> tuple[Check, ...]:
         ("openssl", True),
         ("systemctl", True),
         ("ip", True),
+        ("iptables", config.ssh.enabled),
         ("nvidia-ctk", config.gpu.mode == "all"),
     ):
         checks.append(_command_check(command, required=required))
@@ -347,6 +349,80 @@ def _command_check(command: str, *, required: bool) -> Check:
     )
 
 
+def _ssh_host_check(config: HostConfig) -> Check:
+    if not config.ssh.enabled:
+        return Check(
+            "ssh_host",
+            CheckLevel.PASS,
+            "主机配置未启用 SSH 出站路径",
+            {"enabled": False},
+        )
+    interface_path = Path("/sys/class/net", config.ssh.interface)
+    interface_ok = interface_path.is_dir()
+    route_failures: list[str] = []
+    ip = shutil.which("ip")
+    if ip is None:
+        route_failures.extend(config.ssh.allowed_addresses)
+    else:
+        for address in config.ssh.allowed_addresses:
+            result = subprocess.run(
+                [ip, "route", "get", address],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                route_failures.append(address)
+    expected_mounts = {config.target.home / ".ssh"}
+    gamma_ssh = config.target.home / ".local/share/gamma-ssh"
+    if gamma_ssh.exists():
+        expected_mounts.add(gamma_ssh)
+    ssh_mounts = [
+        mount
+        for mount in config.mounts
+        if mount.container_path in expected_mounts
+    ]
+    mounted_targets = {mount.container_path for mount in ssh_mounts}
+    unconfigured_mounts = [str(path) for path in sorted(expected_mounts - mounted_targets)]
+    missing_mounts = [str(mount.host_path) for mount in ssh_mounts if not mount.host_path.exists()]
+    writable_mounts = [str(mount.host_path) for mount in ssh_mounts if not mount.read_only]
+    passed = (
+        interface_ok
+        and not route_failures
+        and not unconfigured_mounts
+        and not missing_mounts
+        and not writable_mounts
+    )
+    if not interface_ok:
+        message = "SSH 网络接口不存在"
+    elif route_failures:
+        message = "一个或多个 SSH 地址没有宿主路由"
+    elif unconfigured_mounts or missing_mounts or writable_mounts:
+        message = "SSH 挂载缺失或不是只读"
+    else:
+        message = "SSH 接口、精确地址路由和只读挂载已就绪"
+    return Check(
+        "ssh_host",
+        CheckLevel.PASS if passed else CheckLevel.BLOCKED,
+        message,
+        {
+            "enabled": True,
+            "interface": config.ssh.interface,
+            "interface_ok": interface_ok,
+            "allowed_addresses": list(config.ssh.allowed_addresses),
+            "ports": list(config.ssh.ports),
+            "route_failures": route_failures,
+            "mounts": [str(mount.host_path) for mount in ssh_mounts],
+            "unconfigured_mounts": unconfigured_mounts,
+            "missing_mounts": missing_mounts,
+            "writable_mounts": writable_mounts,
+        },
+        "修复 Tailscale 接口、路由或 SSH 只读挂载后重新运行 doctor"
+        if not passed
+        else None,
+    )
+
+
 def _runtime_checks(config: HostConfig) -> tuple[Check, ...]:
     """Collect fast, read-only facts about the current instance after a reboot."""
     if not hasattr(config, "resource_prefix"):
@@ -365,6 +441,7 @@ def _runtime_checks(config: HostConfig) -> tuple[Check, ...]:
         )
 
     checks: list[Check] = [_runtime_manifest_check(config, manifest)]
+    checks.append(_ssh_runtime_check(config, manifest))
     checks.append(_runtime_images_check(config, manifest))
     compose_check, target_container = _runtime_compose_check(config, manifest)
     checks.append(compose_check)
@@ -377,6 +454,33 @@ def _runtime_checks(config: HostConfig) -> tuple[Check, ...]:
     if config.upstream.kind != "unset":
         checks.append(_upstream_http_check(config))
     return tuple(checks)
+
+
+def _ssh_runtime_check(config: HostConfig, manifest: Any) -> Check:
+    configured = {
+        "enabled": config.ssh.enabled,
+        "interface": config.ssh.interface,
+        "allowed_addresses": list(config.ssh.allowed_addresses),
+        "ports": list(config.ssh.ports),
+    }
+    active = {
+        "enabled": manifest.ssh_enabled,
+        "interface": manifest.ssh_interface,
+        "allowed_addresses": list(manifest.ssh_allowed_addresses),
+        "ports": list(manifest.ssh_ports),
+    }
+    matches = configured == active
+    return Check(
+        "ssh_runtime",
+        CheckLevel.PASS if matches else CheckLevel.WARN,
+        "SSH 主机配置已写入当前运行清单"
+        if matches
+        else "SSH 主机配置尚未应用；当前实例继续使用旧运行清单",
+        {"configured": configured, "active": active},
+        "容器可中断后使用当前策略执行 stop、init、start，再验证 SSH"
+        if not matches
+        else None,
+    )
 
 
 def _runtime_manifest_path(config: HostConfig) -> Path:

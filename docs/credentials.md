@@ -2,7 +2,7 @@
 
 目标软件自己的账号凭据可以正常使用。需要单独考虑的是宿主上的 SSH 私钥、Git 令牌和云服务密钥。
 
-禁止 SSH 出站不能保护已经挂入沙箱的凭据，原因很简单：
+即使 SSH 出站受限，也不能保护已经挂入沙箱的凭据，原因很简单：
 
 1. 目标软件可以直接读取私钥或令牌。
 2. 日常策略默认允许经过审计的公网 HTTPS 流量。
@@ -10,11 +10,11 @@
 
 因此，日常策略的网络审计可以帮助发现泄露，但不能预先阻止软件把凭据发送到一个新的公网网站。
 
-是否提供宿主凭据最终由本机 `~/.config/controlled-dev-machine/host.yaml` 的挂载项决定。`config init` 会检测常用开发路径：存在时默认同路径挂载 `~/.config/git`（读写）和 `~/.ssh`（只读），skills、agents、Codex 和 Conda 配置使用读写挂载，但不会扫描或复制其他宿主 Home 内容。操作者应在初始化前删除不愿交给目标软件的条目；不挂载时使用沙箱自己的凭据。
+是否提供宿主凭据最终由本机 `~/.config/controlled-dev-machine/host.yaml` 的挂载项决定。`config init` 会检测常用开发路径：存在时默认同路径挂载 `~/.config/git`（读写）和 `~/.ssh`（只读），skills、agents、Codex 和 Conda 配置使用读写挂载，但不会扫描或复制其他宿主 Home 内容。操作者应在初始化前删除不愿交给目标软件的条目；不挂载时使用沙箱自己的凭据。启用 SSH 时还必须在 `ssh.allowed_addresses` 和 `ssh.ports` 中逐项登记目标；这只限制网络去向，不限制目标软件读取已挂载密钥。
 
 Codex 的整棵 `~/.codex` 也由 `config init` 默认读写挂载；它与宿主共用 Codex 配置、登录状态、会话和 skills。登录状态不进入镜像或仓库，只保存在本机目录。Claude 则继续使用沙箱持久 Home 中独立的 `.claude` 状态，不直接挂载宿主整棵 `~/.claude`。
 
-本机直接把宿主 `~/.config/git` 读写同路径挂入容器，宿主和容器使用同一个 credential store，不维护沙箱副本。必须挂载目录而不是单个凭据文件，因为 Git 更新凭据时会创建锁文件并原子替换原文件。SSH 直接读取宿主 `~/.ssh`，但保持只读，避免容器修改私钥和 `authorized_keys`。Conda 配置、skills 和 agents 不属于关键私钥，允许容器与宿主同步修改。
+本机直接把宿主 `~/.config/git` 读写同路径挂入容器，宿主和容器使用同一个 credential store，不维护沙箱副本。必须挂载目录而不是单个凭据文件，因为 Git 更新凭据时会创建锁文件并原子替换原文件。SSH 直接读取宿主 `~/.ssh` 及其 `Include` 的 `~/.local/share/gamma-ssh`，两者保持只读，避免容器修改私钥和 `authorized_keys`。Conda 配置、skills 和 agents 不属于关键私钥，允许容器与宿主同步修改。
 
 抓包和 eBPF 不能消除凭据泄露风险，也不能保证事后一定发现泄露。具体覆盖范围见 [默认审计](audit.md)。
 

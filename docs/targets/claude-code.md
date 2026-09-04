@@ -31,7 +31,7 @@
 - 宿主 `.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 生成受控副本；
 - `~/.agents/skills` 继续读写同路径挂载；
 - 目标镜像固定安装 Codex CLI；整棵宿主 `~/.codex` 以同路径读写挂载，因此 Codex 的配置、登录状态、会话和 skills 与宿主共用；
-- Git 直接使用宿主 `~/.config/git` 读写目录，Conda 配置直接使用宿主 `.condarc` 读写；SSH 仍使用宿主 `.ssh` 只读目录，避免改写关键私钥；
+- Git 直接使用宿主 `~/.config/git` 读写目录，Conda 配置直接使用宿主 `.condarc` 读写；SSH 使用宿主 `.ssh` 和 `~/.local/share/gamma-ssh` 只读目录，避免改写关键私钥；
 - 主机选择的 Conda 根目录以相同绝对路径读写挂载，默认环境由 `profile.default_conda_env` 指定。
 
 本机同时用 `profile.conda_root` 声明 `~/miniconda3`。其他服务器可以使用不同 Conda 根目录；未声明时只采用该服务器 `.bashrc` 已初始化的环境，不猜测安装位置。
@@ -95,7 +95,7 @@ sudo bin/sandboxctl root-shell
 | 请求 | 处理 |
 |---|---|
 | 普通公网域名 HTTP/80、HTTPS/443 | 外层透明接管；目标 IP 匹配 DNS 租约后放行并保存明文 |
-| 外部 DNS、UDP/QUIC、SSH 和其他非 Web 协议 | 阻断 |
+| 外部 DNS、UDP/QUIC、未登记 SSH 和其他非 Web 协议 | 阻断 |
 | 直接 IP、特殊主机名、已登记 DoH | 默认阻断；发布策略没有模型直连例外 |
 | 原始 TCP、HTTP Upgrade、应用层 `CONNECT`、上游 `101` | 阻断 |
 | TLS 无法解密或策略/审核存储异常 | 本地失败，不改为密文直通 |
@@ -119,7 +119,7 @@ sudo bin/sandboxctl review list
 |---|---|
 | 严格策略产生 `pending` 请求 | 保持原命令运行，先脱敏分析，再一次性批准或拒绝 |
 | 日常策略中的普通公网网页失败 | 检查网关健康、TLS、目标是否为公网域名，以及是否命中明确阻断规则 |
-| 直接 IP、SSH、UDP、外部 DNS 或非 Web 协议失败 | 这是预期边界；不要为了让功能运行而在容器内绕过 |
+| 未登记直接 IP、SSH、UDP、外部 DNS 或非 Web 协议失败 | 这是预期边界；不要为了让功能运行而在容器内绕过 |
 | 新插件、MCP 或后台组件需要联网 | 切回严格策略，用可公开项目单独复现和解释流量 |
 | 审计探针死亡、出口变化或记录无法关联 | 停止扩大使用，保留当前运行和日志，先修复审计条件 |
 
@@ -181,7 +181,7 @@ bin/sandboxctl policy digest policies/daily/NEW_POLICY.yaml
 6. 使用 `stop -> init --policy -> build -> start -> verify-closed` 部署新策略，再重跑产生该流量的真实任务和相邻阻断测试。
 7. 把策略文件、变更原因、测试结论和回滚目标一起提交。出现泄露或回归时，重新部署上一份策略快照，而不是反向修改历史文件。
 
-当前控制器没有自动生成或编辑策略的命令；策略变更需要人工审查 YAML。日常策略已经默认允许受审计的普通公网 Web，因此增加普通网页通常不需要新增域名规则。直接 IP、非标准端口和非 Web 协议仍需要更高证据，不能靠一条宽泛规则放开。
+当前控制器没有自动生成或编辑策略的命令；策略变更需要人工审查 YAML。日常策略已经默认允许受审计的普通公网 Web，因此增加普通网页通常不需要新增域名规则。直接 IP、未登记 SSH、非标准端口和非 Web 协议仍需要更高证据，不能靠一条宽泛规则放开。
 
 ## 增加 MCP、插件或其他扩展
 

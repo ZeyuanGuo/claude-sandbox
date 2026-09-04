@@ -8,6 +8,8 @@ from controlled_dev_machine.doctor import (
     _docker_engine_check,
     _parse_claude_auth,
     _runtime_compose_check,
+    _ssh_host_check,
+    _ssh_runtime_check,
     _target_claude_check,
     _target_network_check,
     _upstream_check,
@@ -25,6 +27,7 @@ def test_doctor_requires_every_command_used_by_deploy_and_runtime(monkeypatch) -
         paths=SimpleNamespace(audit=Path("/tmp/audit")),
         gpu=SimpleNamespace(mode="all"),
         upstream=SimpleNamespace(kind="unset"),
+        ssh=SimpleNamespace(enabled=False),
     )
     monkeypatch.setattr("controlled_dev_machine.doctor._identity_check", lambda _c: _pass("id"))
     monkeypatch.setattr("controlled_dev_machine.doctor._cgroup_check", lambda: _pass("cgroup"))
@@ -61,8 +64,51 @@ def test_doctor_requires_every_command_used_by_deploy_and_runtime(monkeypatch) -
     assert requirements["openssl"] is True
     assert requirements["systemctl"] is True
     assert requirements["ip"] is True
+    assert requirements["iptables"] is False
     assert requirements["nvidia-ctk"] is True
     assert requirements["bpftool"] is False
+
+
+def test_doctor_reports_ssh_settings_waiting_for_next_init(tmp_path: Path, monkeypatch) -> None:
+    ssh_root = tmp_path / ".ssh"
+    ssh_root.mkdir()
+    config = SimpleNamespace(
+        ssh=SimpleNamespace(
+            enabled=True,
+            interface="tailscale0",
+            allowed_addresses=("100.117.92.79",),
+            ports=(22,),
+        ),
+        target=SimpleNamespace(home=tmp_path),
+        mounts=(
+            SimpleNamespace(
+                host_path=ssh_root,
+                container_path=ssh_root,
+                read_only=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr("controlled_dev_machine.doctor.Path.is_dir", lambda _path: True)
+    monkeypatch.setattr("controlled_dev_machine.doctor.shutil.which", lambda _name: "/sbin/ip")
+    monkeypatch.setattr(
+        "controlled_dev_machine.doctor.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+
+    host_check = _ssh_host_check(config)
+    runtime_check = _ssh_runtime_check(
+        config,
+        SimpleNamespace(
+            ssh_enabled=False,
+            ssh_interface="tailscale0",
+            ssh_allowed_addresses=(),
+            ssh_ports=(),
+        ),
+    )
+
+    assert host_check.level == CheckLevel.PASS
+    assert runtime_check.level == CheckLevel.WARN
+    assert "尚未应用" in runtime_check.message
 
 
 def test_doctor_requires_docker_engine_28(monkeypatch) -> None:

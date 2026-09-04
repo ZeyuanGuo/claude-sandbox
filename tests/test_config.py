@@ -57,6 +57,42 @@ def test_paths_resolve_against_target_home_not_process_home(tmp_path: Path) -> N
     assert config.profile.conda_root is None
     assert config.profile.default_conda_env is None
     assert config.profile.timezone == "UTC"
+    assert config.ssh.enabled is False
+    assert config.ssh.interface == "tailscale0"
+    assert config.ssh.ports == (22, 10090)
+
+
+def test_ssh_config_accepts_only_explicit_tailscale_ipv4_targets(tmp_path: Path) -> None:
+    path = _config(tmp_path, mounts="""ssh:
+  enabled: true
+  interface: tailscale0
+  allowed_addresses:
+    - 100.72.7.86
+    - 100.117.92.79
+  ports: [22, 10090]
+mounts: []""")
+    config = load_host_config(path)
+    assert config.ssh.enabled is True
+    assert config.ssh.allowed_addresses == ("100.72.7.86", "100.117.92.79")
+    assert config.ssh.ports == (22, 10090)
+
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("100.117.92.79", "10.0.0.1"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="Tailscale"):
+        load_host_config(path)
+
+
+def test_ssh_config_requires_targets_when_enabled(tmp_path: Path) -> None:
+    path = _config(tmp_path, mounts="""ssh:
+  enabled: true
+  interface: tailscale0
+  allowed_addresses: []
+  ports: [22]
+mounts: []""")
+    with pytest.raises(ConfigError, match="allowed_addresses"):
+        load_host_config(path)
 
 
 def test_gpu_mode_cannot_disable_required_gpu_visibility(tmp_path: Path) -> None:
@@ -209,6 +245,7 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
     home = tmp_path / "home" / "alice"
     (home / ".config" / "git").mkdir(parents=True)
     (home / ".ssh").mkdir()
+    (home / ".local" / "share" / "gamma-ssh").mkdir(parents=True)
     (home / ".agents" / "skills").mkdir(parents=True)
     (home / ".condarc").write_text("channels: [defaults]\n", encoding="utf-8")
     (home / ".bashrc").write_text("export EDITOR=vim\n", encoding="utf-8")
@@ -259,6 +296,7 @@ def test_config_init_uses_invoking_identity_and_existing_common_files(
     mounts = {mount.host_path: mount.read_only for mount in config.mounts}
     assert mounts[home / ".config" / "git"] is False
     assert mounts[home / ".ssh"] is True
+    assert mounts[home / ".local" / "share" / "gamma-ssh"] is True
     assert mounts[home / "claude_code_config" / "settings.json"] is False
     assert mounts[home / "claude_code_config" / "rules"] is False
     assert mounts[home / "claude_code_config" / "skills"] is False

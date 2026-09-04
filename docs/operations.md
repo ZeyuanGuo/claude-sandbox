@@ -86,7 +86,7 @@ bin/sandboxctl config init
 
 `config init` 从实际系统账号填写用户名、UID、GID 和 Home，拒绝覆盖已有文件。它创建宿主 `~/claude_code_config`，以仓库中的 `config/claude/CLAUDE.md` 初始化全局提示词，并创建设置、规则、skills 和 agents 的独立入口；这些项目分别读写挂载到容器 `~/.claude` 下。它不会创建或挂载宿主 `~/.claude`，Claude 的账号、会话、历史、插件和设备状态只保留在沙箱持久 Home。
 
-生成器还会自动创建 `~/.codex`（不存在时）并以读写方式挂载整棵目录；Codex CLI 首次登录后的状态直接保存在宿主该目录。它在源文件安全且实际存在时接入常用 shell、Git、tmux、`~/.agents/skills`、`~/.config/git`、`~/.ssh` 和 `~/.condarc`。Git、skills、agents 和 Conda 配置读写；只有 SSH 关键凭据保持只读。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
+生成器还会自动创建 `~/.codex`（不存在时）并以读写方式挂载整棵目录；Codex CLI 首次登录后的状态直接保存在宿主该目录。它在源文件安全且实际存在时接入常用 shell、Git、tmux、`~/.agents/skills`、`~/.config/git`、`~/.ssh`、`~/.local/share/gamma-ssh` 和 `~/.condarc`。Git、skills、agents 和 Conda 配置读写；SSH 配置和关键凭据保持只读。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
 
 默认通用挂载由仓库中的 `config init` 固定生成；只有源路径实际存在时才加入：
 
@@ -98,6 +98,7 @@ bin/sandboxctl config init
 | `~/.agents/skills` | 同路径 | 读写 | Codex 可见的通用 skills |
 | `~/.config/git` | 同路径 | 读写 | Git 凭据存储和配置数据库 |
 | `~/.ssh` | 同路径 | 只读 | 日常 SSH 配置和密钥 |
+| `~/.local/share/gamma-ssh` | 同路径 | 只读 | SSH `Include` 的主机配置、密钥和 `known_hosts` |
 | `~/.condarc` | 同路径 | 读写 | Conda 配置 |
 
 `CLAUDE.md` 和上表中的 Claude 行为配置直接读写同步；`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 仍由 `init` 生成受控只读副本。宿主不设置 `CLAUDE_CONFIG_DIR`，默认 `~/.claude` 也不作为挂载源，所以宿主直接运行 Claude Code 时不会自动读取容器配置。Claude 凭据、会话数据库和其他运行状态留在持久 Home。项目目录、Conda 根目录和其他大型数据目录属于主机特定配置，由操作者在 `host.yaml` 中追加。
@@ -110,6 +111,20 @@ bin/sandboxctl config init
 - 删除不希望交给目标软件的凭据挂载；
 - 确认持久 Home、状态、审计目录和存储保留线；
 - 确认父代理端口与 `expected_exit_cidr`。
+
+需要让容器复用宿主 SSH 配置时，确认宿主 `~/.ssh/config` 能通过 `Include` 找到 `~/.local/share/gamma-ssh/config`，并把对应的 `id_ed25519` 与 `known_hosts` 保持在该目录。只在明确需要时启用下面的精确 Tailscale 路径：
+
+```yaml
+ssh:
+  enabled: true
+  interface: tailscale0
+  allowed_addresses:
+    - 100.72.7.86
+    - 100.117.92.79
+  ports: [22, 10090]
+```
+
+`ssh.allowed_addresses` 只能填写 `100.64.0.0/10` 中、已经从宿主逐一验证过的地址；不能填写整个网段或公网地址。先在宿主用 `ssh -G <主机别名>` 检查最终 HostName、端口、用户、密钥和 `ProxyJump`，再用短命令 `ssh -o BatchMode=yes -o ConnectTimeout=5 <主机别名> true` 验证登录。SSH 开关、接口、地址和端口会写入运行清单快照；只改 `host.yaml` 不会改变当前运行实例，`recover` 和 `audit restart` 也继续使用旧快照。用户确认可以中断后，使用当前策略执行 `stop -> init --policy <当前策略> -> start`，不需要为这项改动重新构建镜像。随后从容器分别验证宿主 SSH 和已登记 Tailscale 目标，并确认未登记地址仍失败。
 
 编辑完成后再校验：
 

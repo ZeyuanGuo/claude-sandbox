@@ -24,6 +24,14 @@ Web 路径：
          -> 公网
 ```
 
+## SSH 路径
+
+SSH 不进入策略网关，也不使用 HTTP 父代理。启用 `host.yaml` 的 `ssh.enabled` 后，控制器只把 `ssh.allowed_addresses` 中的精确 Tailscale IPv4 地址和 `ssh.ports` 中的端口写入目标、网关和宿主门禁；当前主机使用 `tailscale0`、端口 `22` 和 `10090`。网关通过宿主上游网桥为这些地址建立 `/32` 路由，宿主在转发到 Tailscale 前做源地址伪装。未登记地址、未登记端口和非 Tailscale 地址仍由默认拒绝规则阻断。
+
+宿主 `~/.ssh/config` 及其 `Include` 的 `~/.local/share/gamma-ssh` 目录以只读方式同路径挂入目标；后者包含本机 SSH 配置使用的密钥和 `known_hosts`。挂载不会复制凭据，也不会使目标获得 Docker、宿主网络命名空间或策略文件的权限。配置更新只在下一次停止后 `init` 重新生成 Compose 时进入容器；运行中的容器不会被热修改。
+
+SSH 连接不经过 mitmproxy，因此没有 SSH 明文审计。仍会有目标 cgroup 的 `connect()` 记录和目标/网关 PCAP；凭据泄露风险与其他已挂载宿主凭据相同。主机迁移或 Tailscale 地址变化后，必须更新精确地址列表并重新执行正向 SSH 与未登记目标负向验证。
+
 宿主配置默认填写 `127.0.0.1:11450`，并用 `upstream.expected_exit_cidr` 声明允许的公网出口范围。DNS 和网关实际从内部上游网桥连接该网桥的宿主地址；目标容器看不到这个地址。父代理不决定放行规则，但必须把所有连接强制送到指定出口，不能回退到其他节点或直连。每台服务器以自己的主机配置和启动探测为准，真实出口和凭据不进入仓库。
 
 ## 组件职责
@@ -33,12 +41,12 @@ Web 路径：
 | 目标 nftables | 只允许受控 DNS 和策略用到的 TCP 端口；把 Web TCP 透明送到网关 |
 | 受控 DNS | 按策略接受域名，经父代理发出 DoH，拒绝私网/保留地址并签发短期名称-IP租约 |
 | mitmproxy addon | 解密 HTTP/HTTPS，核对原始目的地址、DNS 租约和 Host/SNI；记录请求并立即流式转发响应 |
-| 宿主父代理门禁 | 运行时只允许回环和本项目 DNS/网关访问 `11450`，停止和重启恢复时只允许回环；拒绝外部/LAN 和其他网桥 |
+| 宿主父代理门禁 | 运行时只允许回环和本项目 DNS/网关访问 `11450`，并按配置允许目标访问精确 Tailscale SSH 地址/端口；停止和重启恢复时只允许回环；拒绝外部/LAN 和其他网桥 |
 | 宿主 `11450` | 把 DNS 和已批准 Web 连接强制送到指定出口；出口失败时直接失败，不参与项目策略 |
 | tcpdump 与 cgroup eBPF | 保存目标、DNS、网关实际数据包，以及目标 cgroup 的执行、连接和常规 UDP 发送调用 |
 | network watchdog | 检查上述进程身份，并续期三处网络命名空间中的短期放行项 |
 
-目标不加入 `upstream_net`，不能直接访问宿主代理。`upstream_net` 从创建起就是 Docker 内部网络，没有普通公网路由；容器启动前，宿主 nftables 已只允许 DNS 和网关连接 `upstream.cdm.test:11450`。宿主本机进程仍可通过回环使用父代理。目标没有 `NET_ADMIN`，不能修改路由或 nftables；宿主 Docker socket、策略、审计目录和网关私钥也不挂入目标。
+目标不加入 `upstream_net`，不能直接访问宿主代理。`upstream_net` 从创建起就是 Docker 内部网络，没有普通公网路由；容器启动前，宿主 nftables 已只允许 DNS 和网关连接 `upstream.cdm.test:11450`，另按 SSH 配置建立精确 Tailscale 转发。宿主本机进程仍可通过回环使用父代理。目标没有 `NET_ADMIN`，不能修改路由或 nftables；宿主 Docker socket、策略、审计目录和网关私钥也不挂入目标。
 
 ## DNS 约束
 
@@ -94,7 +102,7 @@ Web 路径：
 - 容器没有代理变量或专用 CA 路径，系统 curl、Conda curl、系统 Python、已登记 Conda 环境和 Node 都能透明访问 HTTPS。
 - 普通 A/AAAA 查询经父代理上的 DoH 返回；外部 DNS 被阻断。
 - 新客户端连接的 IP 必须与当前租约或其 60 秒宽限期一致；已核验的客户端连接会固定绑定目标，未解析 IP、伪造地址或切换目标仍返回本地 `invalid-destination`。
-- TCP/22、原始 TCP、协议升级、应用层 `CONNECT`、元数据地址和策略/审核故障不会到达公网。
+- 公网和未登记目标的 TCP/22、原始 TCP、协议升级、应用层 `CONNECT`、元数据地址和策略/审核故障不会到达公网；登记的 Tailscale SSH 例外尚未在当前运行容器中应用验收。
 - 必要审计探针退出后网络放行项按期过期。
 
 当前没有证明：

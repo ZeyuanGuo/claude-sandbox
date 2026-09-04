@@ -45,6 +45,14 @@ upstream:
   # 只用于记录父代理配置来源；控制器不会启动或解析它。
   config_path:
 
+# 可选：把 SSH 限定到精确的 Tailscale IPv4 地址和端口。
+# 这条路径不经过 HTTP 透明代理；未列出的目标仍被阻断。
+ssh:
+  enabled: false
+  interface: tailscale0
+  allowed_addresses: []
+  ports: [22, 10090]
+
 # 可选：Claude 提示词从宿主独立目录直接读写挂载。
 # shell 和 Git 配置仍由 init 生成受控副本，其中的代理会被清除。
 # default_conda_env 是本机选择，不应在通用代码中写死。
@@ -88,6 +96,9 @@ mounts: []
 #     access: rw
 #   - host_path: ~/.ssh
 #     container_path: /home/alice/.ssh
+#     access: ro
+#   - host_path: ~/.local/share/gamma-ssh
+#     container_path: /home/alice/.local/share/gamma-ssh
 #     access: ro
 #   - host_path: ~/.condarc
 #     container_path: /home/alice/.condarc
