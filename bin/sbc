@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+# Resolve this script when it is called through ~/.local/bin/sbc.
+COMMAND_NAME=$(basename -- "$0")
+SCRIPT_PATH=$0
+while [ -L "$SCRIPT_PATH" ]; do
+    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+    LINK_TARGET=$(readlink "$SCRIPT_PATH")
+    case "$LINK_TARGET" in
+        /*) SCRIPT_PATH=$LINK_TARGET ;;
+        *) SCRIPT_PATH=$SCRIPT_DIR/$LINK_TARGET ;;
+    esac
+done
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+
+if [ "$#" -eq 0 ]; then
+    set -- shell
+fi
+
+case "$COMMAND_NAME" in
+    sbd) set -- doctor "$@" ;;
+    sbr) set -- recover "$@" ;;
+    sba) set -- audit restart "$@" ;;
+esac
+
+exec sudo "$REPO_ROOT/bin/sandboxctl" "$@"

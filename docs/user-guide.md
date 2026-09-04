@@ -4,12 +4,22 @@
 
 ## 进入和退出
 
-在宿主进入沙箱：
+在宿主从任意目录进入沙箱：
 
 ```bash
-cd "$HOME/claude-sandbox"
-sudo bin/sandboxctl shell
+sbc
 ```
+
+当前主机提供以下直接命令：
+
+```bash
+sbc                 # 进入 shell；带参数时转发给 sandboxctl
+sbd                 # 只读快速诊断
+sbr                 # 自动选择启动或恢复审计
+sba                 # 不重启容器，只恢复审计和目标网络
+```
+
+完整写法分别是 `sbc doctor`、`sbc recover` 和 `sbc audit restart`。新主机没有这些别名时，按根目录 [readme.md](../readme.md) 的“最短命令”一节加入 `~/.bashrc`。
 
 进入后就是普通开发 shell：
 
@@ -58,13 +68,12 @@ claude --resume NEW_SESSION_ID
 状态检查都在宿主执行：
 
 ```bash
-cd "$HOME/claude-sandbox"
-sudo bin/sandboxctl doctor
-sudo bin/sandboxctl status
-sudo bin/sandboxctl audit status
+sbd
+sbc status
+sbc audit status
 ```
 
-重启或断网后的第一条命令始终是 `sudo bin/sandboxctl doctor`。如果它报告基础审计失活而四个容器仍在运行，执行 `sudo bin/sandboxctl audit restart`；如果容器缺失，执行 `sudo bin/sandboxctl recover`。这些恢复命令不会扩大到其他用户的容器或进程。
+重启或断网后的第一条命令始终是 `sbd`。如果它报告基础审计失活而四个容器仍在运行，执行 `sba`；如果不确定容器是否被 Docker 保留，执行 `sbr`。这些恢复命令不会扩大到其他用户的容器或进程。
 
 正常状态应满足：四个服务运行，DNS、网关和 canary 为 `healthy`；`audit status` 的 `active` 为 `true`；五个探针/监督进程和三个 `namespaces` 项均为 `alive: true`；出口落在 `host.yaml` 的 `upstream.expected_exit_cidr` 内。
 
