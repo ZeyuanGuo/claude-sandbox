@@ -259,6 +259,7 @@ fi
 
 # Managed by controlled-dev-machine. A host profile may alter PATH or network
 # variables after sourcing .bashrc, so restore the transparent-network state.
+export PATH="$HOME/.local/bin:$PATH"
 if [ -n "${CDM_DEFAULT_CONDA_ENV:-}" ] \
     && [ -n "${CDM_CONDA_ROOT:-}" ] \
     && [ -d "$CDM_CONDA_ROOT/envs/$CDM_DEFAULT_CONDA_ENV/bin" ]; then
@@ -855,6 +856,7 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
             "tty": True,
             "environment": {
                 "HOME": str(config.target.home),
+                "PATH": f"{config.target.home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "CLAUDE_CONFIG_DIR": str(config.target.home / ".claude"),
                 "USER": config.target.name,
                 "TZ": config.profile.timezone,
