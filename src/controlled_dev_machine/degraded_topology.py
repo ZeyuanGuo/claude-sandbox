@@ -1,0 +1,122 @@
+"""Rootless topology: an internal target and a fixed-parent egress relay."""
+from __future__ import annotations
+
+from pathlib import Path
+
+
+def build_compose(
+    *, root: Path, runtime: Path, state: Path, target_image: str,
+    gateway_image: str, policy: Path, policy_digest: str,
+    upstream_host: str = "", upstream_port: str = "", dns_suffixes: tuple[str, ...] = (),
+    projects: Path | None = None,
+) -> dict:
+    if upstream_host and not dns_suffixes:
+        raise ValueError(
+            "an external parent requires an explicit DNS suffix allowlist"
+        )
+    audit = state / "audit"
+
+    def mount(source: Path, target: str, readonly: bool = True) -> dict:
+        return {"type": "bind", "source": str(source), "target": target,
+                "read_only": readonly, "bind": {"create_host_path": False}}
+
+    def service(image: str, command: list[str]) -> dict:
+        return {"image": image, "user": "0:0", "command": command,
+                "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
+                "restart": "unless-stopped", "init": True}
+
+    dns_command = ["python3", "/opt/cdm/dns_gateway.py", "--record-path",
+                   "/audit/dns/queries.jsonl", "--proxy-host", "172.31.1.10",
+                   "--proxy-port", "8080", "--doh-address", "1.1.1.1",
+                   "--doh-server-name", "cloudflare-dns.com", "--lease-socket",
+                   "/run/cdm-dns/lease.sock"]
+    if dns_suffixes:
+        for suffix in dns_suffixes:
+            dns_command += ["--allowed-suffix", suffix]
+    else:
+        # Offline mode has no egress network; this is only useful for local
+        # canaries and cannot send packets outside the internal networks.
+        dns_command += ["--allow-public-domains"]
+    dns = service(target_image, dns_command)
+    dns.update({
+        "volumes": [mount(root / "src/controlled_dev_machine/dns_gateway.py", "/opt/cdm/dns_gateway.py"),
+                    mount(audit / "dns", "/audit/dns", False),
+                    mount(state / "dns-control", "/run/cdm-dns", False)],
+        "networks": {"target_net": {"ipv4_address": "172.31.0.2"},
+                     "upstream_net": {"ipv4_address": "172.31.1.2"}},
+        "dns": ["127.0.0.1"],
+    })
+    gateway = service(gateway_image, [
+        "--mode", "regular@8080", "--set", "connection_strategy=lazy", "--set",
+        "rawtcp=false", "--set", "upstream_cert=false", "--set", "ssl_insecure=false",
+        "--set", "confdir=/ca", "-w", "/audit/plaintext/flows.mitm",
+        "-s", "/opt/cdm/gateway/cdm_addon.py",
+    ])
+    gateway.update({
+        "environment": {
+            "PYTHONPATH": "/opt/cdm/src", "CDM_DEGRADED_MODE": "1",
+            "CDM_POLICY_PATH": "/run/cdm/policy.yaml", "CDM_EXPECTED_POLICY_DIGEST": policy_digest,
+            "CDM_REVIEW_DIR": "/audit/review", "CDM_REVIEW_TTL_SECONDS": "300",
+            "CDM_REVIEW_POLL_SECONDS": "0.25", "CDM_CANARY_ADDRESS": "127.0.0.1",
+            "CDM_DNS_LEASE_SOCKET": "/run/cdm-dns/lease.sock",
+            "CDM_UPSTREAM_HOST": "172.31.1.10", "CDM_UPSTREAM_PORT": "8080",
+        },
+        "volumes": [mount(policy, "/run/cdm/policy.yaml"),
+                    mount(audit / "review", "/audit/review", False),
+                    mount(audit / "plaintext", "/audit/plaintext", False),
+                    mount(state / "dns-control", "/run/cdm-dns"),
+                    mount(state / "proxy-ca", "/ca", False)],
+        "networks": {"target_net": {"ipv4_address": "172.31.0.3"},
+                     "upstream_net": {"ipv4_address": "172.31.1.3"}},
+        "dns": ["172.31.0.2"],
+        "healthcheck": {"test": ["CMD", "python3", "-m", "controlled_dev_machine.gateway_health"],
+                        "interval": "5s", "timeout": "2s", "retries": 3},
+    })
+    relay = service(gateway_image, ["python3", "-m", "controlled_dev_machine.degraded_egress"])
+    relay.update({
+        "entrypoint": [],
+        "environment": {"PYTHONPATH": "/opt/cdm/src", "CDM_RELAY_AUDIT": "/audit/egress/events.jsonl",
+                        "CDM_RELAY_UPSTREAM_HOST": upstream_host,
+                        "CDM_RELAY_UPSTREAM_PORT": upstream_port},
+        "volumes": [mount(audit / "egress", "/audit/egress", False)],
+        "networks": {"upstream_net": {"ipv4_address": "172.31.1.10"}},
+        "dns": ["127.0.0.1"],
+    })
+    target = service(target_image, ["sleep", "infinity"])
+    target.update({
+        "hostname": "devbox", "working_dir": "/home/gzy",
+        "environment": {
+            "USER": "gzy", "HOME": "/home/gzy", "CLAUDE_CONFIG_DIR": "/home/gzy/.claude",
+            "CDM_CONDA_ROOT": "/home/gzy/miniconda3", "CDM_DEFAULT_CONDA_ENV": "pthgnn",
+            "PATH": "/home/gzy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8", "TZ": "America/Los_Angeles",
+            "NODE_USE_SYSTEM_CA": "1", "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
+            "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
+            "NODE_EXTRA_CA_CERTS": "/etc/ssl/certs/ca-certificates.crt",
+            "HTTP_PROXY": "http://172.31.0.3:8080", "HTTPS_PROXY": "http://172.31.0.3:8080",
+            "http_proxy": "http://172.31.0.3:8080", "https_proxy": "http://172.31.0.3:8080",
+            "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost",
+        },
+        "volumes": [mount(runtime / "home", "/home/gzy", False),
+                    mount(runtime / "miniconda3", "/home/gzy/miniconda3"),
+                    mount(state / "trust/ca-certificates.crt", "/etc/ssl/certs/ca-certificates.crt")],
+        "dns": ["172.31.0.2"],
+        "networks": {"target_net": {"ipv4_address": "172.31.0.4"}},
+    })
+    project_root = projects or (runtime / "projects")
+    for project in ("newdfm", "dfm"):
+        path = project_root / project
+        if path.is_dir():
+            target["volumes"].append(mount(path, "/home/gzy/" + project, False))
+    networks = {
+        "target_net": {"internal": True, "enable_ipv6": False,
+                       "ipam": {"config": [{"subnet": "172.31.0.0/24"}]}},
+        "upstream_net": {"internal": True, "enable_ipv6": False,
+                         "ipam": {"config": [{"subnet": "172.31.1.0/24"}]}},
+    }
+    if upstream_host:
+        networks["egress_net"] = {"internal": False, "enable_ipv6": False}
+        relay["networks"]["egress_net"] = {}
+    return {"name": "cdm-degraded", "services": {"dns": dns, "gateway": gateway,
+                                                  "egress": relay, "target": target},
+            "networks": networks}

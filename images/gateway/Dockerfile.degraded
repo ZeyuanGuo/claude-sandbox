@@ -1,0 +1,13 @@
+ARG BASE_IMAGE=cdm-degraded-base:5090
+FROM ${BASE_IMAGE}
+ARG CODE_DIGEST
+LABEL cdm.source_digest=${CODE_DIGEST}
+USER root
+RUN python3 -c "import yaml, mitmproxy"
+COPY src /opt/cdm/src
+COPY gateway/mitmproxy/cdm_addon.py /opt/cdm/gateway/cdm_addon.py
+COPY gateway/mitmproxy/entrypoint.sh /opt/cdm/gateway/entrypoint.sh
+RUN chmod 0755 /opt/cdm/gateway/entrypoint.sh
+ENV PYTHONPATH=/opt/cdm/src
+USER 1000:1000
+ENTRYPOINT ["/opt/cdm/gateway/entrypoint.sh"]

@@ -7,6 +7,7 @@ controller package so their security invariants can be tested without mitmproxy.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
@@ -41,6 +42,7 @@ class ControlledReviewAddon:
         self.audit_storage_fault: str | None = None
         self.canary_address = ipaddress.ip_address(os.environ["CDM_CANARY_ADDRESS"])
         self.dns_lease_socket = os.environ["CDM_DNS_LEASE_SOCKET"]
+        self.degraded = os.environ.get("CDM_DEGRADED_MODE") == "1"
         self.connection_bindings = ConnectionBindingRegistry()
         self.pending_lease_lookups: dict[
             tuple[int, str, str], asyncio.Task[str | None]
@@ -58,14 +60,23 @@ class ControlledReviewAddon:
             raise RuntimeError("connection_strategy must be lazy")
         if ctx.options.rawtcp:
             raise RuntimeError("rawtcp must be disabled")
-        if ctx.options.mode != ["transparent"]:
+        if self.degraded:
+            modes = [str(mode) for mode in ctx.options.mode]
+            if len(modes) != 1 or not modes[0].startswith("regular@"):
+                raise RuntimeError("degraded gateway must expose regular proxy mode")
+            if getattr(ctx.options, "upstream_cert", True):
+                raise RuntimeError("degraded gateway must not connect before request review")
+        elif ctx.options.mode != ["transparent"]:
             raise RuntimeError("gateway must expose only transparent mode")
         self.review_store.initialize()
         self._load_verified_policy()
 
     def _load_verified_policy(self):
         policy = load_policy(self.policy_path)
-        actual = policy.digest()
+        if self.degraded and self.expected_policy_digest.startswith("raw:"):
+            actual = "raw:" + hashlib.sha256(self.policy_path.read_bytes()).hexdigest()
+        else:
+            actual = policy.digest()
         if actual != self.expected_policy_digest:
             raise RuntimeError(
                 "policy digest mismatch: "
@@ -164,9 +175,14 @@ class ControlledReviewAddon:
             )
             return
         try:
-            destination_error = await self._verify_original_destination(
-                flow, logical_host
-            )
+            if self.degraded:
+                destination_error = self._verify_degraded_destination(flow, logical_host)
+                if destination_error is None:
+                    destination_error = await self._resolve_degraded_destination(flow, logical_host)
+            else:
+                destination_error = await self._verify_original_destination(
+                    flow, logical_host
+                )
         except LeaseServiceUnavailable as exc:
             ctx.log.error(f"DNS lease service unavailable: {exc}")
             flow.response = _blocked(
@@ -195,6 +211,8 @@ class ControlledReviewAddon:
         flow.metadata["cdm_policy_action"] = decision.action
         flow.metadata["cdm_policy_rule"] = decision.rule_id
         if decision.action == "allow":
+            if self.degraded:
+                self._pin_degraded_dispatch(flow)
             return
         if decision.action == "block":
             flow.response = _blocked("policy-block", decision.reason)
@@ -248,6 +266,8 @@ class ControlledReviewAddon:
                         request_sha256=record.request_sha256,
                         policy_digest=current_policy.digest(),
                     )
+                    if self.degraded:
+                        self._pin_degraded_dispatch(flow)
                     flow.resume()
                     return
                 if current.state in {"blocked", "expired"}:
@@ -364,6 +384,60 @@ class ControlledReviewAddon:
             flow.metadata["cdm_dns_lease_id"] = binding.lease_id
         flow.metadata["cdm_original_destination"] = f"{destination}:{raw_port}"
         return None
+
+    def _verify_degraded_destination(
+        self, flow: http.HTTPFlow, logical_host: str
+    ) -> str | None:
+        """Validate the hostname, scheme, port and TLS identity at the proxy."""
+        try:
+            canonical_domain(logical_host)
+        except PolicyError:
+            return "degraded proxy requires a canonical hostname"
+        if (flow.request.scheme, flow.request.port) not in (("http", 80), ("https", 443)):
+            return "degraded proxy permits only ports 80 and 443"
+        if flow.request.scheme == "https":
+            try:
+                sni = canonical_domain(flow.client_conn.sni or "")
+            except PolicyError:
+                return "HTTPS requires a canonical client SNI hostname"
+            if sni != canonical_domain(logical_host):
+                return "HTTPS request hostname does not match client SNI"
+        flow.metadata["cdm_degraded_mode"] = True
+        flow.metadata["cdm_original_destination"] = f"proxy:{logical_host}:{flow.request.port}"
+        return None
+
+    async def _resolve_degraded_destination(self, flow: http.HTTPFlow, hostname: str) -> str | None:
+        # The gateway's only resolver is the audited DNS container. The parent
+        # receives a leased IP, not a name it could independently re-resolve.
+        try:
+            records = await asyncio.wait_for(
+                asyncio.to_thread(socket.getaddrinfo, hostname, flow.request.port,
+                                  socket.AF_INET, socket.SOCK_STREAM), timeout=10,
+            )
+        except (OSError, asyncio.TimeoutError):
+            return "controlled DNS resolution failed"
+        for record in records:
+            address = record[4][0]
+            if not _is_public_address(ipaddress.ip_address(address)):
+                continue
+            lease = await self._shared_dns_lease(flow.client_conn, hostname, address)
+            if lease is not None:
+                flow.metadata["cdm_dns_lease_id"] = lease
+                flow.metadata["cdm_pinned_destination"] = address
+                flow.metadata["cdm_logical_host"] = hostname
+                return None
+        return "controlled DNS did not grant a public destination lease"
+
+    def _pin_degraded_dispatch(self, flow: http.HTTPFlow) -> None:
+        address = flow.metadata["cdm_pinned_destination"]
+        authority = flow.request.host_header
+        flow.request.host = address
+        flow.request.host_header = authority
+        flow.server_conn.via = ("http", self.upstream)
+
+    def tls_start_server(self, data) -> None:
+        if self.degraded and data.context.client.sni:
+            data.conn.sni = canonical_domain(data.context.client.sni)
 
     async def _shared_dns_lease(
         self, connection: object, hostname: str, address: str
