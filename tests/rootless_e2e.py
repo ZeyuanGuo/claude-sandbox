@@ -78,10 +78,6 @@ rules:
                              gateway_image="cdm-degraded-gateway:5090", policy=policy,
                              policy_digest=digest, upstream_host="172.31.1.11",
                              upstream_port="18081", dns_suffixes=("fixture.example",))
-    # The production degraded stack may stay up while this credential-free
-    # fixture runs.  Use a separate internal subnet to avoid Docker pool
-    # overlap; no host or public network is added.
-    _remap_network(document, os.environ.get("CDM_ROOTLESS_E2E_NETWORK_PREFIX", "172.32"))
     # The fixture has no external bridge, DNS, or host ports and an empty Home.
     document["networks"].pop("egress_net")
     document["services"]["egress"]["networks"].pop("egress_net")
@@ -100,6 +96,14 @@ rules:
                     {"type": "bind", "source": str(root / "tests/rootless_fixture.py"),
                      "target": "/test/rootless_fixture.py", "read_only": True}],
     }
+    # The production degraded stack may stay up while this credential-free
+    # fixture runs.  Use a separate internal subnet to avoid Docker pool
+    # overlap; no host or public network is added.  Apply this after adding
+    # the fixture because its fixed parent address is part of the remap too.
+    _remap_network(document, os.environ.get("CDM_ROOTLESS_E2E_NETWORK_PREFIX", "172.32"))
+    relay_env = document["services"]["egress"].setdefault("environment", {})
+    relay_env["CDM_RELAY_DNS_SOURCE"] = "172.32.1.2"
+    relay_env["CDM_RELAY_GATEWAY_SOURCE"] = "172.32.1.3"
     (stage / "trust/ca-certificates.crt").touch()
     config = stage / "compose.yaml"
     config.write_text(yaml.safe_dump(document, sort_keys=False))

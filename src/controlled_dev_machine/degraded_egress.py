@@ -361,7 +361,9 @@ def main(argv=None):
         else:
             port = os.environ.get("CDM_RELAY_UPSTREAM_PORT")
             mapping = {"parent_host": os.environ.get("CDM_RELAY_UPSTREAM_HOST") or None,
-                       "parent_port": int(port) if port else None}
+                       "parent_port": int(port) if port else None,
+                       "trusted_dns_ips": [os.environ.get("CDM_RELAY_DNS_SOURCE", "172.31.1.2")],
+                       "trusted_gateway_ips": [os.environ.get("CDM_RELAY_GATEWAY_SOURCE", "172.31.1.3")]}
         config = RelayConfig.from_mapping(mapping, audit_path=args.audit)
     except (OSError, ValueError, TypeError) as exc:
         parser.error(str(exc))
