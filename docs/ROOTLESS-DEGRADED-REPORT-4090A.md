@@ -121,8 +121,8 @@ network or any user credential. The 14 checks passed on the acceptance target:
 The same artifact/image/policy digests were copied to 4090b over the private
 link. 4090b has passed offline doctor, Compose configuration, route
 isolation, no-parent 502/SERVFAIL checks, gateway-stop fail-closed behavior,
-and the addon destination matrix. A final live 14-check E2E rerun on 4090b is
-still a promotion gate if the host is changed after this report.
+the addon destination matrix, and the live 14-check credential-free E2E after
+the final image/source refresh.
 
 ## Restored runtime checks
 
@@ -150,6 +150,13 @@ copy is intentionally materialized, `newdfm` and `dfm` are mounted from the
 user-owned recovery mirror so the full data set is available without a second
 430GB copy; this source is recorded in `mode.json` and can later be replaced
 by `5090-runtime/projects/` without changing the container contract.
+
+Final offline environment evidence on both 4090a and 4090b:
+
+```text
+base Python: 3.13.13; import urllib.parse: PASS
+pthgnn Python: 3.10.9; numpy 1.23.5; torch 2.11.0+cu128: PASS
+```
 
 ## Rootless limitations
 
