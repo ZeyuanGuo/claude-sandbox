@@ -49,6 +49,7 @@ def build_compose(
     gateway = service(gateway_image, [
         "--mode", "regular@8080", "--set", "connection_strategy=lazy", "--set",
         "rawtcp=false", "--set", "upstream_cert=false", "--set", "ssl_insecure=false",
+        "--set", "block_global=false",
         "--set", "confdir=/ca", "-w", "/audit/plaintext/flows.mitm",
         "-s", "/opt/cdm/gateway/cdm_addon.py",
     ])
