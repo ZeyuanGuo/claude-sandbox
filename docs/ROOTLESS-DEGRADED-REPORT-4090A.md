@@ -68,7 +68,7 @@ bin/sandboxctl-degraded
 tests/rootless_e2e.py
 de41f3cc68320315e59c22ff053ff448a3d09396972afb46fbac6774d0b450eb
 tests/rootless_runtime_smoke.py
-0508f4b009494477400822c93ec9257651b0ab2fcf52e7bab361676ae491c3f4
+2b24c7e242b23f0edc5a3e49b28dd54902cca6f82bac4c93f3e5514b87ecb83c
 ```
 
 The verified image references used by the deployment were:
