@@ -82,17 +82,16 @@ gateway: cdm-degraded-gateway:5090
 
 ## Automated evidence
 
-The release acceptance run used the isolated Python 3.11 test runtime and
-`/home/gzy/5090-migration-work/pytest-relay-v2.xml`:
+The final checkout acceptance used the isolated Python 3.11 test runtime:
 
 ```text
-249 passed, 0 failed, 0 skipped
+236 passed, 0 failed, 0 skipped
 ```
 
-The latest checkout verification (`pytest-doc-full.xml`) records 253 passed;
-the added relay/topology cases are supplemental tests and do not replace the
-249-test acceptance record above. No test starts Claude or opens a public
-network connection.
+This count includes the rootless topology, relay, addon, policy, runtime, and
+daily-work smoke unit tests. The 14-check live internal E2E below is run
+separately against Docker on each acceptance host. No test starts a logged-in
+Claude session or opens a public network connection.
 
 The structural checker in `tests/verify_degraded_compose.py` validates both
 render modes: no-parent mode has no `egress_net`; configured-parent mode has
