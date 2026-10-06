@@ -99,6 +99,18 @@ for _ in range(100):
     optimizer.step()
 assert float(torch.abs(model(torch.tensor([[3.0]])) - 7.0)) < 0.2
 print("numpy=%s torch=%s cuda=%s" % (numpy.__version__, torch.__version__, torch.cuda.is_available()))
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    cuda_model = torch.nn.Linear(1, 1).to(device)
+    cuda_optimizer = torch.optim.SGD(cuda_model.parameters(), lr=0.1)
+    cuda_features = torch.tensor([[0.0], [1.0]], device=device)
+    cuda_target = torch.tensor([[1.0], [3.0]], device=device)
+    cuda_optimizer.zero_grad()
+    cuda_loss = torch.nn.functional.mse_loss(cuda_model(cuda_features), cuda_target)
+    cuda_loss.backward()
+    cuda_optimizer.step()
+    torch.cuda.synchronize()
+    print("cuda-training=pass")
 PY
   cuda=$(/home/gzy/miniconda3/envs/pthgnn/bin/python -c 'import torch; print(str(torch.cuda.is_available()).lower())')
   if [ "{gpu_mode}" = required ] && [ "$cuda" != true ]; then

@@ -20,6 +20,7 @@ def test_runtime_smoke_covers_daily_files_python_and_offline_tools() -> None:
         "codex --help",
         "/home/gzy/miniconda3/envs/pthgnn/bin/python",
         "torch.nn.Linear",
+        "cuda-training=pass",
         "/proc/net/route",
     ):
         assert marker in script
