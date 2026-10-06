@@ -10,6 +10,7 @@ def test_runtime_smoke_covers_daily_files_python_and_offline_tools() -> None:
         "mkdir -p \"$tmp/nested/.hidden\"",
         "ln -s nested/.hidden/value \"$tmp/value-link\"",
         "chmod 600",
+        "command -v python3",
         "python-training=pass",
         "git --version",
         "node --version",

@@ -29,9 +29,9 @@ chmod 600 "$tmp/nested/.hidden/value"
 test "$(stat -c %a "$tmp/nested/.hidden/value")" = 600
 mv "$tmp/nested/.hidden/value" "$tmp/nested/.hidden/value.renamed"
 test -f "$tmp/nested/.hidden/value.renamed"
-command -v python >/dev/null
-python --version >/dev/null
-python - "$tmp" <<'PY'
+command -v python3 >/dev/null
+python3 --version >/dev/null
+python3 - "$tmp" <<'PY'
 import hashlib
 import pathlib
 import sys
@@ -42,7 +42,7 @@ target.write_bytes(payload)
 assert target.read_bytes() == payload
 assert hashlib.sha256(target.read_bytes()).hexdigest()
 PY
-python - <<'PY'
+python3 - <<'PY'
 # Deterministic, dependency-free training smoke: y = 2x + 1.
 weights, bias = 0.0, 0.0
 for _ in range(400):
