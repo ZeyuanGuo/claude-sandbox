@@ -60,7 +60,9 @@ print("python-training=pass")
 PY
 test "${{HOME}}" = /home/gzy
 test "${{CLAUDE_CONFIG_DIR}}" = /home/gzy/.claude
-test -n "${{LANG}}" && test -n "${{LC_ALL}}" && test -n "${{TZ}}"
+test "${{LANG}}" = en_US.UTF-8
+test "${{LC_ALL}}" = en_US.UTF-8
+test "${{TZ}}" = America/Los_Angeles
 printf 'smoke\\n' > "$claude_probe"
 test "$(cat "$claude_probe")" = smoke
 if [ -d /home/gzy/newdfm ]; then
