@@ -56,7 +56,7 @@ on both hosts before promotion.
 src/controlled_dev_machine/degraded_rootless.py
 9d6b89daf9a46ce29d7ddc423ce93406cc32f0052b6d54006ff5deaf71a9906b
 src/controlled_dev_machine/degraded_topology.py
-07649c106dd5be3b0be4c5b0bed62cfb90fdbeb10f08b3b030b230068706b3d9
+45ed7a04be473a978370c874aa6c2530e13fa9bd1fe2977e9b2473898f5d6dac
 src/controlled_dev_machine/degraded_egress.py
 3ef315a5c928fdf1a2d2ab26d6c05ad2515656e84622a012a580a3722c3000c6
 gateway/mitmproxy/cdm_addon.py
@@ -67,6 +67,8 @@ bin/sandboxctl-degraded
 7be39ad202efc07587c70340756546e2ac14ce45582dac44605cbf619288a1a0
 tests/rootless_e2e.py
 de41f3cc68320315e59c22ff053ff448a3d09396972afb46fbac6774d0b450eb
+tests/rootless_runtime_smoke.py
+0508f4b009494477400822c93ec9257651b0ab2fcf52e7bab361676ae491c3f4
 ```
 
 The verified image references used by the deployment were:
@@ -157,6 +159,16 @@ Final offline environment evidence on both 4090a and 4090b:
 base Python: 3.13.13; import urllib.parse: PASS
 pthgnn Python: 3.10.9; numpy 1.23.5; torch 2.11.0+cu128: PASS
 ```
+
+Daily-work acceptance on both hosts also passed with
+`tests/rootless_runtime_smoke.py`: hidden-file/symlink/permission/rename and
+delete operations, a local Git commit/status cycle, Node/npm execution,
+Claude/Codex version and help startup, deterministic Python training, NumPy
+and Torch CPU training, and a real CUDA matrix/training step. The target now
+uses the recovered `pthgnn` environment in `PATH` and binds the host NVIDIA
+device nodes plus driver libraries through the rootless user daemon; no
+`--privileged`, `NET_ADMIN`, login, prompt, or external account request was
+used.
 
 ## Rootless limitations
 

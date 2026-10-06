@@ -79,6 +79,9 @@ def test_runtime_preserves_original_absolute_paths_locale_timezone(tmp_path):
     assert env["LANG"] == env["LC_ALL"] == "en_US.UTF-8"
     assert env["CDM_CONDA_ROOT"] == "/home/gzy/miniconda3"
     assert env["CDM_DEFAULT_CONDA_ENV"] == "pthgnn"
+    assert env["CONDA_DEFAULT_ENV"] == "pthgnn"
+    assert env["PATH"].startswith("/home/gzy/miniconda3/envs/pthgnn/bin:/home/gzy/miniconda3/bin:")
+    assert env["LD_LIBRARY_PATH"] == "/run/cdm-nvidia:/home/gzy/miniconda3/lib"
     assert target["command"] == ["sleep", "infinity"]  # Original container inspect.
     volumes = {item["target"]: item for item in target["volumes"]}
     assert volumes["/home/gzy"]["source"] == str(tmp_path / "runtime/home")

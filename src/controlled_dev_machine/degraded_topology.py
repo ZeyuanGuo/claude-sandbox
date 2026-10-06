@@ -4,6 +4,39 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def _rootless_gpu_mounts() -> tuple[list[str], list[dict]]:
+    """Expose only pre-existing NVIDIA devices and driver libraries.
+
+    Rootless Docker cannot use ``--gpus`` without a CDI installation. Direct
+    device binds remain user-controlled and work when the host device nodes are
+    world-readable, while the target still has all capabilities dropped.
+    """
+    device_names = sorted(path.name for path in Path("/dev").glob("nvidia[0-9]*"))
+    device_names.extend(name for name in (
+        "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"
+    ) if (Path("/dev") / name).exists())
+    devices = [f"/dev/{name}:/dev/{name}" for name in dict.fromkeys(device_names)]
+    mounts = []
+    library_names = ("libcuda.so.1", "libnvidia-ml.so.1")
+    for name in library_names:
+        for directory in (Path("/lib/x86_64-linux-gnu"),
+                          Path("/usr/lib/x86_64-linux-gnu")):
+            source = directory / name
+            if source.exists():
+                mounts.append({"type": "bind", "source": str(source),
+                               "target": "/run/cdm-nvidia/" + name,
+                               "read_only": True,
+                               "bind": {"create_host_path": False}})
+                break
+    nvidia_smi = Path("/usr/bin/nvidia-smi")
+    if nvidia_smi.is_file() and nvidia_smi.stat().st_mode & 0o111:
+        mounts.append({"type": "bind", "source": str(nvidia_smi),
+                       "target": "/usr/local/bin/nvidia-smi",
+                       "read_only": True,
+                       "bind": {"create_host_path": False}})
+    return devices, mounts
+
+
 def build_compose(
     *, root: Path, runtime: Path, state: Path, target_image: str,
     gateway_image: str, policy: Path, policy_digest: str,
@@ -86,23 +119,28 @@ def build_compose(
         "dns": ["127.0.0.1"],
     })
     target = service(target_image, ["sleep", "infinity"])
+    gpu_devices, gpu_mounts = _rootless_gpu_mounts()
     target.update({
         "hostname": "devbox", "working_dir": "/home/gzy",
         "environment": {
             "USER": "gzy", "HOME": "/home/gzy", "CLAUDE_CONFIG_DIR": "/home/gzy/.claude",
             "CDM_CONDA_ROOT": "/home/gzy/miniconda3", "CDM_DEFAULT_CONDA_ENV": "pthgnn",
-            "PATH": "/home/gzy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PATH": "/home/gzy/miniconda3/envs/pthgnn/bin:/home/gzy/miniconda3/bin:/home/gzy/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "CONDA_DEFAULT_ENV": "pthgnn",
             "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8", "TZ": "America/Los_Angeles",
             "NODE_USE_SYSTEM_CA": "1", "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
             "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
             "NODE_EXTRA_CA_CERTS": "/etc/ssl/certs/ca-certificates.crt",
+            "LD_LIBRARY_PATH": "/run/cdm-nvidia:/home/gzy/miniconda3/lib",
             "HTTP_PROXY": "http://172.31.0.3:8080", "HTTPS_PROXY": "http://172.31.0.3:8080",
             "http_proxy": "http://172.31.0.3:8080", "https_proxy": "http://172.31.0.3:8080",
             "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost",
         },
+        "devices": gpu_devices,
         "volumes": [mount(runtime / "home", "/home/gzy", False),
                     mount(runtime / "miniconda3", "/home/gzy/miniconda3"),
-                    mount(state / "trust/ca-certificates.crt", "/etc/ssl/certs/ca-certificates.crt")],
+                    mount(state / "trust/ca-certificates.crt", "/etc/ssl/certs/ca-certificates.crt"),
+                    *gpu_mounts],
         "dns": ["172.31.0.2"],
         "networks": {"target_net": {"ipv4_address": "172.31.0.4"}},
     })
