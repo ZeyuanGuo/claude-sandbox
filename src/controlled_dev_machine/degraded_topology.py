@@ -41,7 +41,7 @@ def build_compose(
     *, root: Path, runtime: Path, state: Path, target_image: str,
     gateway_image: str, policy: Path, policy_digest: str,
     upstream_host: str = "", upstream_port: str = "", dns_suffixes: tuple[str, ...] = (),
-    projects: Path | None = None,
+    projects: Path | None = None, strict_local: bool = False,
 ) -> dict:
     if upstream_host and not dns_suffixes:
         raise ValueError(
@@ -136,8 +136,10 @@ def build_compose(
             "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1",
             "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
             "DISABLE_UPDATES": "1",
-            "HTTP_PROXY": "http://172.31.0.3:8080", "HTTPS_PROXY": "http://172.31.0.3:8080",
-            "http_proxy": "http://172.31.0.3:8080", "https_proxy": "http://172.31.0.3:8080",
+            "HTTP_PROXY": "http://127.0.0.1:8080" if strict_local else "http://172.31.0.3:8080",
+            "HTTPS_PROXY": "http://127.0.0.1:8080" if strict_local else "http://172.31.0.3:8080",
+            "http_proxy": "http://127.0.0.1:8080" if strict_local else "http://172.31.0.3:8080",
+            "https_proxy": "http://127.0.0.1:8080" if strict_local else "http://172.31.0.3:8080",
             "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost",
         },
         "devices": gpu_devices,
@@ -162,6 +164,30 @@ def build_compose(
     if upstream_host:
         networks["egress_net"] = {"internal": False, "enable_ipv6": False}
         relay["networks"]["egress_net"] = {}
-    return {"name": "cdm-degraded", "services": {"dns": dns, "gateway": gateway,
-                                                  "egress": relay, "target": target},
-            "networks": networks}
+    services = {"dns": dns, "gateway": gateway, "egress": relay, "target": target}
+    if strict_local:
+        bridge_dir = state / "proxy-bridge"
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        bridge_script = root / "src/controlled_dev_machine/proxy_bridge.py"
+        net_bridge = service(gateway_image, ["python3", "/opt/cdm/proxy_bridge.py",
+                                             "unix-listen", "--socket", "/run/cdm-proxy/gateway.sock",
+                                             "--host", "172.31.0.3", "--port", "8080"])
+        net_bridge.update({"volumes": [mount(bridge_script, "/opt/cdm/proxy_bridge.py"),
+                                        mount(bridge_dir, "/run/cdm-proxy", False)],
+                           "entrypoint": [],
+                           "networks": {"target_net": {"ipv4_address": "172.31.0.5"}},
+                           "dns": ["172.31.0.2"]})
+        local_bridge = service(gateway_image, ["python3", "/opt/cdm/proxy_bridge.py",
+                                               "tcp-listen", "--listen", "127.0.0.1:8080",
+                                               "--socket", "/run/cdm-proxy/gateway.sock"])
+        local_bridge.update({"network_mode": "service:target",
+                             "entrypoint": [],
+                             "volumes": [mount(bridge_script, "/opt/cdm/proxy_bridge.py"),
+                                         mount(bridge_dir, "/run/cdm-proxy")],
+                             "depends_on": ["target", "net-bridge"]})
+        target["network_mode"] = "none"
+        target.pop("networks", None)
+        target.pop("dns", None)
+        services["net-bridge"] = net_bridge
+        services["local-bridge"] = local_bridge
+    return {"name": "cdm-degraded", "services": services, "networks": networks}

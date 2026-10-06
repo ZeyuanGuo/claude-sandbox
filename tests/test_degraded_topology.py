@@ -24,6 +24,23 @@ def test_target_has_no_direct_external_or_relay_network(tmp_path):
     assert "ports" not in target and "network_mode" not in target
 
 
+def test_strict_local_target_has_only_loopback_and_proxy_bridges(tmp_path):
+    config = build_compose(root=tmp_path / "repo", runtime=tmp_path / "runtime",
+                           state=tmp_path / "state", target_image="target",
+                           gateway_image="gateway", policy=tmp_path / "policy",
+                           policy_digest="raw:fixture", upstream_host="192.168.71.10",
+                           upstream_port="8080", dns_suffixes=("api.ipify.org",),
+                           strict_local=True)
+    target = config["services"]["target"]
+    assert target["network_mode"] == "none"
+    assert "networks" not in target
+    assert target["environment"]["HTTP_PROXY"] == "http://127.0.0.1:8080"
+    assert set(config["services"]) == {"dns", "gateway", "egress", "target",
+                                        "net-bridge", "local-bridge"}
+    assert config["services"]["local-bridge"]["network_mode"] == "service:target"
+    assert config["services"]["net-bridge"]["networks"]["target_net"]["ipv4_address"] == "172.31.0.5"
+
+
 def test_only_relay_has_external_network_even_with_parent_configured(tmp_path):
     config = compose(tmp_path, upstream=True)
     external_services = {name for name, service in config["services"].items()
