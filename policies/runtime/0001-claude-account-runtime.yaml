@@ -1,0 +1,157 @@
+schema_version: 1
+policy_id: runtime-claude-account
+revision: 1
+mode: strict
+created_at: "2026-10-07T00:00:00Z"
+parent_digest: ff93b68351ff32b42cf8472306af82cc88aaaf0ebf714f3130aa4fa96bd4cce9
+web_default: review
+rules:
+  - id: block-claude-event-logging
+    priority: 10
+    action: block
+    purpose: "关闭非必要遥测；仍保留网关审计"
+    domain_kind: exact
+    domain: api.anthropic.com
+    schemes: [https]
+    ports: [443]
+    methods: [POST]
+    path_prefixes: [/api/event_logging/]
+    path_match: prefix
+    content_types: [application/json]
+    body_max_bytes: 8388608
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: claude-account-runtime
+  - id: allow-claude-api-hello
+    priority: 20
+    action: allow
+    purpose: "Claude startup health endpoint"
+    domain_kind: exact
+    domain: api.anthropic.com
+    schemes: [https]
+    ports: [443]
+    methods: [GET]
+    path_prefixes: [/api/hello]
+    path_match: exact
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: claude-account-runtime
+  - id: allow-claude-platform-hello
+    priority: 30
+    action: allow
+    purpose: "Claude OAuth health endpoint"
+    domain_kind: exact
+    domain: platform.claude.com
+    schemes: [https]
+    ports: [443]
+    methods: [GET]
+    path_prefixes: [/v1/oauth/hello]
+    path_match: exact
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: claude-account-runtime
+  - id: allow-claude-oauth-organizations
+    priority: 40
+    action: allow
+    purpose: "读取当前已登录账号的组织列表"
+    domain_kind: exact
+    domain: api.anthropic.com
+    schemes: [https]
+    ports: [443]
+    methods: [GET]
+    path_prefixes: [/api/oauth/organizations/]
+    path_match: prefix
+    content_types: []
+    body_max_bytes: 0
+    allow_sensitive_headers: true
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: claude-account-runtime
+  - id: allow-claude-oauth-profile
+    priority: 45
+    action: allow
+    purpose: "读取当前账号的 Claude profile"
+    domain_kind: exact
+    domain: api.anthropic.com
+    schemes: [https]
+    ports: [443]
+    methods: [GET]
+    path_prefixes: [/api/oauth/profile]
+    path_match: exact
+    content_types: []
+    body_max_bytes: 0
+    allow_sensitive_headers: true
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: claude-account-runtime
+  - id: allow-claude-oauth-token
+    priority: 50
+    action: allow
+    purpose: "刷新当前已登录账号的 OAuth token"
+    domain_kind: exact
+    domain: platform.claude.com
+    schemes: [https]
+    ports: [443]
+    methods: [POST]
+    path_prefixes: [/v1/oauth/token]
+    path_match: exact
+    content_types: [application/json, application/x-www-form-urlencoded]
+    body_max_bytes: 1048576
+    allow_sensitive_headers: true
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: claude-account-runtime
+  - id: allow-claude-messages
+    priority: 60
+    action: allow
+    purpose: "正常 Claude Code 模型请求；仅固定 Anthropic API 主机"
+    domain_kind: exact
+    domain: api.anthropic.com
+    schemes: [https]
+    ports: [443]
+    methods: [POST]
+    path_prefixes: [/v1/messages]
+    path_match: prefix
+    content_types: [application/json]
+    body_max_bytes: 33554432
+    allow_sensitive_headers: true
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: claude-account-runtime
+  - id: allow-exit-identity-check
+    priority: 70
+    action: allow
+    purpose: "确认固定洛杉矶出口"
+    domain_kind: exact
+    domain: api.ipify.org
+    schemes: [https]
+    ports: [443]
+    methods: [GET]
+    path_prefixes: [/]
+    path_match: exact
+    content_types: []
+    body_max_bytes: 0
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: transparent-exit-verification
+  - id: allow-codex-responses-api-key
+    priority: 80
+    action: allow
+    purpose: "Codex API-key responses endpoint through the fixed LA parent"
+    domain_kind: exact
+    domain: ezcode.lalalands.uk
+    schemes: [https]
+    ports: [443]
+    methods: [POST]
+    path_prefixes: [/v1/responses]
+    path_match: prefix
+    content_types: [application/json]
+    body_max_bytes: 33554432
+    allow_sensitive_headers: true
+    tls_identity_required: true
+    plaintext_required: true
+    evidence: codex-api-key-runtime
