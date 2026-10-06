@@ -63,6 +63,8 @@ test "${{CLAUDE_CONFIG_DIR}}" = /home/gzy/.claude
 test "${{LANG}}" = en_US.UTF-8
 test "${{LC_ALL}}" = en_US.UTF-8
 test "${{TZ}}" = America/Los_Angeles
+test -x /home/gzy/miniconda3/bin/python3.13
+/home/gzy/miniconda3/bin/python3.13 --version | grep -F 'Python 3.13.13'
 printf 'smoke\\n' > "$claude_probe"
 test "$(cat "$claude_probe")" = smoke
 if [ -d /home/gzy/newdfm ]; then
