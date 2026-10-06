@@ -77,7 +77,7 @@ The verified image references used by the deployment were:
 target:  cdm-degraded-target:5090-rootfs
          sha256:d52a88b46be8d7399e354135b787ce2b6d6deaf545c84d6636887c95eb551d31
 gateway: cdm-degraded-gateway:5090
-         sha256:56c2c9c158f8704713934de8ad814a7b9cf7e196ad50da88b62dbfed90dff5c4
+         sha256:eaec06aef65c5b8030fa66f248893dbed13b1b2ad8b7d9f09a63c6065ff8b86a
 ```
 
 ## Automated evidence
