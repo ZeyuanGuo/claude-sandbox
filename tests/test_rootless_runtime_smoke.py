@@ -11,6 +11,8 @@ def test_runtime_smoke_covers_daily_files_python_and_offline_tools() -> None:
         "ln -s nested/.hidden/value \"$tmp/value-link\"",
         "chmod 600",
         "command -v python3",
+        "printf 'smoke\\n' > \"$claude_probe\"",
+        "project_probe=/home/gzy/newdfm/.cdm-rootless-smoke-$$",
         "python-training=pass",
         "git --version",
         "node --version",

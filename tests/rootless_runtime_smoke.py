@@ -20,7 +20,9 @@ def _target_script(*, require_ml: bool, require_gpu: bool) -> str:
     gpu_mode = "required" if require_gpu else "optional"
     return f'''set -eu
 tmp="$HOME/.cdm-rootless-smoke-$$"
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+claude_probe="$CLAUDE_CONFIG_DIR/.cdm-rootless-smoke-$$"
+project_probe=""
+trap 'rm -rf "$tmp" "$claude_probe" "$project_probe"' EXIT HUP INT TERM
 mkdir -p "$tmp/nested/.hidden"
 printf 'rootless-smoke\\n' > "$tmp/nested/.hidden/value"
 ln -s nested/.hidden/value "$tmp/value-link"
@@ -59,6 +61,18 @@ PY
 test "${{HOME}}" = /home/gzy
 test "${{CLAUDE_CONFIG_DIR}}" = /home/gzy/.claude
 test -n "${{LANG}}" && test -n "${{LC_ALL}}" && test -n "${{TZ}}"
+printf 'smoke\\n' > "$claude_probe"
+test "$(cat "$claude_probe")" = smoke
+if [ -d /home/gzy/newdfm ]; then
+  project_probe=/home/gzy/newdfm/.cdm-rootless-smoke-$$
+elif [ -d /home/gzy/dfm ]; then
+  project_probe=/home/gzy/dfm/.cdm-rootless-smoke-$$
+else
+  echo 'no recovered project mount' >&2
+  exit 44
+fi
+printf 'smoke\\n' > "$project_probe"
+test "$(cat "$project_probe")" = smoke
 git --version >/dev/null
 git_tmp="$tmp/git-project"
 mkdir -p "$git_tmp"
