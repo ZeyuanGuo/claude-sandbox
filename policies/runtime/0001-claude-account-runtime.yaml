@@ -147,7 +147,7 @@ rules:
     schemes: [https]
     ports: [443]
     methods: [POST]
-    path_prefixes: [/v1/responses]
+    path_prefixes: [/responses, /v1/responses]
     path_match: prefix
     content_types: [application/json]
     body_max_bytes: 33554432
