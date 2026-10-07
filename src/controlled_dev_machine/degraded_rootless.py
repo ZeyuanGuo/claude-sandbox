@@ -152,6 +152,11 @@ def render() -> int:
         (state() / part).mkdir(mode=0o700, parents=True, exist_ok=True)
     suffixes = tuple(x.strip() for x in os.environ.get("CDM_DEGRADED_DNS_SUFFIXES", "").split(",") if x.strip())
     strict_local = os.environ.get("CDM_DEGRADED_STRICT_LOCAL") == "1"
+    ssh_bridge = os.environ.get("CDM_DEGRADED_SSH_BRIDGE") == "1"
+    ssh_socket_dir = Path(os.environ.get("CDM_DEGRADED_SSH_SOCKET_DIR",
+                                         str(state() / "ssh-bridge"))).expanduser()
+    if ssh_bridge and not (ssh_socket_dir / "ssh_config").is_file():
+        raise SystemExit("SSH bridge configuration is not prepared")
     project_root = runtime() / "projects"
     if not any((project_root / name).is_dir() for name in ("newdfm", "dfm")):
         # Avoid copying hundreds of GB a second time while the immutable
@@ -163,7 +168,8 @@ def render() -> int:
                              target_image=images["target"], gateway_image=tag, policy=policy,
                              policy_digest=digest, upstream_host=parent, upstream_port=port,
                              dns_suffixes=suffixes, projects=project_root,
-                             strict_local=strict_local)
+                             strict_local=strict_local, ssh_bridge=ssh_bridge,
+                             ssh_socket_dir=ssh_socket_dir)
     canary = os.environ.get("CDM_DEGRADED_LOCAL_CANARY") == "1"
     if canary:
         document["networks"].pop("egress_net", None)
@@ -178,7 +184,8 @@ def render() -> int:
                                "compose_digest": hashlib.sha256(path.read_bytes()).hexdigest(),
                                "project_root": str(project_root),
                                "upstream_configured": bool(parent), "local_canary": canary,
-                               "strict_local": strict_local})
+                               "strict_local": strict_local, "ssh_bridge": ssh_bridge,
+                               "ssh_socket_dir": str(ssh_socket_dir)})
     print(path)
     return 0
 

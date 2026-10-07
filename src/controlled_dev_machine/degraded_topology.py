@@ -42,6 +42,8 @@ def build_compose(
     gateway_image: str, policy: Path, policy_digest: str,
     upstream_host: str = "", upstream_port: str = "", dns_suffixes: tuple[str, ...] = (),
     projects: Path | None = None, strict_local: bool = False,
+    ssh_bridge: bool = False,
+    ssh_socket_dir: Path | None = None,
 ) -> dict:
     if upstream_host and not dns_suffixes:
         raise ValueError(
@@ -155,6 +157,14 @@ def build_compose(
         path = project_root / project
         if path.is_dir():
             target["volumes"].append(mount(path, "/home/gzy/" + project, False))
+    if ssh_bridge:
+        socket_dir = ssh_socket_dir or (state / "ssh-bridge")
+        target["volumes"].extend([
+            mount(socket_dir, "/run/cdm-ssh"),
+            mount(root / "src", "/opt/cdm-ssh"),
+            mount(socket_dir / "ssh_config", "/home/gzy/.ssh/config"),
+            mount(socket_dir / "ssh_config", "/root/.ssh/config"),
+        ])
     networks = {
         "target_net": {"internal": True, "enable_ipv6": False,
                        "ipam": {"config": [{"subnet": "172.31.0.0/24"}]}},

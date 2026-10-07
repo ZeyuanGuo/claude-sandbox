@@ -1,0 +1,13 @@
+[Unit]
+Description=CDM fixed campus SSH reverse sockets to 4090b
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R /tmp/cdm-ssh-bridge/mainstorage-100.sock:100.117.92.79:22 -R /tmp/cdm-ssh-bridge/nas-100.sock:100.88.3.50:10090 -R /tmp/cdm-ssh-bridge/3090-100.sock:100.127.67.57:10090 -R /tmp/cdm-ssh-bridge/4090-100.sock:100.112.213.32:10090 -R /tmp/cdm-ssh-bridge/a800-100.sock:100.98.100.42:10090 -R /tmp/cdm-ssh-bridge/mainstorage-10.sock:10.112.116.37:22 -R /tmp/cdm-ssh-bridge/nas-10.sock:10.112.88.101:10090 -R /tmp/cdm-ssh-bridge/3090-10.sock:10.112.201.18:10090 -R /tmp/cdm-ssh-bridge/4090-10.sock:10.112.18.98:10090 -R /tmp/cdm-ssh-bridge/a800-10.sock:10.112.216.82:10090 4090b
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
