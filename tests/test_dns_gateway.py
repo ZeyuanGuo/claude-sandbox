@@ -191,7 +191,7 @@ def test_public_doh_queries_are_not_serialized(monkeypatch) -> None:
     client = DohClient(
         DohEndpoint(
             proxy_host="127.0.0.1",
-            proxy_port=11440,
+            proxy_port=26940,
             address="1.1.1.1",
             server_name="cloudflare-dns.com",
             path="/dns-query",

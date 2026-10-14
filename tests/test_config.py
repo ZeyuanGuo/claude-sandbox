@@ -316,7 +316,7 @@ def test_http_upstream_exit_range_is_configurable(tmp_path: Path) -> None:
     path.write_text(
         path.read_text(encoding="utf-8").replace(
             "upstream:\n  kind: unset",
-            "upstream:\n  kind: http\n  host: 127.0.0.1\n  port: 11440\n"
+            "upstream:\n  kind: http\n  host: 127.0.0.1\n  port: 26940\n"
             "  expected_exit_cidr: 8.8.8.8/32",
         ),
         encoding="utf-8",
@@ -337,7 +337,7 @@ def test_http_upstream_requires_an_explicit_exit_range(tmp_path: Path) -> None:
     path.write_text(
         path.read_text(encoding="utf-8").replace(
             "upstream:\n  kind: unset",
-            "upstream:\n  kind: http\n  host: 127.0.0.1\n  port: 11440",
+            "upstream:\n  kind: http\n  host: 127.0.0.1\n  port: 26940",
         ),
         encoding="utf-8",
     )

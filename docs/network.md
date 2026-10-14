@@ -8,7 +8,7 @@ DNS 路径：
 
 ```text
 目标程序 -> 只读挂载的 /etc/resolv.conf -> 受控 DNS 172.28.0.4
-         -> 父代理 11440 CONNECT 到固定 1.1.1.1:443
+         -> 父代理 26940 CONNECT 到固定 1.1.1.1:443
          -> TLS SNI cloudflare-dns.com -> DoH wire format
          -> 校验公网地址 -> 记录 DNS 租约 -> 返回目标程序
 ```
@@ -20,11 +20,11 @@ Web 路径：
          -> 目标网络 nftables -> 透明 mitmproxy
          -> 核对 Host/SNI、原始目的 IP 和 DNS 租约
          -> strict 请求审核或 daily 直接放行；旁路记录请求
-         -> 父代理 11440 CONNECT 到已解析的目标 IP
+         -> 父代理 26940 CONNECT 到已解析的目标 IP
          -> 公网
 ```
 
-宿主配置填写 `127.0.0.1:11440`，并用 `upstream.expected_exit_cidr` 声明允许的公网出口范围。DNS 和网关实际从内部上游网桥连接该网桥的宿主地址；目标容器看不到这个地址。父代理不决定放行规则；DNS、目的地址绑定和 HTTP 内容策略都在本项目内完成。每台服务器以自己的主机配置和启动探测为准，真实出口不进入仓库。
+宿主配置填写 `127.0.0.1:26940`，并用 `upstream.expected_exit_cidr` 声明允许的公网出口范围。DNS 和网关实际从内部上游网桥连接该网桥的宿主地址；目标容器看不到这个地址。父代理不决定放行规则；DNS、目的地址绑定和 HTTP 内容策略都在本项目内完成。每台服务器以自己的主机配置和启动探测为准，真实出口不进入仓库。
 
 ## 组件职责
 
@@ -33,12 +33,12 @@ Web 路径：
 | 目标 nftables | 只允许受控 DNS 和策略用到的 TCP 端口；把 Web TCP 透明送到网关 |
 | 受控 DNS | 按策略接受域名，经父代理发出 DoH，拒绝私网/保留地址并签发短期名称-IP租约 |
 | mitmproxy addon | 解密 HTTP/HTTPS，核对原始目的地址、DNS 租约和 Host/SNI；记录请求并立即流式转发响应 |
-| 宿主父代理门禁 | 运行时只允许回环和本项目 DNS/网关访问 `11440`，停止和重启恢复时只允许回环；拒绝外部/LAN 和其他网桥 |
-| 宿主 `11440` | 把 DNS 和已批准 Web 连接送到指定出口，不参与项目策略 |
+| 宿主父代理门禁 | 运行时只允许回环和本项目 DNS/网关访问 `26940`，停止和重启恢复时只允许回环；拒绝外部/LAN 和其他网桥 |
+| 宿主 `26940` | 把 DNS 和已批准 Web 连接送到指定出口，不参与项目策略 |
 | tcpdump 与 cgroup eBPF | 保存目标、DNS、网关实际数据包，以及目标 cgroup 的执行、连接和常规 UDP 发送调用 |
 | network watchdog | 检查上述进程身份，并续期三处网络命名空间中的短期放行项 |
 
-目标不加入 `upstream_net`，不能直接访问宿主代理。`upstream_net` 从创建起就是 Docker 内部网络，没有普通公网路由；容器启动前，宿主 nftables 已只允许 DNS 和网关连接 `upstream.cdm.test:11440`。宿主本机进程仍可通过回环使用父代理。目标没有 `NET_ADMIN`，不能修改路由或 nftables；宿主 Docker socket、策略、审计目录和网关私钥也不挂入目标。
+目标不加入 `upstream_net`，不能直接访问宿主代理。`upstream_net` 从创建起就是 Docker 内部网络，没有普通公网路由；容器启动前，宿主 nftables 已只允许 DNS 和网关连接 `upstream.cdm.test:26940`。宿主本机进程仍可通过回环使用父代理。目标没有 `NET_ADMIN`，不能修改路由或 nftables；宿主 Docker socket、策略、审计目录和网关私钥也不挂入目标。
 
 ## DNS 约束
 
