@@ -430,7 +430,7 @@ def test_host_profile_uses_direct_claude_mount_and_neutral_shell(
     host_prompt.parent.mkdir()
     host_bashrc = config.target.home / ".bashrc"
     host_prompt.write_text("# Host instructions\n\nUse Chinese.\n", encoding="utf-8")
-    host_bashrc.write_text("export HTTPS_PROXY=http://127.0.0.1:11430\n", encoding="utf-8")
+    host_bashrc.write_text("export HTTPS_PROXY=http://127.0.0.1:26930\n", encoding="utf-8")
     config = replace(
         config,
         profile=HostProfile(
@@ -446,7 +446,7 @@ def test_host_profile_uses_direct_claude_mount_and_neutral_shell(
     )
     files, source_digest = _profile_bundle(config, Path.cwd())
     assert "CLAUDE.md" not in files
-    assert "127.0.0.1:11430" not in files[".bashrc"]
+    assert "127.0.0.1:26930" not in files[".bashrc"]
     assert "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY" in files[".bashrc"]
     assert 'conda activate "$CDM_DEFAULT_CONDA_ENV"' in files[".bashrc"]
     assert "$CDM_CONDA_ROOT/etc/profile.d/conda.sh" in files[".bashrc"]
@@ -579,7 +579,7 @@ def test_image_builds_use_host_network_without_persisting_proxy_values(
         "no_proxy",
     ):
         monkeypatch.delenv(variable, raising=False)
-    monkeypatch.setenv("HTTP_PROXY", "http://user:secret@127.0.0.1:11430")
+    monkeypatch.setenv("HTTP_PROXY", "http://user:secret@127.0.0.1:26930")
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     options = _build_proxy_options()
     assert options == (
@@ -606,7 +606,7 @@ def test_http_upstream_is_gateway_only(tmp_path: Path) -> None:
         upstream=UpstreamConfig(
             kind="http",
             host="127.0.0.1",
-            port=11440,
+            port=26940,
             config_path=None,
             expected_exit_cidr="8.0.0.0/8",
         ),
@@ -626,7 +626,7 @@ def test_http_upstream_is_gateway_only(tmp_path: Path) -> None:
     assert gateway["networks"]["upstream_net"]["ipv4_address"] == "172.28.0.34"
     assert dns["networks"]["upstream_net"]["ipv4_address"] == "172.28.0.35"
     assert gateway["environment"]["CDM_UPSTREAM_HOST"] == "upstream.cdm.test"
-    assert gateway["environment"]["CDM_UPSTREAM_PORT"] == "11440"
+    assert gateway["environment"]["CDM_UPSTREAM_PORT"] == "26940"
     assert "upstream.cdm.test:172.28.0.33" in gateway["extra_hosts"]
     assert "upstream.cdm.test:172.28.0.33" in dns["extra_hosts"]
     assert "--doh-address" in dns["command"]
@@ -640,7 +640,7 @@ def test_upstream_exit_must_match_host_configured_range(tmp_path: Path, monkeypa
         upstream=UpstreamConfig(
             kind="http",
             host="127.0.0.1",
-            port=11440,
+            port=26940,
             config_path=None,
             expected_exit_cidr="8.0.0.0/8",
         ),
@@ -662,7 +662,7 @@ def test_upstream_exit_must_match_host_configured_range(tmp_path: Path, monkeypa
 def test_host_parent_guard_allows_only_project_infrastructure(tmp_path: Path, monkeypatch) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
+        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=26940, config_path=None),
     )
     manifest = _manifest(config, tmp_path)
     scripts: list[tuple[str, str]] = []
@@ -678,7 +678,7 @@ def test_host_parent_guard_allows_only_project_infrastructure(tmp_path: Path, mo
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._run",
         lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            [], 0, stdout="tcp dport 11440 drop\n"
+            [], 0, stdout="tcp dport 26940 drop\n"
         ),
     )
 
@@ -686,23 +686,23 @@ def test_host_parent_guard_allows_only_project_infrastructure(tmp_path: Path, mo
 
     table, script = scripts[0]
     assert table == _host_parent_table(manifest)
-    assert 'iifname "lo" tcp dport 11440 accept' in script
+    assert 'iifname "lo" tcp dport 26940 accept' in script
     assert (
-        'iifname "br-123456789012" ip saddr { 172.28.0.34, 172.28.0.35 } tcp dport 11440 accept'
+        'iifname "br-123456789012" ip saddr { 172.28.0.34, 172.28.0.35 } tcp dport 26940 accept'
     ) in script
     assert 'iifname "br-123456789012" drop' in script
-    assert "tcp dport 11440 drop" in script
+    assert "tcp dport 26940 drop" in script
 
 
 def test_stopped_parent_guard_keeps_the_parent_proxy_loopback_only(tmp_path: Path) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
+        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=26940, config_path=None),
     )
     script = _stopped_host_parent_guard_script(config, _manifest(config, tmp_path))
 
-    assert 'iifname "lo" tcp dport 11440 accept' in script
-    assert "tcp dport 11440 drop" in script
+    assert 'iifname "lo" tcp dport 26940 accept' in script
+    assert "tcp dport 26940 drop" in script
     assert "172.28.0.34" not in script
     assert "172.28.0.35" not in script
 
@@ -1187,7 +1187,7 @@ def test_ebpf_readiness_requires_observed_syscall_canaries(tmp_path: Path, monke
 def test_transparent_firewalls_allow_only_the_controlled_paths(tmp_path: Path, monkeypatch) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
+        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=26940, config_path=None),
     )
     manifest = _manifest(config, tmp_path)
     pids = {"gateway": 101, "dns": 102, "target": 103}
@@ -1222,14 +1222,14 @@ def test_transparent_firewalls_allow_only_the_controlled_paths(tmp_path: Path, m
     gateway = scripts[101]
     assert "tcp dport { 80, 443, 18680 } redirect to :8080" in gateway
     assert "chain forward" in gateway and "policy drop" in gateway
-    assert "ip daddr @audit_parent_addresses tcp dport 11440 accept" in gateway
+    assert "ip daddr @audit_parent_addresses tcp dport 26940 accept" in gateway
     assert "ip daddr @audit_canary_addresses tcp dport { 80, 443 } accept" in gateway
     gateway_output = gateway.split("chain output", 1)[1]
     assert "    ct state established,related accept" not in gateway_output
     assert "udp dport 53 accept" not in gateway
 
     dns = scripts[102]
-    assert "ip daddr @audit_parent_addresses tcp dport 11440 accept" in dns
+    assert "ip daddr @audit_parent_addresses tcp dport 26940 accept" in dns
     assert "ip saddr @audit_target_addresses udp dport 53 accept" in dns
     assert "policy drop" in dns
 
@@ -1245,7 +1245,7 @@ def test_ssh_firewalls_use_explicit_tailscale_targets_without_proxy_redirect(
 ) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
+        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=26940, config_path=None),
         ssh=SshConfig(
             enabled=True,
             interface="tailscale0",
@@ -1318,7 +1318,7 @@ def test_ssh_firewalls_use_explicit_tailscale_targets_without_proxy_redirect(
         "controlled_dev_machine.runtime._run",
         lambda command, **_kwargs: (
             commands.append(command)
-            or SimpleNamespace(returncode=0, stdout="tcp dport 11440 drop\n")
+            or SimpleNamespace(returncode=0, stdout="tcp dport 26940 drop\n")
         ),
     )
     _configure_host_parent_guard(config, manifest)

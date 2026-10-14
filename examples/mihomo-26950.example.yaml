@@ -5,7 +5,7 @@ mode: rule
 log-level: info
 ipv6: false
 
-mixed-port: 11450
+mixed-port: 26950
 
 proxies:
   - name: commercial-first-hop

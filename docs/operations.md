@@ -43,15 +43,15 @@ git status --short
 
 ### 3. 配置固定出口父代理
 
-父代理是本项目的外部前置条件，不由 `sandboxctl` 安装。部署者应先让一个支持 HTTPS `CONNECT` 的 HTTP 代理监听宿主 `11450`，并确认它使用期望的公网出口。DNS 和网关从 Docker 内部桥访问宿主，因此父代理必须监听该桥可达的地址；示例使用 `0.0.0.0`。安全边界由 `sandboxctl` 安装的宿主 nftables 提供：运行时只允许回环及本实例 DNS/网关的固定源地址，停止时只允许回环，其他容器、LAN 和外部来源均被拒绝。代理可以由 Mihomo、Clash 或其他实现提供；父代理必须全局使用指定出口，出口失效时直接失败，不能回退到其他代理或直连。
+父代理是本项目的外部前置条件，不由 `sandboxctl` 安装。部署者应先让一个支持 HTTPS `CONNECT` 的 HTTP 代理监听宿主 `26950`，并确认它使用期望的公网出口。DNS 和网关从 Docker 内部桥访问宿主，因此父代理必须监听该桥可达的地址；示例使用 `0.0.0.0`。安全边界由 `sandboxctl` 安装的宿主 nftables 提供：运行时只允许回环及本实例 DNS/网关的固定源地址，停止时只允许回环，其他容器、LAN 和外部来源均被拒绝。代理可以由 Mihomo、Clash 或其他实现提供；父代理必须全局使用指定出口，出口失效时直接失败，不能回退到其他代理或直连。
 
-仓库提供了脱敏的 [`examples/mihomo-11450.example.yaml`](../examples/mihomo-11450.example.yaml)：`11450` 的唯一规则指向固定出口节点，该节点再通过 `dialer-proxy` 使用商业 VPN 作为第一跳。把模板复制到宿主私有目录、填入两级节点参数并设为 `0600`；不要把真实服务器、账号或密码提交到 Git。模板中的 `allow-lan: true` 只用于让 Docker 内部桥可达，不能代替上述 nftables 门禁。使用其他父代理实现时也必须保持“唯一最终出口、失败即失败”的结构。
+仓库提供了脱敏的 [`examples/mihomo-26950.example.yaml`](../examples/mihomo-26950.example.yaml)：`26950` 的唯一规则指向固定出口节点，该节点再通过 `dialer-proxy` 使用商业 VPN 作为第一跳。把模板复制到宿主私有目录、填入两级节点参数并设为 `0600`；不要把真实服务器、账号或密码提交到 Git。模板中的 `allow-lan: true` 只用于让 Docker 内部桥可达，不能代替上述 nftables 门禁。使用其他父代理实现时也必须保持“唯一最终出口、失败即失败”的结构。
 
 下面是仓库验收过的 amd64 参考部署。Mihomo 固定为 `v1.18.3`，解压后程序的 SHA-256 是 `6a31325951db7ed8bb42f484fa4c5c4dc02d06488a4cb25f810e8ecb0245163d`：
 
 ```bash
 mihomo_root="$HOME/.local/share/claude-sandbox/mihomo"
-mihomo_config="$HOME/.config/claude-sandbox/mihomo-11450.yaml"
+mihomo_config="$HOME/.config/claude-sandbox/mihomo-26950.yaml"
 install -d -m 700 "$mihomo_root" "$(dirname "$mihomo_config")"
 curl -fsSL \
   https://github.com/MetaCubeX/mihomo/releases/download/v1.18.3/mihomo-linux-amd64-compatible-v1.18.3.gz \
@@ -60,20 +60,20 @@ chmod 700 "$mihomo_root/mihomo"
 printf '%s  %s\n' \
   6a31325951db7ed8bb42f484fa4c5c4dc02d06488a4cb25f810e8ecb0245163d \
   "$mihomo_root/mihomo" | sha256sum --check --strict
-install -m 600 examples/mihomo-11450.example.yaml "$mihomo_config"
+install -m 600 examples/mihomo-26950.example.yaml "$mihomo_config"
 ```
 
 填好私有配置后先检查并安装用户服务，但先不要启动：
 
 ```bash
 "$mihomo_root/mihomo" -t -d "$mihomo_root" -f "$mihomo_config"
-install -Dm644 examples/mihomo-11450.service \
+install -Dm644 examples/mihomo-26950.service \
   "$HOME/.config/systemd/user/claude-sandbox-mihomo.service"
 systemctl --user daemon-reload
 ```
 
 不要在 `sandboxctl guard` 之前启动这个服务。父代理配置、程序和运行数据都位于用户目录；迁移时只需重新下载已校验程序并放入该主机自己的私有配置，不复制凭据到仓库。
-示例服务每次启动前都会确认当前用户 `main` 实例的系统级门禁已经 active；门禁安装失败或开机恢复失败时，父代理保持启动失败，不会绑定 `11450`。
+示例服务每次启动前都会确认当前用户 `main` 实例的系统级门禁已经 active；门禁安装失败或开机恢复失败时，父代理保持启动失败，不会绑定 `26950`。
 
 ### 4. 生成本机配置
 
@@ -167,10 +167,10 @@ sudo bin/sandboxctl init --policy policies/strict/0002-claude-account.yaml
 sudo bin/sandboxctl guard
 systemctl --user start claude-sandbox-mihomo.service
 curl --fail --silent --show-error \
-  --proxy http://127.0.0.1:11450 https://api.ipify.org
+  --proxy http://127.0.0.1:26950 https://api.ipify.org
 sudo bin/sandboxctl doctor --json
 sudo bin/sandboxctl storage plan
-HOST_BUILD_PROXY=http://127.0.0.1:11400  # 按本机实际构建代理修改
+HOST_BUILD_PROXY=http://127.0.0.1:26900  # 按本机实际构建代理修改
 export HTTP_PROXY="$HOST_BUILD_PROXY"
 export HTTPS_PROXY="$HTTP_PROXY"
 export NO_PROXY=127.0.0.1,localhost
@@ -182,9 +182,9 @@ systemctl --user enable claude-sandbox-mihomo.service
 sudo bin/sandboxctl automation install
 ```
 
-`guard` 在父代理启动前安装并启用持久 nftables 门禁，此时 `11450` 只允许宿主回环访问；正式 `start` 才原子加入本实例 DNS 和网关的固定来源。这样首次部署也不会在两条命令之间向 LAN、外部或其他容器暴露代理。出口探测结果必须落在 `upstream.expected_exit_cidr` 内；固定出口填写精确 `/32`。`doctor` 任一 `blocked` 都要先修复。`init`、`guard`、`build`、`start` 和 `stop` 对同一实例互斥；运行中执行这些命令会直接拒绝，避免活动容器、门禁、`current` 清单和镜像标签分叉。
+`guard` 在父代理启动前安装并启用持久 nftables 门禁，此时 `26950` 只允许宿主回环访问；正式 `start` 才原子加入本实例 DNS 和网关的固定来源。这样首次部署也不会在两条命令之间向 LAN、外部或其他容器暴露代理。出口探测结果必须落在 `upstream.expected_exit_cidr` 内；固定出口填写精确 `/32`。`doctor` 任一 `blocked` 都要先修复。`init`、`guard`、`build`、`start` 和 `stop` 对同一实例互斥；运行中执行这些命令会直接拒绝，避免活动容器、门禁、`current` 清单和镜像标签分叉。
 
-基础镜像固定上游 digest，并由 `skopeo` 导入本机 Docker。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 同时核对源码、清单、策略、profile、镜像标签和 image ID。同一标签被重新构建成不同内容时会拒绝启动。构建阶段使用宿主网络；`sudo -E` 会把当前命令已有的标准代理变量临时交给 BuildKit，因此 `127.0.0.1` 上的宿主代理可直接使用。代理值不写入生成的 Compose、镜像或目标运行环境。容器启动后仍没有代理变量，运行流量只走 `11450`。
+基础镜像固定上游 digest，并由 `skopeo` 导入本机 Docker。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 同时核对源码、清单、策略、profile、镜像标签和 image ID。同一标签被重新构建成不同内容时会拒绝启动。构建阶段使用宿主网络；`sudo -E` 会把当前命令已有的标准代理变量临时交给 BuildKit，因此 `127.0.0.1` 上的宿主代理可直接使用。代理值不写入生成的 Compose、镜像或目标运行环境。容器启动后仍没有代理变量，运行流量只走 `26950`。
 
 `start` 会再次核对父代理门禁，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不发布端口，不挂 Docker socket；全部 GPU 可见但不设置独占模式。canary CA 和服务端证书有效期为 30 天；每次 `start` 在证书剩余有效期不足 7 天时先原子更新，再启动容器。
 
@@ -239,7 +239,7 @@ sudo bin/sandboxctl init --policy "$current_policy"
 sudo bin/sandboxctl guard
 systemctl --user start claude-sandbox-mihomo.service
 curl --fail --silent --show-error \
-  --proxy http://127.0.0.1:11450 https://api.ipify.org
+  --proxy http://127.0.0.1:26950 https://api.ipify.org
 sudo bin/sandboxctl start
 sudo bin/sandboxctl verify-closed
 ```

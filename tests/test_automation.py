@@ -15,7 +15,7 @@ def _config(tmp_path: Path):
     return SimpleNamespace(
         resource_prefix="cdm-u1010-main",
         target=SimpleNamespace(name="alice", uid=1010, gid=1010, home=tmp_path / "home" / "alice"),
-        upstream=SimpleNamespace(kind="http", host="127.0.0.1", port=11450),
+        upstream=SimpleNamespace(kind="http", host="127.0.0.1", port=26950),
     )
 
 

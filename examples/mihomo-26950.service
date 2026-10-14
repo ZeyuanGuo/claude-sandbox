@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=/bin/sh -ec 'uid=$$(/usr/bin/id -u); exec /usr/bin/systemctl is-active --quiet "cdm-u$${uid}-main-parent-guard.service"'
-ExecStart=%h/.local/share/claude-sandbox/mihomo/mihomo -d %h/.local/share/claude-sandbox/mihomo -f %h/.config/claude-sandbox/mihomo-11450.yaml
+ExecStart=%h/.local/share/claude-sandbox/mihomo/mihomo -d %h/.local/share/claude-sandbox/mihomo -f %h/.config/claude-sandbox/mihomo-26950.yaml
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

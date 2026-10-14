@@ -36,7 +36,7 @@ def test_nonzero_capture_waits_for_packet_delivery(tmp_path: Path, monkeypatch) 
         metadata_path=tmp_path / "capture.json",
         started_at="start",
         ready_at="ready",
-        capture_filter="dst port 11450",
+        capture_filter="dst port 26950",
     )
 
     def sleep(_seconds):
@@ -92,7 +92,7 @@ def test_nonzero_capture_stops_at_packet_timeout(tmp_path: Path, monkeypatch) ->
         metadata_path=tmp_path / "capture.json",
         started_at="start",
         ready_at="ready",
-        capture_filter="dst port 11450",
+        capture_filter="dst port 26950",
     )
     times = iter((0.0, 5.0))
     monkeypatch.setattr(
