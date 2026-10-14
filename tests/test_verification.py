@@ -31,7 +31,7 @@ def test_strict_public_web_probe_approves_its_own_review(monkeypatch) -> None:
     config = SimpleNamespace(
         upstream=SimpleNamespace(
             kind="http",
-            port=11440,
+            port=26940,
             expected_exit_cidr="204.1.123.50/32",
         )
     )

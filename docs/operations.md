@@ -27,11 +27,11 @@ sudo apt-get install -y python3 python3-yaml nftables iproute2 util-linux \
   tcpdump bpftrace skopeo curl openssl
 ```
 
-父代理是本项目的外部前置条件，不由 `sandboxctl` 安装。部署者应先让一个支持 HTTPS `CONNECT` 的 HTTP 代理只监听宿主 `127.0.0.1:11440`，并确认它使用期望的公网出口。代理可以由 Clash 或其他实现提供；本项目只连接端口，不解析代理自己的 YAML，也不把代理地址暴露给目标容器。
+父代理是本项目的外部前置条件，不由 `sandboxctl` 安装。部署者应先让一个支持 HTTPS `CONNECT` 的 HTTP 代理只监听宿主 `127.0.0.1:26940`，并确认它使用期望的公网出口。代理可以由 Clash 或其他实现提供；本项目只连接端口，不解析代理自己的 YAML，也不把代理地址暴露给目标容器。
 
 ```bash
 curl --fail --silent --show-error \
-  --proxy http://127.0.0.1:11440 https://api.ipify.org
+  --proxy http://127.0.0.1:26940 https://api.ipify.org
 ```
 
 输出必须落在随后配置的 `upstream.expected_exit_cidr` 内。只有一个固定出口时，把实际输出追加 `/32`；只有 VPN 服务明确保证一段地址池时才填写较大的 CIDR。真实出口属于主机私有配置，不能写入仓库。若父代理需要本地配置文件，可把路径写入 `upstream.config_path` 作为存在性检查；控制器不会用它启动父代理。

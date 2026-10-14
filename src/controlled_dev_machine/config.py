@@ -229,7 +229,7 @@ def create_host_config(path: Path) -> None:
         "upstream": {
             "kind": "http",
             "host": "127.0.0.1",
-            "port": 11440,
+            "port": 26940,
             "expected_exit_cidr": None,
             "config_path": None,
         },
