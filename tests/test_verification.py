@@ -1,9 +1,54 @@
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 import controlled_dev_machine.verification as verification
 from controlled_dev_machine.errors import DeploymentError
+
+
+@pytest.mark.parametrize("environment, passes", [
+    ({"NODE_OPTIONS": "--use-system-ca"}, True),
+    ({"NODE_OPTIONS": "--max-old-space-size=512 --use-system-ca"}, True),
+    ({"NODE_OPTIONS": "--use-system-ca", "NODE_TLS_REJECT_UNAUTHORIZED": "1"}, True),
+    ({"NODE_USE_SYSTEM_CA": "1"}, False),
+    ({"NODE_OPTIONS": "--no-warnings"}, False),
+    ({"NODE_OPTIONS": "--example=--use-system-ca"}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "NODE_TLS_REJECT_UNAUTHORIZED": "0"}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "HTTPS_PROXY": "http://127.0.0.1:9"}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "SSL_CERT_FILE": ""}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "SSL_CERT_FILE": "/tmp/old-ca.pem"}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "REQUESTS_CA_BUNDLE": ""}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "REQUESTS_CA_BUNDLE": "/tmp/old-ca.pem"}, False),
+    ({"NODE_OPTIONS": '"'}, False),
+])
+def test_native_environment_requires_system_ca_without_disabling_tls(
+    monkeypatch, environment, passes,
+) -> None:
+    environment = {
+        "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
+        "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
+        **environment,
+    }
+    def run_environment_script(_config, arguments, *, timeout, name):
+        assert arguments[:2] == ["python3", "-c"]
+        assert name == "native-network-environment"
+        result = subprocess.run(
+            [sys.executable, "-c", arguments[2]], env=environment,
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode:
+            raise DeploymentError(result.stderr)
+
+    monkeypatch.setattr(verification, "_expect_command_success", run_environment_script)
+    if passes:
+        assert verification._run_environment_neutral(SimpleNamespace()) == {
+            "name": "native-network-environment", "ok": True,
+        }
+    else:
+        with pytest.raises(DeploymentError):
+            verification._run_environment_neutral(SimpleNamespace())
 
 
 def test_live_audit_accepts_the_supervised_service_relay() -> None:

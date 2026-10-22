@@ -1,14 +1,17 @@
 import json
 import os
 import subprocess
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from controlled_dev_machine import runtime
 from controlled_dev_machine.config import (
+    ControlledMount,
     HostProfile,
+    HostSshConfig,
     ProjectMount,
     ServicePorts,
     UpstreamConfig,
@@ -23,33 +26,38 @@ from controlled_dev_machine.runtime import (
     _bpftrace_cgroup_id,
     _check_upstream,
     _configure_host_parent_guard,
+    _configure_host_ssh_guard,
     _configure_infrastructure_network,
     _configure_target_network,
+    _controlled_mount_source,
     _dns_policy_args,
     _enable_target_route,
     _gateway_build_digest,
     _host_parent_guard_runner_script,
     _host_parent_table,
     _host_password_hash,
+    _initialize_user_profile,
     _legacy_compose_path_for_stop,
     _lifecycle_lock,
     _pin_built_images,
     _prepare_directories,
     _profile_bundle,
+    _profile_host_location,
     _require_deployable_policy,
     _require_gateway_image,
     _require_instance_stopped,
     _require_pinned_image_id,
     _require_policy_files,
-    _require_profile_sources,
     _require_target_image,
     _service_relay_command,
     _stopped_host_parent_guard_script,
+    _stopped_host_ssh_guard_script,
     _target_build_digest,
     _wait_audit_probe_ready,
     _wait_target_ebpf_ready,
     audit_status,
     compose_build,
+    compose_shell,
     compose_start_closed,
     render_closed_compose,
 )
@@ -60,6 +68,62 @@ def _use_test_lifecycle_lock(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", tmp_path / "locks"
     )
+
+
+def test_unchanged_enabled_systemd_unit_does_not_reload(tmp_path: Path, monkeypatch):
+    unit = tmp_path / "guard.service"
+    unit.write_text("[Service]\nType=oneshot\n")
+    enabled = tmp_path / "multi-user.target.wants"
+    enabled.mkdir()
+    (enabled / unit.name).symlink_to(unit)
+    commands = []
+    monkeypatch.setattr(runtime, "_run", lambda args: commands.append(args))
+    runtime._install_systemd_unit(unit, unit.read_text(), systemctl="systemctl")
+    assert commands == []
+
+
+@pytest.mark.parametrize("existing", [None, "old unit\n"])
+def test_changed_systemd_unit_is_reloaded(tmp_path: Path, monkeypatch, existing):
+    unit = tmp_path / "guard.service"
+    if existing is not None:
+        unit.write_text(existing)
+    commands = []
+    monkeypatch.setattr(runtime, "_run", lambda args: commands.append(args))
+    runtime._install_systemd_unit(unit, "new unit\n", systemctl="systemctl")
+    assert unit.read_text() == "new unit\n"
+    assert commands == [["systemctl", "daemon-reload"],
+                        ["systemctl", "enable", "--no-reload", "guard.service"]]
+
+
+def test_unchanged_disabled_systemd_unit_is_enabled_without_reload(tmp_path: Path, monkeypatch):
+    unit = tmp_path / "guard.service"
+    unit.write_text("unit\n")
+    commands = []
+    monkeypatch.setattr(runtime, "_run", lambda args: commands.append(args))
+    runtime._install_systemd_unit(unit, "unit\n", systemctl="systemctl")
+    assert commands == [["systemctl", "enable", "--no-reload", "guard.service"]]
+
+
+@pytest.mark.parametrize("existing", [None, "old unit\n"])
+def test_failed_systemd_reload_is_retried(tmp_path: Path, monkeypatch, existing):
+    unit = tmp_path / "guard.service"
+    if existing is not None:
+        unit.write_text(existing)
+    commands = []
+
+    def reload_fails(args):
+        commands.append(args)
+        raise DeploymentError("reload failed")
+
+    monkeypatch.setattr(runtime, "_run", reload_fails)
+    for _ in range(2):
+        with pytest.raises(DeploymentError, match="reload failed"):
+            runtime._install_systemd_unit(unit, "new unit\n", systemctl="systemctl")
+        if existing is None:
+            assert not unit.exists()
+        else:
+            assert unit.read_text() == existing
+    assert commands == [["systemctl", "daemon-reload"], ["systemctl", "daemon-reload"]]
 
 
 def _host_config(tmp_path: Path):
@@ -164,9 +228,11 @@ def test_target_has_no_publication_or_audit_mount(tmp_path: Path) -> None:
     assert target["build"]["args"]["TARGET_BUILD_DIGEST"] == "c" * 64
     assert "CDM_TARGET_UID" not in target["environment"]
     assert "CDM_TARGET_GID" not in target["environment"]
-    assert target["environment"]["NODE_USE_SYSTEM_CA"] == "1"
+    assert target["environment"]["NODE_OPTIONS"] == "--use-system-ca"
+    assert "NODE_USE_SYSTEM_CA" not in target["environment"]
     assert not any("PROXY" in name or "proxy" in name for name in target["environment"])
-    assert "SSL_CERT_FILE" not in target["environment"]
+    assert target["environment"]["SSL_CERT_FILE"] == "/etc/ssl/certs/ca-certificates.crt"
+    assert target["environment"]["REQUESTS_CA_BUNDLE"] == "/etc/ssl/certs/ca-certificates.crt"
     sources = {item["source"] for item in target["volumes"]}
     assert str(config.paths.audit) not in sources
     assert str(config.docker.socket) not in sources
@@ -213,6 +279,32 @@ def test_target_home_uses_fixed_persistent_host_bind(tmp_path: Path) -> None:
     )
 
 
+def test_target_hostname_uses_config_without_changing_image_inputs(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    changed = replace(config, target=replace(config.target, hostname="workstation-a24f"))
+    compose = render_closed_compose(changed, _manifest(changed, tmp_path))
+    assert compose["services"]["target"]["hostname"] == "workstation-a24f"
+    files, _ = _profile_bundle(changed, Path.cwd())
+    assert "Ubuntu container, workstation-a24f," in files[".bashrc"]
+    assert _target_build_digest(changed, Path.cwd()) == _target_build_digest(config, Path.cwd())
+
+
+def test_target_mac_is_persistent_per_network_and_not_an_image_input(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    original = render_closed_compose(config, manifest)["services"]["target"]
+    assert "mac_address" not in original["networks"]["target_net"]
+    changed = replace(config, target=replace(config.target, mac_address="02:7b:3c:4d:5e:6f"))
+    for _ in range(2):
+        target = render_closed_compose(changed, manifest)["services"]["target"]
+        assert target["networks"]["target_net"] == {
+            "ipv4_address": manifest.target_address,
+            "mac_address": "02:7b:3c:4d:5e:6f",
+        }
+        assert "mac_address" not in target
+    assert _target_build_digest(changed, Path.cwd()) == _target_build_digest(config, Path.cwd())
+
+
 def test_shared_host_home_and_declared_service_ports_are_rendered(tmp_path: Path) -> None:
     config = replace(
         _host_config(tmp_path),
@@ -245,6 +337,105 @@ def test_shared_host_home_and_declared_service_ports_are_rendered(tmp_path: Path
         "--gid",
         "65534",
     ]
+
+
+def test_controlled_mounts_override_shared_home_and_preserve_data_propagation(
+    tmp_path: Path,
+) -> None:
+    base_config = _host_config(tmp_path)
+    config = replace(
+        base_config,
+        workspace=WorkspaceConfig(
+            share_host_home=True,
+            controlled_mounts=(
+                ControlledMount(Path(".claude"), read_only=False),
+                ControlledMount(Path(".codex"), read_only=False),
+            ),
+        ),
+        mounts=(
+            ProjectMount(
+                host_path=tmp_path / "data",
+                container_path=Path("/data"),
+                read_only=False,
+                propagation="rslave",
+            ),
+            ProjectMount(
+                host_path=base_config.target.home / ".claude" / "skills",
+                container_path=base_config.target.home / ".claude" / "skills",
+                read_only=False,
+            ),
+        ),
+        paths=replace(
+            base_config.paths,
+            persistent_home=tmp_path / "managed-home",
+            state=tmp_path / "state",
+            audit=tmp_path / "audit",
+        ),
+    )
+    (config.target.home / ".claude").mkdir()
+    (config.target.home / ".claude" / "skills").mkdir()
+    (config.target.home / ".codex").mkdir()
+    manifest = _manifest(config, tmp_path)
+    volumes = render_closed_compose(config, manifest)["services"]["target"]["volumes"]
+
+    home_index = next(
+        index for index, item in enumerate(volumes) if item["target"] == str(config.target.home)
+    )
+    claude_index = next(
+        index
+        for index, item in enumerate(volumes)
+        if item["target"] == str(config.target.home / ".claude")
+    )
+    codex_index = next(
+        index
+        for index, item in enumerate(volumes)
+        if item["target"] == str(config.target.home / ".codex")
+    )
+    data = next(item for item in volumes if item["target"] == "/data")
+    skills_index = next(
+        index
+        for index, item in enumerate(volumes)
+        if item["target"] == str(config.target.home / ".claude" / "skills")
+    )
+
+    assert home_index < claude_index < codex_index < skills_index
+    assert volumes[claude_index]["source"] == str(
+        _controlled_mount_source(config, config.workspace.controlled_mounts[0])
+    )
+    assert volumes[codex_index]["source"] == str(
+        _controlled_mount_source(config, config.workspace.controlled_mounts[1])
+    )
+    assert data["bind"]["propagation"] == "rslave"
+
+
+def test_controlled_mount_seed_copies_host_tree_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _host_config(tmp_path)
+    (config.target.home / ".claude").mkdir()
+    (config.target.home / ".claude" / "settings.json").write_text(
+        "{\"fixture\": true}\n", encoding="utf-8"
+    )
+    config = replace(
+        config,
+        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+        paths=replace(
+            config.paths,
+            persistent_home=tmp_path / "managed-home",
+            state=tmp_path / "state",
+            audit=tmp_path / "audit",
+        ),
+        workspace=WorkspaceConfig(
+            share_host_home=True,
+            controlled_mounts=(ControlledMount(Path(".claude"), read_only=False),),
+        ),
+    )
+    monkeypatch.setattr("controlled_dev_machine.runtime.os.chown", lambda *_args: None)
+
+    _prepare_directories(config)
+
+    seeded = _controlled_mount_source(config, config.workspace.controlled_mounts[0])
+    assert (seeded / "settings.json").read_text(encoding="utf-8") == "{\"fixture\": true}\n"
 
 
 def test_host_password_hash_selects_only_target_user(tmp_path: Path) -> None:
@@ -409,15 +600,95 @@ def test_gateway_is_lazy_and_records_plaintext(tmp_path: Path) -> None:
     assert gateway["healthcheck"]["start_period"] == "20s"
 
 
-def test_claude_runtime_instructions_are_read_only(tmp_path: Path) -> None:
+def test_user_profile_has_no_automatic_single_file_binds(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
-    compose = render_closed_compose(config, _manifest(config, tmp_path))
-    target = compose["services"]["target"]
-    instruction = next(
-        item for item in target["volumes"] if item["target"].endswith("/.claude/CLAUDE.md")
+    config = replace(
+        config,
+        profile=replace(
+            config.profile,
+            gitconfig=config.target.home / ".gitconfig",
+            tmux_config=config.target.home / ".tmux.conf",
+        ),
     )
-    assert instruction["source"].endswith("/generated/current/profile/CLAUDE.md")
-    assert instruction["read_only"] is True
+    compose = render_closed_compose(config, _manifest(config, tmp_path))
+    volumes = compose["services"]["target"]["volumes"]
+    user_files = {
+        config.target.home / name
+        for name in (".claude/CLAUDE.md", ".bashrc", ".profile", ".gitconfig", ".tmux.conf")
+    }
+    assert not any(Path(item["target"]) in user_files for item in volumes)
+    assert not any("generated/current/profile" in item["source"] for item in volumes)
+
+
+def test_python_trust_uses_system_bundle_without_binding_over_package_files(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    conda = config.target.home / "conda"
+    package_files = [
+        base / name
+        for base in (conda, conda / "envs/dev")
+        for name in ("ssl/cacert.pem", "lib/python3.10/site-packages/certifi/cacert.pem")
+    ]
+    for path in package_files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original package data\n")
+    config = replace(config, profile=replace(
+        config.profile, conda_root=conda, default_conda_env="dev",
+    ))
+    target = render_closed_compose(config, _manifest(config, tmp_path))["services"]["target"]
+    targets = {Path(item["target"]) for item in target["volumes"]}
+    assert not targets.intersection(package_files)
+    assert not any(
+        path.is_relative_to(config.target.home) and path.name == "cacert.pem"
+        for path in targets
+    )
+    system = next(
+        item for item in target["volumes"]
+        if item["target"] == "/etc/ssl/certs/ca-certificates.crt"
+    )
+    assert system["read_only"] is True
+    assert system["source"] == str(config.paths.state / "target-trust/ca-certificates.crt")
+    assert target["environment"]["SSL_CERT_FILE"] == system["target"]
+    assert target["environment"]["REQUESTS_CA_BUNDLE"] == system["target"]
+    for path in package_files:
+        assert path.read_text() == "original package data\n"
+        replacement = path.with_name("atomic-package-save.tmp")
+        replacement.write_text("updated package data\n")
+        replacement.replace(path)
+        assert path.read_text() == "updated package data\n"
+
+
+def test_explicit_user_mount_is_not_duplicated_by_profile_generation(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    host_prompt = config.target.home / "claude_code_config" / "CLAUDE.md"
+    config = replace(
+        config,
+        mounts=(
+            ProjectMount(
+                host_path=host_prompt,
+                container_path=config.target.home / ".claude" / "CLAUDE.md",
+                read_only=False,
+            ),
+        ),
+    )
+
+    target = render_closed_compose(config, _manifest(config, tmp_path))["services"][
+        "target"
+    ]
+    instructions = [
+        item
+        for item in target["volumes"]
+        if item["target"] == str(config.target.home / ".claude" / "CLAUDE.md")
+    ]
+
+    assert instructions == [
+        {
+            "type": "bind",
+            "source": str(host_prompt),
+            "target": str(config.target.home / ".claude" / "CLAUDE.md"),
+            "read_only": False,
+            "bind": {"create_host_path": False},
+        }
+    ]
 
 
 def test_host_profile_is_merged_without_overriding_sandbox_network(
@@ -463,7 +734,8 @@ def test_host_profile_is_merged_without_overriding_sandbox_network(
     assert "conda activate \"$CDM_DEFAULT_CONDA_ENV\"" in files[".bashrc"]
     assert "$CDM_CONDA_ROOT/etc/profile.d/conda.sh" in files[".bashrc"]
     assert "$HOME/miniconda3" not in files[".bashrc"]
-    assert "unset REQUESTS_CA_BUNDLE SSL_CERT_FILE" in files[".profile"]
+    for name in (".bashrc", ".profile"):
+        assert "unset REQUESTS_CA_BUNDLE SSL_CERT_FILE" not in files[name]
     assert "Controlled development workstation" in files[".bashrc"]
     assert "System identity: Ubuntu container, devbox, Etc/UTC, en_US.UTF-8" in files[".bashrc"]
     assert "CDM_SHELL_NOTICE_SHOWN" not in files[".bashrc"]
@@ -478,8 +750,415 @@ def test_host_profile_is_merged_without_overriding_sandbox_network(
         config.target.home / "conda"
     )
     profile_targets = {item["target"] for item in target["volumes"]}
-    assert str(config.target.home / ".bashrc") in profile_targets
-    assert str(config.target.home / ".profile") in profile_targets
+    assert str(config.target.home / ".bashrc") not in profile_targets
+    assert str(config.target.home / ".profile") not in profile_targets
+
+
+def _claude_prompt_profile(tmp_path: Path):
+    config = _host_config(tmp_path)
+    source = config.target.home / "claude_code_config" / "CLAUDE.md"
+    source.parent.mkdir()
+    template_root = tmp_path / "template"
+    managed = template_root / "config" / "claude" / "CLAUDE.md"
+    managed.parent.mkdir(parents=True)
+    suffix = "# Managed sandbox instructions\n\nUse Codex for independent review.\n"
+    managed.write_text(suffix, encoding="utf-8")
+    config = replace(
+        config,
+        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+        profile=replace(config.profile, claude_instructions=source),
+    )
+    return config, source, template_root, suffix
+
+
+def test_long_original_claude_prompt_precedes_managed_suffix_without_truncation(
+    tmp_path: Path,
+) -> None:
+    config, source, template_root, suffix = _claude_prompt_profile(tmp_path)
+    original = "# 原提示\n\n" + "保留原始推理与工程约束。\n" * 2400 + "原提示末尾标记\n"
+    assert len(original.encode("utf-8")) > 58000
+    source.write_text(original, encoding="utf-8")
+
+    files, _ = _profile_bundle(config, template_root)
+
+    assert files["CLAUDE.md"] == original.rstrip() + "\n\n" + suffix.rstrip() + "\n"
+    assert source.read_text(encoding="utf-8") == original
+
+
+def test_claude_prompt_rereads_original_source_without_creating_a_second_baseline(
+    tmp_path: Path,
+) -> None:
+    config, source, template_root, suffix = _claude_prompt_profile(tmp_path)
+    source.write_text("# Original prompt\n", encoding="utf-8")
+    existing_paths = set(tmp_path.rglob("*"))
+    first, first_digest = _profile_bundle(config, template_root)
+    revised = "# Revised original prompt\n\nKeep the new requirement.\n"
+    source.write_text(revised, encoding="utf-8")
+
+    second, second_digest = _profile_bundle(config, template_root)
+
+    assert second["CLAUDE.md"] == revised.rstrip() + "\n\n" + suffix.rstrip() + "\n"
+    assert second["CLAUDE.md"] != first["CLAUDE.md"]
+    assert second_digest != first_digest
+    assert config.profile.claude_instructions == source
+    assert source.read_text(encoding="utf-8") == revised
+    assert set(tmp_path.rglob("*")) == existing_paths
+
+
+def _shared_profile(tmp_path: Path):
+    config, source, template_root, suffix = _claude_prompt_profile(tmp_path)
+    source.write_text("# Shared instructions\n", encoding="utf-8")
+    config = replace(
+        config,
+        paths=replace(config.paths, persistent_home=tmp_path / "private-home"),
+        workspace=WorkspaceConfig(
+            share_host_home=True,
+            controlled_mounts=(ControlledMount(Path(".claude"), read_only=False, seed="never"),),
+        ),
+    )
+    private = _controlled_mount_source(config, config.workspace.controlled_mounts[0])
+    private.mkdir(parents=True)
+    return config, source, template_root, suffix, private
+
+
+def test_shared_profile_seeds_regular_import_and_separate_private_rules(tmp_path: Path) -> None:
+    config, source, template_root, suffix, private = _shared_profile(tmp_path)
+    files, _ = _profile_bundle(config, template_root)
+    _initialize_user_profile(config, files)
+
+    loader = private / "CLAUDE.md"
+    rules = private / "rules/controlled-environment.md"
+    assert loader.is_file() and not loader.is_symlink()
+    assert loader.read_text().splitlines()[0] == f"@{source}"
+    assert "append local instructions here" in loader.read_text()
+    assert "# Shared instructions" not in loader.read_text()
+    assert rules.read_text() == suffix
+    assert rules.is_file() and not rules.is_symlink()
+    assert loader.stat().st_uid == config.target.uid
+    assert rules.stat().st_uid == config.target.uid
+    assert loader.stat().st_mode & 0o200
+    assert rules.stat().st_mode & 0o200
+    assert rules.parent.stat().st_uid == config.target.uid
+    assert not (config.target.home / ".claude/CLAUDE.md").exists()
+
+
+def test_nonshared_profile_seeds_full_prompt_in_persistent_home(tmp_path: Path) -> None:
+    config, source, template_root, suffix = _claude_prompt_profile(tmp_path)
+    source.write_text("# Original instructions\n", encoding="utf-8")
+    config.paths.persistent_home.mkdir(parents=True)
+    files, _ = _profile_bundle(config, template_root)
+    _initialize_user_profile(config, files)
+    prompt = config.paths.persistent_home / ".claude/CLAUDE.md"
+    assert prompt.read_text() == "# Original instructions\n\n" + suffix
+    assert not prompt.is_symlink()
+    assert not (config.paths.persistent_home / ".claude/rules/controlled-environment.md").exists()
+
+
+def test_seed_resolves_longest_visible_mount_parent(tmp_path: Path) -> None:
+    config, _, template_root, suffix, private = _shared_profile(tmp_path)
+    shared_rules = config.target.home / "shared-rules"
+    shared_rules.mkdir()
+    config = replace(
+        config,
+        mounts=(*config.mounts, ProjectMount(
+            host_path=shared_rules,
+            container_path=config.target.home / ".claude/rules",
+            read_only=False,
+        )),
+    )
+    expected = runtime._ProfileLocation(private, Path("CLAUDE.md"), False)
+    assert _profile_host_location(config, config.target.home / ".claude/CLAUDE.md") == expected
+    assert _profile_host_location(
+        config, config.target.home / ".claude/rules/controlled-environment.md",
+    ) == runtime._ProfileLocation(shared_rules, Path("controlled-environment.md"), False)
+    files, _ = _profile_bundle(config, template_root)
+    _initialize_user_profile(config, files)
+    assert (shared_rules / "controlled-environment.md").read_text() == suffix
+    assert not (private / "rules").exists()
+
+
+def test_shared_import_rejects_source_hidden_by_private_mount(tmp_path: Path) -> None:
+    config, _, template_root, _, _ = _shared_profile(tmp_path)
+    hidden = config.target.home / ".claude/CLAUDE.md"
+    hidden.parent.mkdir()
+    hidden.write_text("# Host-only prompt\n")
+    config = replace(config, profile=replace(config.profile, claude_instructions=hidden))
+    with pytest.raises(DeploymentError, match="未被私有挂载覆盖"):
+        _profile_bundle(config, template_root)
+
+
+def test_profile_reinitialization_preserves_atomic_user_edits_and_private_auth(
+    tmp_path: Path,
+) -> None:
+    config, source, template_root, _, private = _shared_profile(tmp_path)
+    host_claude = config.target.home / ".claude"
+    host_claude.mkdir()
+    (host_claude / "credentials.json").write_text("host-only fixture")
+    account = private / "credentials.json"
+    account.write_text("private account fixture")
+    history = private / "history.jsonl"
+    history.write_text("private history fixture")
+    files, old_digest = _profile_bundle(config, template_root)
+    _initialize_user_profile(config, files)
+    loader = private / "CLAUDE.md"
+    temporary = private / "editor-save.tmp"
+    temporary.write_text("# User-edited local instructions\n")
+    temporary.replace(loader)
+    rules = private / "rules/controlled-environment.md"
+    rules.write_text("# User-edited environment instructions\n")
+    bashrc = config.target.home / ".bashrc"
+    bashrc.write_text("export EDITOR=vim\n")
+    source.write_text("# New shared instructions\n")
+
+    updated, new_digest = _profile_bundle(config, template_root)
+    _initialize_user_profile(config, updated)
+    _initialize_user_profile(config, updated)
+
+    assert new_digest != old_digest
+    assert loader.read_text() == "# User-edited local instructions\n"
+    assert rules.read_text() == "# User-edited environment instructions\n"
+    assert bashrc.read_text() == "export EDITOR=vim\n"
+    assert account.read_text() == "private account fixture"
+    assert history.read_text() == "private history fixture"
+    assert (host_claude / "credentials.json").read_text() == "host-only fixture"
+
+
+def test_existing_empty_user_files_and_broken_links_are_not_reowned_or_replaced(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config, _, template_root, _, _ = _shared_profile(tmp_path)
+    files, _ = _profile_bundle(config, template_root)
+    targets = {
+        "CLAUDE.md": config.target.home / ".claude/CLAUDE.md",
+        "controlled-environment.md": config.target.home / ".claude/rules/controlled-environment.md",
+    }
+    for name in files:
+        target = targets.get(name, config.target.home / name)
+        location = _profile_host_location(config, target)
+        path = location.root / location.relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+        path.chmod(0o600)
+    profile = config.target.home / ".profile"
+    profile.unlink()
+    profile.symlink_to(config.target.home / "missing-user-profile")
+
+    def must_not_reown(*args):
+        pytest.fail("existing user files and parents must not be reowned")
+
+    monkeypatch.setattr(runtime.os, "fchown", must_not_reown)
+    monkeypatch.setattr(runtime.os, "chown", must_not_reown)
+    _initialize_user_profile(config, files)
+    assert profile.is_symlink()
+    assert (config.target.home / ".bashrc").read_text() == ""
+    location = _profile_host_location(config, config.target.home / ".claude/CLAUDE.md")
+    assert (location.root / location.relative).read_text() == ""
+    assert (location.root / location.relative).stat().st_mode & 0o777 == 0o600
+
+
+def test_seed_does_not_follow_user_parent_symlink(tmp_path: Path) -> None:
+    config, _, template_root, _, private = _shared_profile(tmp_path)
+    outside = tmp_path / "outside-user-view"
+    outside.mkdir()
+    (private / "rules").symlink_to(outside)
+    files, _ = _profile_bundle(config, template_root)
+    with pytest.raises(DeploymentError, match="无法初始化用户 profile"):
+        _initialize_user_profile(config, files)
+    assert not (outside / "controlled-environment.md").exists()
+
+
+def test_seed_rejects_symlink_ancestor_of_its_data_root(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    (outside / "existing/leaf").mkdir(parents=True)
+    alias = tmp_path / "root-alias"
+    alias.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(DeploymentError, match="无法初始化用户 profile"):
+        runtime._seed_profile_file(
+            alias / "existing/leaf", Path("CLAUDE.md"), "must not escape\n",
+            os.getuid(), os.getgid(),
+        )
+    assert list((outside / "existing/leaf").iterdir()) == []
+
+
+def test_seed_temporary_collision_never_deletes_existing_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(runtime.uuid, "uuid4", lambda: SimpleNamespace(hex="collision"))
+    existing = tmp_path / ".cdm-seed-collision"
+    existing.write_text("user-owned existing file")
+    with pytest.raises(DeploymentError, match="无法初始化用户 profile"):
+        runtime._seed_profile_file(
+            tmp_path, Path("test.md"), "must not publish", os.geteuid(), os.getegid(),
+        )
+    assert existing.read_text() == "user-owned existing file"
+    assert not (tmp_path / "test.md").exists()
+
+
+@pytest.mark.parametrize("kind", ["controlled", "project"])
+def test_readonly_profile_mapping_is_never_seeded(tmp_path: Path, kind) -> None:
+    config, _, _, _, private = _shared_profile(tmp_path)
+    if kind == "controlled":
+        config = replace(config, workspace=replace(
+            config.workspace,
+            controlled_mounts=(ControlledMount(Path(".claude"), read_only=True, seed="never"),),
+        ))
+        protected = private / "rules"
+    else:
+        protected = config.target.home / "readonly-rules"
+        protected.mkdir()
+        config = replace(config, mounts=(*config.mounts, ProjectMount(
+            host_path=protected,
+            container_path=config.target.home / ".claude/rules",
+            read_only=True,
+        )))
+    location = _profile_host_location(
+        config, config.target.home / ".claude/rules/controlled-environment.md",
+    )
+    assert location.read_only
+    _initialize_user_profile(config, {"controlled-environment.md": "do not seed\n"})
+    assert not (protected / "controlled-environment.md").exists()
+    assert not (private / "rules/controlled-environment.md").exists()
+    if kind == "controlled":
+        assert not protected.exists()
+
+
+def test_directory_replaced_between_mkdir_and_open_is_not_reowned(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    existing = tmp_path / "existing-directory"
+    existing.mkdir()
+    other_group = next((gid for gid in os.getgroups() if gid != os.getgid()), os.getgid())
+    os.chown(existing, -1, other_group)
+    metadata = existing.stat()
+    original_mkdir = os.mkdir
+    replaced = []
+
+    def replace_after_creation(path, *args, **kwargs):
+        original_mkdir(path, *args, **kwargs)
+        if path == "rules":
+            os.rmdir(path, dir_fd=kwargs["dir_fd"])
+            os.rename(existing, path, dst_dir_fd=kwargs["dir_fd"])
+            replaced.append(path)
+
+    def must_not_chown(*args, **kwargs):
+        pytest.fail("a raced-in existing directory must never be chowned")
+
+    monkeypatch.setattr(runtime.os, "mkdir", replace_after_creation)
+    monkeypatch.setattr(runtime.os, "chown", must_not_chown)
+    monkeypatch.setattr(runtime.os, "fchown", must_not_chown)
+    runtime._seed_profile_file(
+        root, Path("rules/test.md"), "seed\n", os.geteuid(), os.getegid(),
+    )
+    assert replaced == ["rules"]
+    preserved = (root / "rules").stat()
+    assert (preserved.st_ino, preserved.st_uid, preserved.st_gid) == (
+        metadata.st_ino, metadata.st_uid, metadata.st_gid,
+    )
+    assert (root / "rules/test.md").read_text() == "seed\n"
+
+
+def _simulate_profile_root_identity(monkeypatch):
+    state = {"uid": 0, "gid": 41, "groups": [41, 42]}
+    monkeypatch.setattr(runtime.os, "geteuid", lambda: state["uid"])
+    monkeypatch.setattr(runtime.os, "getegid", lambda: state["gid"])
+    monkeypatch.setattr(runtime.os, "getgroups", lambda: list(state["groups"]))
+    monkeypatch.setattr(runtime.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name="target"))
+    monkeypatch.setattr(runtime.os, "getgrouplist", lambda name, gid: [gid, 51])
+    monkeypatch.setattr(runtime.os, "seteuid", lambda uid: state.update(uid=uid))
+    monkeypatch.setattr(runtime.os, "setegid", lambda gid: state.update(gid=gid))
+    monkeypatch.setattr(runtime.os, "setgroups", lambda groups: state.update(groups=list(groups)))
+    return state
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_profile_identity_is_restored_after_success_or_write_failure(monkeypatch, fail) -> None:
+    state = _simulate_profile_root_identity(monkeypatch)
+    try:
+        with runtime._profile_user_identity(1234, 50):
+            assert state == {"uid": 1234, "gid": 50, "groups": [50, 51]}
+            if fail:
+                raise OSError("simulated write failure")
+    except OSError:
+        assert fail
+    assert state == {"uid": 0, "gid": 41, "groups": [41, 42]}
+
+
+@pytest.mark.parametrize("setter", ["setgroups", "setegid", "seteuid"])
+def test_identity_switch_failure_cannot_create_seed_and_restores_identity(
+    tmp_path: Path, monkeypatch, setter,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    state = _simulate_profile_root_identity(monkeypatch)
+    original = getattr(runtime.os, setter)
+    target = {"setgroups": [50, 51], "setegid": 50, "seteuid": 1234}[setter]
+
+    def denied(value):
+        if value == target:
+            raise PermissionError("simulated identity denial")
+        original(value)
+
+    monkeypatch.setattr(runtime.os, setter, denied)
+    with pytest.raises(DeploymentError, match="无法初始化用户 profile"):
+        runtime._seed_profile_file(root, Path("test.md"), "must not publish", 1234, 50)
+    assert list(root.iterdir()) == []
+    assert state == {"uid": 0, "gid": 41, "groups": [41, 42]}
+
+
+def test_unprivileged_cross_uid_seed_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(runtime.os, "geteuid", lambda: 1234)
+    monkeypatch.setattr(runtime.os, "getegid", lambda: 50)
+    with pytest.raises(DeploymentError, match="无权切换"):
+        runtime._seed_profile_file(tmp_path, Path("test.md"), "must not publish", 1235, 50)
+    assert not (tmp_path / "test.md").exists()
+
+
+@pytest.mark.parametrize("relative", [Path("../escape"), Path("/tmp/escape"), Path(".")])
+def test_seed_rejects_paths_outside_opened_data_root(tmp_path: Path, relative) -> None:
+    with pytest.raises(DeploymentError, match="必须位于数据根之下"):
+        runtime._seed_profile_file(
+            tmp_path, relative, "must not publish", os.geteuid(), os.getegid(),
+        )
+
+
+def test_group_writable_atomic_source_edit_is_a_valid_initialization_seed(tmp_path: Path) -> None:
+    config, source, template_root, _ = _claude_prompt_profile(tmp_path)
+    source.write_text("# Original\n")
+    source.chmod(0o664)
+    _profile_bundle(config, template_root)
+    replacement = source.with_name("editor-save.tmp")
+    replacement.write_text("# Edited source\n")
+    replacement.chmod(0o664)
+    replacement.replace(source)
+    files, _ = _profile_bundle(config, template_root)
+    assert "# Edited source" in files["CLAUDE.md"]
+
+
+def test_root_seed_snapshot_is_still_verified_independently_of_user_edits(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    files = {"CLAUDE.md": "# Immutable seed snapshot\n"}
+    manifest = replace(
+        manifest,
+        profile_digest=runtime._profile_digest(files),
+        policy_snapshot_path=str(
+            config.paths.state / "policies" / f"{manifest.policy_digest}.yaml"
+        ),
+    )
+    generation = config.paths.state / "generated/current"
+    snapshot = generation / "profile"
+    snapshot.mkdir(parents=True)
+    (snapshot / "CLAUDE.md").write_text(files["CLAUDE.md"])
+    (generation / "runtime.json").write_text(json.dumps(asdict(manifest)))
+    monkeypatch.setattr(runtime, "_require_current_generation", lambda _: None)
+    assert runtime.load_runtime(config) == manifest
+    (config.target.home / ".bashrc").write_text("# User may edit this\n")
+    assert runtime.load_runtime(config) == manifest
+    (snapshot / "CLAUDE.md").write_text("# Corrupted root snapshot\n")
+    with pytest.raises(DeploymentError, match="运行 profile 与运行清单摘要不一致"):
+        runtime.load_runtime(config)
 
 
 def test_profile_skips_missing_optional_shell_initializers(tmp_path: Path) -> None:
@@ -517,7 +1196,7 @@ conda activate pthgnn
     assert digest_with_initializer != digest_without_initializer
 
 
-def test_start_rejects_profile_source_changed_after_init(tmp_path: Path) -> None:
+def test_start_does_not_recheck_edited_profile_sources(tmp_path: Path, monkeypatch) -> None:
     config = _host_config(tmp_path)
     config = replace(
         config,
@@ -535,10 +1214,28 @@ def test_start_rejects_profile_source_changed_after_init(tmp_path: Path) -> None
         profile_source_digest=source_digest,
     )
 
-    _require_profile_sources(config, manifest)
     host_bashrc.write_text("export EDITOR=nvim\n", encoding="utf-8")
-    with pytest.raises(DeploymentError, match="宿主 profile 已变化"):
-        _require_profile_sources(config, manifest)
+    monkeypatch.setattr(runtime, "load_runtime", lambda _: manifest)
+    monkeypatch.setattr(runtime, "_require_root", lambda: None)
+    monkeypatch.setattr(runtime, "_require_policy_files", lambda _: None)
+    monkeypatch.setattr(runtime, "_require_target_image", lambda *_: None)
+    monkeypatch.setattr(runtime, "_require_gateway_image", lambda *_: None)
+    monkeypatch.setattr(runtime, "_check_gpu_cdi", lambda _: None)
+    monkeypatch.setattr(runtime, "_service_container_id", lambda *_: None)
+
+    def no_profile_reread(*args):
+        pytest.fail("start must not reread mutable profile sources")
+
+    class ReachedHostSetup(Exception):
+        pass
+
+    def reached_host_setup(*args):
+        raise ReachedHostSetup
+
+    monkeypatch.setattr(runtime, "_profile_bundle", no_profile_reread)
+    monkeypatch.setattr(runtime, "_install_host_parent_guard", reached_host_setup)
+    with pytest.raises(ReachedHostSetup):
+        compose_start_closed(config)
 
 
 def test_profile_sources_must_be_owned_regular_files_inside_target_home(
@@ -765,10 +1462,6 @@ def test_repeated_start_exits_before_changing_host_state(
     )
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._require_target_image",
-        lambda _config, _manifest: None,
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._require_profile_sources",
         lambda _config, _manifest: None,
     )
     monkeypatch.setattr("controlled_dev_machine.runtime._check_gpu_cdi", lambda _config: None)
@@ -1023,6 +1716,65 @@ def test_transparent_firewalls_allow_only_the_controlled_paths(
     assert any(command[-3:] == ["default", "via", "172.28.0.2"] for command in commands)
 
 
+def test_host_ssh_is_narrowly_allowed_and_target_network_gets_host_gateway(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = replace(
+        _host_config(tmp_path),
+        host_ssh=HostSshConfig(enabled=True, port=10090),
+    )
+    manifest = _manifest(config, tmp_path)
+    scripts: dict[int, str] = {}
+    host_scripts: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._service_pid",
+        lambda *_args: 103,
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._apply_nft",
+        lambda pid, script: scripts.__setitem__(pid, script),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._verify_nft_table", lambda _pid: None
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._apply_host_nft",
+        lambda table, script: host_scripts.append((table, script)),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout=""),
+    )
+
+    _configure_target_network(config, manifest)
+    _configure_host_ssh_guard(config, manifest)
+
+    assert "ip daddr 172.28.0.1 tcp dport 10090 accept" in scripts[103]
+    assert "tcp dport 22 accept" not in scripts[103]
+    assert len(host_scripts) == 1
+    assert "ip saddr 172.28.0.3 ip daddr 172.28.0.1 tcp dport 10090 accept" in host_scripts[0][1]
+    assert "ip daddr 172.28.0.1 tcp dport 10090 drop" in host_scripts[0][1]
+    stopped = _stopped_host_ssh_guard_script(config, manifest)
+    assert "172.28.0.3" not in stopped.split("tcp dport", 1)[0]
+
+
+def test_host_access_network_mode_is_nat_only_when_enabled(tmp_path: Path) -> None:
+    disabled_config = _host_config(tmp_path)
+    disabled = render_closed_compose(disabled_config, _manifest(disabled_config, tmp_path))
+    enabled_config = replace(
+        disabled_config, host_ssh=HostSshConfig(enabled=True, port=10090)
+    )
+    enabled = render_closed_compose(enabled_config, _manifest(enabled_config, tmp_path))
+    disabled_mode = disabled["networks"]["target_net"]["driver_opts"][
+        "com.docker.network.bridge.gateway_mode_ipv4"
+    ]
+    enabled_mode = enabled["networks"]["target_net"]["driver_opts"][
+        "com.docker.network.bridge.gateway_mode_ipv4"
+    ]
+    assert disabled_mode == "isolated"
+    assert enabled_mode == "nat"
+
+
 def _gateway_source_tree(root: Path) -> None:
     files = {
         "images/target/Dockerfile": "FROM scratch\n",
@@ -1168,6 +1920,85 @@ def test_compose_build_disables_attestations_at_command_level(
 
     assert compose_calls == [
         ("build", "--provenance=false", "--sbom=false", "target", "gateway")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("root", "expected_user"),
+    [(False, "1000:1000"), (True, "0:0")],
+)
+def test_compose_shell_forwards_terminal_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root: bool,
+    expected_user: str,
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    compose_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    monkeypatch.setenv("TERM", "screen-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._compose",
+        lambda _config, _manifest, *args, **kwargs: (
+            compose_calls.append((args, kwargs))
+            or subprocess.CompletedProcess(args, 0)
+        ),
+    )
+
+    assert compose_shell(config, root=root) == 0
+    assert compose_calls == [
+        (
+            (
+                "exec",
+                "--env",
+                "TERM=screen-256color",
+                "--env",
+                "COLORTERM=truecolor",
+                "--user",
+                expected_user,
+                "target",
+                "bash",
+            ),
+            {"check": False},
+        )
+    ]
+
+
+@pytest.mark.parametrize("term", [None, "", "dumb", "unknown", "xterm"])
+def test_compose_shell_uses_builtin_256_color_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, term: str | None
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    compose_calls: list[tuple[str, ...]] = []
+    if term is None:
+        monkeypatch.delenv("TERM", raising=False)
+    else:
+        monkeypatch.setenv("TERM", term)
+    monkeypatch.delenv("COLORTERM", raising=False)
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._compose",
+        lambda _config, _manifest, *args, **_kwargs: (
+            compose_calls.append(args) or subprocess.CompletedProcess(args, 0)
+        ),
+    )
+
+    assert compose_shell(config, root=False) == 0
+    assert compose_calls == [
+        (
+            "exec",
+            "--env",
+            "TERM=xterm-256color",
+            "--user",
+            "1000:1000",
+            "target",
+            "bash",
+        )
     ]
 
 

@@ -58,7 +58,7 @@ cd "$HOME/claude-sandbox"
 bin/sandboxctl config init
 ```
 
-`config init` 从实际系统账号填写用户名、UID、GID 和 Home，拒绝覆盖已有文件。它会自动创建 `~/.codex`（不存在时）并以读写方式挂载整棵目录；Codex CLI 随目标镜像安装，首次登录后状态直接保存在宿主该目录。它还会在源文件安全且实际存在时接入常用 shell/Git/tmux/Claude 文本配置，并同路径挂载现有 Claude skills、agents、`~/.config/git`、`~/.ssh` 和 `~/.condarc`。Git、skills、agents 和 Conda 配置读写，以支持日常同步；只有 SSH 关键凭据保持只读。它不会挂载整棵宿主 `~/.claude`，Claude 的账号、会话和设备状态保留在沙箱持久 Home。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
+`config init` 从实际系统账号填写用户名、UID、GID 和 Home，拒绝覆盖已有文件。它会自动创建 `~/.codex`（不存在时）并以读写方式挂载整棵目录；Codex CLI 随目标镜像安装，首次登录后状态直接保存在宿主该目录。它还会在源文件安全且实际存在时接入常用 shell/Git/tmux/Claude 文本配置，并同路径挂载现有 Claude skills、agents、`~/.config/git`、`~/.ssh` 和 `~/.condarc`。这些日常配置目录读写，包括 SSH 配置、known_hosts 和用户凭据，保留用户原有属主与权限。它不会挂载整棵宿主 `~/.claude`，Claude 的账号、会话和设备状态保留在沙箱持久 Home。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
 
 默认通用挂载由仓库中的 `config init` 固定生成；只有源路径实际存在时才加入：
 
@@ -67,10 +67,12 @@ bin/sandboxctl config init
 | `~/.codex` | 同路径 | 读写 | Codex 配置、登录状态、会话和 skills |
 | `~/.claude/skills`、`~/.claude/agents`、`~/.agents/skills` | 同路径 | 读写 | Claude/Codex 可见的通用 skills 与 agents |
 | `~/.config/git` | 同路径 | 读写 | Git 凭据存储和配置数据库 |
-| `~/.ssh` | 同路径 | 只读 | 日常 SSH 配置和密钥 |
+| `~/.ssh` | 同路径 | 读写 | 日常 SSH 配置、known_hosts 和密钥 |
 | `~/.condarc` | 同路径 | 读写 | Conda 配置 |
 
-`.claude/CLAUDE.md`、`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 不直接覆盖容器文件，而是由 `init` 生成受控副本并挂入目标 Home；Claude 会话数据库和其他状态留在持久 Home。项目目录、Conda 根目录和其他大型数据目录属于主机特定配置，由操作者在 `host.yaml` 中追加。
+`profile` 中的 `.claude/CLAUDE.md`、`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 仅作为缺失文件的 `init` 种子，不覆盖已有内容，不以只读单文件挂载限制日常编辑。共享 Home 的普通配置直接共享；Claude 的主指令和设置仍位于独立可写目录，可引用共同的非认证规则。编辑器以临时文件加原子 rename 保存后，内容仍应在重建后保留；不得在恢复时重新覆盖用户修改。项目目录、Conda 根目录和其他大型数据目录属于主机特定配置，由操作者在 `host.yaml` 中追加。
+
+可编辑配置不等于可编辑控制面。CA、machine-id、解析器、审计及网络控制组件仍由控制器管理并保持只读；Claude 旧账号的已识别归档继续隔离，不因开放 SSH 或日常配置而重新暴露。共享 Home 已覆盖的普通目录无需重复挂载；Home 外的 SSH Include 依赖需按实际路径单独接入可写目录，而不是只挂一个不能原子替换的配置文件。
 
 然后编辑 `~/.config/controlled-dev-machine/host.yaml`：
 
@@ -81,6 +83,9 @@ bin/sandboxctl config init
 - 确认持久 Home、状态、审计目录和存储保留线；
 - 确认父代理端口与 `expected_exit_cidr`。
 - 专用账号需要透明复用整棵 Home 时设置 `workspace.share_host_home: true`，并把 `paths.state`、`paths.audit` 放到共享 Home 之外；
+- 如果需要整棵 Home 透明共享、但把 Claude/Codex 或其他目录交给控制器单独管理，在同一段配置中增加 `workspace.controlled_mounts`。每项只填写相对 Home 的 `path`、`access` 和可选的 `seed`；受控源目录由控制器放在 `paths.persistent_home/.controlled-mounts`，不会再作为宿主 Home 的普通路径暴露。首次使用 `seed: copy-if-empty` 会从现有宿主目录种子，之后容器写入只进入受控源；父 Home 的原目录仍保留，便于核对或回滚；
+- 需要让宿主与沙箱共用 skills、agents 或 commands 时，将这些目录作为普通 `mounts` 显式挂到受控 `.claude` 的同名严格子路径。挂载顺序会保留受控父目录中的账号和会话状态，同时以读写子挂载覆盖所列的非凭据目录；不要穿透 `.credentials.json`、`settings.json` 或整个 `.claude`；
+- `/data` 等包含宿主子挂载的目录可在普通 `mounts` 项中设置 `propagation: rslave`。这会把宿主运行期间新出现的子挂载传入容器，但不把容器侧挂载反向传回宿主；
 - 需要从宿主访问容器服务时填写 `service_ports`，端口段必须在 `1024-65535` 内且最多 1024 个端口。
 
 编辑完成后再校验：
@@ -128,7 +133,7 @@ sudo bin/sandboxctl verify-closed
 
 `doctor` 任一 `blocked` 都要先修复。`init`、`build`、`start` 和 `stop` 对同一实例互斥；运行中执行 `init` 或 `build` 会直接拒绝，避免活动容器、`current` 清单和镜像标签分叉。
 
-基础镜像固定上游 digest，优先由 `skopeo` 导入本机 Docker；旧版 skopeo 与 Docker Engine API 不兼容时自动回退到同一 digest 的 Docker CLI pull，再以 immutable image ID 打标签。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 同时核对源码、清单、策略、profile、镜像标签和 image ID。同一标签被重新构建成不同内容时会拒绝启动。构建时如需代理，只给当前构建命令设置 `HTTP_PROXY`/`HTTPS_PROXY`，这些变量不会写入目标运行环境。
+基础镜像固定上游 digest，优先由 `skopeo` 导入本机 Docker；旧版 skopeo 与 Docker Engine API 不兼容时自动回退到同一 digest 的 Docker CLI pull，再以 immutable image ID 打标签。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 核对源码、运行清单、策略、镜像标签和 image ID；用户日常配置不属于不可变运行 profile，正常编辑不应触发源文件漂移拒绝。同一标签被重新构建成不同内容时会拒绝启动。构建时如需代理，只给当前构建命令设置 `HTTP_PROXY`/`HTTPS_PROXY`，这些变量不会写入目标运行环境。
 
 `start` 安装本实例的宿主 nftables 父代理门禁和 systemd 恢复单元，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不挂 Docker socket；只有配置了 `service_ports` 时才启动同号 TCP relay。relay 先在宿主命名空间监听声明端口，再进入目标网络命名空间连接 `127.0.0.1:同号端口`，并以无补充组的 `65534:65534` 运行；不会为目标网络接口增加入站放行。全部 GPU 可见但不设置独占模式。
 
@@ -159,6 +164,8 @@ sudo bin/sandboxctl shell
 ```bash
 sudo bin/sandboxctl root-shell
 ```
+
+`shell` 和 `root-shell` 会自动把宿主调用端的 `TERM` 以及非空的 `COLORTERM` 传入交互 shell，使容器使用与当前终端一致的颜色和 TUI 能力。调用端没有可用终端声明、声明为 `dumb`/`unknown`，或只有 8 色的 `xterm` 时，入口会内建回退到镜像已提供 terminfo 的 `xterm-256color`；用户不需要导出变量、重载 `.bashrc` 或增加启动参数。非交互探针不注入这些变量。若显示异常，再在宿主和容器内分别检查 `printf '%s %s\n' "$TERM" "$COLORTERM"` 与 `tput colors`。
 
 停止整套环境：
 
@@ -226,3 +233,27 @@ sudo bin/sandboxctl storage plan
 - 审计日志可独立归档，但不复制活动 runtime、CA 私钥、nftables 状态或 systemd 运行文件。
 
 目标机重新执行 `doctor -> init -> build -> start -> verify-closed`，再验证 Python/GPU/Git/Claude 真实任务。只有这些新证据通过，才能说该服务器复现成功；源服务器的运行编号和测试结论不能直接继承。
+
+## 多台服务器共享项目
+
+项目文件可以放在共同的 NFS 目录，各台服务器仍分别运行自己的 Docker、策略网关和审计。共享的是文件内容；保存文件不会更新已经构建的镜像，也不会重启已有容器。主机实际 UID/GID、挂载、GPU、出口和完整网络门禁需要逐机验证。
+
+共享 Home 时，将主机配置放在各机本地 `/etc/controlled-dev-machine/<用户名>/host.yaml`，再让共享的 `~/.config/controlled-dev-machine/host.yaml` 成为指向该绝对路径的符号链接。相同链接在每台服务器上解析到各自本地文件，原有 `bin/sandboxctl` 入口与显式 `--config` 用法保持一致。配置中的用户名、UID/GID、Home 必须匹配所在服务器。
+
+| 内容 | 存放与更新方式 |
+| --- | --- |
+| 项目源码、Dockerfile、通用策略、文档 | NFS 上一份共享目录；本地磁盘副本可通过 Unison 双向同步 |
+| `host.yaml`、控制器 Python | 每机本地；入口在存在时优先使用 `/opt/controlled-dev-machine/venv/bin/python`，`CDM_PYTHON` 可显式指定 |
+| Docker 镜像、容器、网络、CDI | 每机独立；相同构建输入可导出、导入镜像，并在目标机核对两个镜像的内容 ID |
+| `paths.state`、`paths.audit`、CA、受控 Home | 每机本地、位于共享 Home 和项目挂载之外；由所在主机单独管理 |
+| Git 提交、分支、暂存区 | 本地与 NFS 副本各自管理；文件同步排除 `.git`，发布版本由 Git 显式对齐 |
+
+Unison 同步的范围应限定为登记的项目，排除虚拟环境、缓存、运行状态和审计目录。冲突不设置自动优先来源；同一文件两端均被修改时保留各自内容，核对后合并。定时器的间隔从上次同步结束开始计算，网络中断时变更留在原端，恢复连接后再同步。同步范围、服务名称、日志和停用命令记录在各次主机部署记录中。
+
+更新共享源码后，各机分别停止、重新生成配置、构建、启动和验收。在其他机器上仍有任务运行时，它们继续使用原镜像；这属于待部署变更，不能以文件摘要相同代替镜像与运行验证。复用导出的镜像前核对完整构建摘要，导入后核对 image ID，再在该机独立登记镜像记录；运行清单、CA 和活动审计文件由目标机重新生成。
+
+由 systemd 管理的实例必须通过所在服务停止和启动，例如 `systemctl stop cdm-gzy.service -> sandboxctl init --policy <策略> -> sandboxctl build -> systemctl start cdm-gzy.service -> sandboxctl verify-closed`；未使用服务管理的实例才直接使用 `sandboxctl stop/start`。不要在 `RemainAfterExit=yes` 的服务仍为 active 时直接停止容器，否则后续 `systemctl start` 可能不会再次执行启动命令。正式服务应保留审计子进程，临时部署单元退出时清理整个 cgroup 会使网络因审计失效而关闭。
+
+多个 Docker daemon 使用各自的数据目录，符合 [Docker 的存储要求](https://docs.docker.com/engine/daemon/)。NFS 内的账号、会话数据库和工具缓存是否支持并发写入由各软件决定；本项目的文件读写验证不证明这些数据库能被多个进程同时使用。需要独立状态时，使用 `workspace.controlled_mounts`，将可共享的配置或 skills 作为明确子挂载接入。
+
+未验证与待确认：本节描述部署方式，各机是否已经通过验收以现场记录为准；文档本身不证明任一服务器的运行状态。

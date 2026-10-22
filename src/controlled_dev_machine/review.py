@@ -102,7 +102,9 @@ class RequestStore:
         )
         current = _utc(now)
         request_id = uuid.uuid4().hex
-        request_dir = self.requests_dir / request_id
+        # Publish the directory only after every file is complete. Readers may
+        # enumerate requests while the gateway is still writing the body.
+        request_dir = self.requests_dir / f".{request_id}.tmp"
         request_dir.mkdir(mode=0o700)
         _inherit_owner(request_dir, self.requests_dir)
         body_sha256 = hashlib.sha256(body).hexdigest()
@@ -151,6 +153,18 @@ class RequestStore:
             _write_bytes(request_dir / "body.bin", body)
             _write_json(request_dir / "headers.json", header_items)
             _write_json(request_dir / "record.json", asdict(record))
+            with self._locked():
+                published_dir = self.requests_dir / request_id
+                request_dir.rename(published_dir)
+                try:
+                    directory = os.open(self.requests_dir, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                except Exception:
+                    published_dir.rename(request_dir)
+                    raise
         except Exception:
             for child in ("record.json", "headers.json", "body.bin"):
                 (request_dir / child).unlink(missing_ok=True)

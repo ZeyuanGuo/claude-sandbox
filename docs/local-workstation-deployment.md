@@ -50,10 +50,18 @@
 - 2026-08-07：完成审计再次确认私有策略与活动 manifest 摘要一致，20 项 `verify-closed` 检查全部通过。向三处在线 tcpdump 请求中间统计后，target、gateway、dns 的内核丢包计数均为 0；bpftrace 错误日志为空且无丢事件标记，审计继续 active。smoke 的唯一非业务观察是 API 客户端先发出一次被策略 403 的同端点 `HEAD` 探测，以及无 stdin 时的一行 CLI 警告；文件修改、5 次消息请求和测试均成功，因此没有扩大策略。流式响应正文不保存在 `.mitm` flow 中，响应状态、请求正文、传输字节和双侧 PCAP 仍完整保留，这是现有审计边界而非本次新增异常。
 - 2026-08-07：完成审计后的最终门禁再次通过 171 项 pytest、Ruff、`git diff --check`、shell 语法、主机配置和活动 Compose 配置校验；`doctor --json` 的 24 项主机检查全部为 pass，没有 warning 或 blocked。私有 daily 环境继续在线，临时 root shell 和全部完成审计探针文件已清理。
 - 2026-08-07：按部署任务范围追加一次只读日常工作复测，不再修改实现或创建提交。容器内 Claude 在 4 个 turn 中读取实现与测试、执行 `python3 -m unittest -v` 并给出结论；结果为 success，无 API 错误、权限拒绝或 stderr，外层哈希确认工作文件未变化，6 项测试再次通过。该窗口只有同一 API 角色的 2 次 `POST /v1/messages`（200）和 1 次 `HEAD` 探测（403），无额外业务主机、flow 错误或新增 DNS；四个服务连续运行约 6 小时并保持健康。
+- 2026-08-08：拉取远端 `c95ed7f` 并与本机工作站配置合并，当前本地合并提交为 `9d47afa`，没有推送。共享 Home 模式继续使用宿主 `/home/gzy`，`.claude` 与 `.codex` 改由 `paths.persistent_home/.controlled-mounts` 中的独立读写存储覆盖，`/data` 保持 `rslave` 读写挂载，服务 relay 继续发布 `25600-25700/tcp`。
+- 2026-08-08：受控目录禁止被同路径或祖先 `mounts` 覆盖，但允许显式普通挂载指向其严格子路径；Compose 固定按共享 Home、受控目录、普通子挂载、只读 profile 的顺序渲染。这样可以隔离 Claude 的账号、settings、会话和历史，同时让明确列出的非凭据目录继续与宿主共用。
+- 2026-08-08：检查并恢复另一台受控容器导出的 `.claude` tar。归档只有一个 `.claude/` 顶层、2200 个安全路径条目，没有绝对路径、父目录跳转、链接或特殊文件；1852 个普通文件恢复到 `paths.persistent_home/.controlled-mounts/.claude`，没有解压到宿主活动 `~/.claude`。恢复后的 `.credentials.json` 和 `settings.json` 权限为 `0600`，Claude 账号状态与真实 headless API 请求均成功。
+- 2026-08-08：宿主 `~/.claude/skills`、`agents`、`commands` 作为独立读写子挂载进入沙箱，双向写入探针通过；宿主 Claude 继续读取宿主自己的 `~/.claude`，未读取沙箱账号。临时 smoke 目录、恢复前旧状态和原始 tar 已清理。最终全量 pytest、Ruff、配置校验、24 项 doctor 检查和完整 `verify-closed` 均通过；门禁证据位于 `/var/log/controlled-dev-machine/gzy/audit/structured/20260808T181656.009006Z-ec24a800/verify-closed.json`，审计与 101 端口 relay 保持在线。
+- 2026-08-08：容器内 Codex CLI 0.147.0 加载受控 `.codex` 中的 API-key 认证和配置，`codex doctor` 确认安装、配置、认证、状态数据库与活动提供方连通性正常。真实 `codex exec --ephemeral` 请求成功；随后 Codex 在仓库外共享目录实现 `slugify` 并运行 4 项测试，宿主复跑同样通过，临时夹具已清理。Doctor 仅报告一个既有可选 MCP 命令路径缺失，不影响核心 Codex 请求、文件编辑和命令执行。
+- 2026-08-08：宿主 Ubuntu 22.04 的 tmux 从 APT `3.2a` 更新为官方 release `3.7b`，发布包 SHA-256 校验通过，源码安装到 `/usr/local/bin/tmux`，保留 `/usr/bin/tmux` 作为系统包回退。宿主 `.tmux.conf` 改用 `tmux-256color` 和 `terminal-features` RGB，移除会干扰全屏 TUI 重绘的 `smcup/rmcup` override；独立 socket 的配置与版本探针通过。现有两个会话仍由旧 server 承载，等待操作者从 tmux 外部重启 server 后切换。
 
 ## 当前本机约束
 
 - 共享读写路径：`/home/gzy`、`/data`。
+- Claude 私有状态：沙箱使用独立可写 `.claude`，不导入宿主旧认证；有效非认证功能可以单独共享。提示词、规则和设置保留为可写普通文件，可引用共同主规则，不使用只读单文件覆盖。
+- 日常配置：shell、Git、tmux、SSH 配置和用户凭据可在容器内正常编辑、原子保存并持久化；`init` 仅为缺失文件提供种子，不覆盖已有修改。Codex 共用宿主配置和登录状态。
 - 控制状态与审计：位于共享 Home 之外，只由宿主管理。
 - 容器身份：`devbox`、`America/Los_Angeles`、`en_US.UTF-8`。
 - 服务入口：宿主与容器同号 `25600-25700/tcp`。
@@ -62,4 +70,4 @@
 
 ## 下一步
 
-当前私有 daily 环境保持运行。后续新增域名、端口、凭据模式或联网组件时，先生成独立私有策略并重新执行闭锁门禁和增量审计归因。
+日常使用和恢复以当前安装的开发沙盒入口及 [开发沙盒配置](development-sandbox.md) 为准；上面的带日期记录保留为历史证据。日常用户配置修改不需要重建。后续新增网络能力、策略或控制组件时，按对应变更重新执行闭锁门禁和增量审计归因。

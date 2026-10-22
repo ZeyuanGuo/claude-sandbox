@@ -1,5 +1,7 @@
 # 用户使用指南
 
+已安装的同路径开发沙盒入口、Codex 共享与 Claude 独立状态约定见 [开发沙盒配置](development-sandbox.md)。
+
 这份文档只写日常需要的操作。部署、策略设计和完整检测证据不在这里展开。
 
 ## 进入和退出
@@ -20,9 +22,22 @@ claude
 
 默认情况下，容器 Home 固定映射到宿主配置的 `paths.persistent_home`，不是临时卷。Claude 的会话、历史、memory、账号状态和其他持久文件因此长期保存；容器内的 `~/.claude` 位于这棵持久 Home 中。Codex 的整棵 `~/.codex` 默认读写挂载，因此宿主和容器共用 Codex 配置、登录状态、会话和 skills。
 
-默认配置生成器会在路径实际存在时接入宿主的 `~/.claude/skills`、`~/.claude/agents`、`~/.agents/skills`、`~/.codex`、`~/.config/git` 和 `.condarc`，这些普通工具状态按上游配置读写；`.ssh` 仍只读。每台服务器只挂载实际存在且愿意交给目标软件的项目；不维护另一份沙箱凭据。
+默认配置生成器会在路径实际存在时接入宿主的 `~/.claude/skills`、`~/.claude/agents`、`~/.agents/skills`、`~/.codex`、`~/.config/git`、`~/.ssh` 和 `.condarc`，这些普通工具状态按上游配置读写；SSH 配置、known_hosts 和用户密钥也可正常编辑。每台服务器只挂载实际存在且愿意交给目标软件的项目；共享凭据不另维护一份沙箱副本。
 
-专用开发账号也可以设置 `workspace.share_host_home: true`，把宿主同名 Home 直接映射到容器 Home。此时 NVM、Conda、Rustup、浏览器缓存和所有工作文件会即时双向可见；容器内的修改就是宿主修改。后续本机可在这层共享 Home 上声明受控子目录挂载，例如 `.claude`、`.codex` 或其他相对路径；这些子目录会覆盖父 Home，但其存储由控制器单独管理。`paths.state` 和 `paths.audit` 必须放在这棵共享 Home 之外，控制器生成的 shell、Git、tmux 和 Claude 指令仍以只读覆盖层接入，避免宿主网络变量破坏透明网关。
+专用开发账号也可以设置 `workspace.share_host_home: true`，把宿主同名 Home 直接映射到容器 Home。此时 NVM、Conda、Rustup、浏览器缓存和所有工作文件会即时双向可见；容器内的修改就是宿主修改。Claude 的独立状态可由受控 `.claude` 子目录覆盖，Codex 继续共享宿主状态。`paths.state` 和 `paths.audit` 必须放在这棵共享 Home 之外。shell、Git、tmux、提示词和环境规则是日常可写配置，不叠加只读单文件覆盖；`init` 仅为缺失文件提供初始种子，之后编辑和原子保存都持久保留，不必重新 `init`，也不因正常编辑而拒绝下次启动。CA、machine-id、审计与网络控制组件仍由控制器管理。
+
+独立 Claude 目录的配置形状如下；`seed: never` 不导入宿主旧认证，已有私有状态在重建后保留：
+
+```yaml
+workspace:
+  share_host_home: true
+  controlled_mounts:
+    - path: .claude
+      access: rw
+      seed: never
+```
+
+宿主 Claude 和沙箱 Claude 可以使用两套独立账号、settings、会话和历史，同时把明确的非凭据子目录单独穿透。普通 `mounts` 允许指向受控目录的严格子路径，并在受控父目录之后挂载。例如将宿主 `~/.claude/skills`、`agents` 和 `commands` 读写挂入沙箱时，宿主 Claude 仍从宿主 `~/.claude` 读取自己的凭据；沙箱 Claude 的凭据只从受控 `.claude` 读取。不要把 `.credentials.json`、`settings.json`、`session-env` 或整个 `.claude` 再作为普通挂载。
 
 文件、Git、Python、GPU、Skill、子 agent、MCP 和 Web 等开发流程已在 API-key 基线中验证。当前账号模式尚未完成整套验收；遇到阻断时按下文处理。退出 Claude 或 shell 不会停止沙箱，也不会删除会话。
 

@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Daily shell/CLI entry; privileged lifecycle stays in the original controller."""
+import json
+import os
+from pathlib import Path
+import pwd
+import shlex
+import subprocess
+import sys
+
+
+def main():
+    uid = int(os.environ.get("SUDO_UID", os.getuid()))
+    account = pwd.getpwuid(uid)
+    path = Path("/etc/controlled-dev-machine") / account.pw_name / "entry.json"
+    if not path.is_file():
+        raise SystemExit("当前主机尚未配置受控开发容器；不会自动回退到旧虚拟机。")
+    entry = json.loads(path.read_text())
+    if (entry["uid"], entry["gid"], entry["home"]) != (uid, account.pw_gid, account.pw_dir):
+        raise SystemExit("沙盒入口与当前宿主账号不匹配。")
+    docker = ["docker", "--context", entry["docker_context"]]
+    args = sys.argv[1:]
+    root = False
+    while args and args[0] in ("root", "--root"):
+        root = True
+        args.pop(0)
+    action = args.pop(0) if args else "shell"
+    if action in ("--help", "-h", "help"):
+        print("sbc [shell|claude [参数]|codex [参数]|exec 命令|root|status|doctor|recover|start|stop|audit status]")
+        return 0
+    if action == "status":
+        os.execvp(docker[0], docker + ["ps", "-a", "--filter",
+                  "label=com.docker.compose.project=" + entry["project"],
+                  "--format", "{{.Names}} {{.Status}}"])
+    if action in ("start", "stop", "recover"):
+        command = ["/usr/bin/systemctl", "restart" if action == "recover" else action,
+                   entry["systemd_unit"]]
+        os.execvp(command[0] if os.geteuid() == 0 else "sudo",
+                  command if os.geteuid() == 0 else ["sudo", *command])
+    if action in ("doctor", "audit"):
+        command = [entry["controller"], "--config", entry["config"], action, *args]
+        if action == "audit" and not args:
+            command.append("status")
+        os.execvp(command[0] if os.geteuid() == 0 else "sudo",
+                  command if os.geteuid() == 0 else ["sudo", *command])
+    if action == "root-shell":
+        root, action = True, "shell"
+    if action not in ("shell", "exec", "claude", "codex"):
+        raise SystemExit("未知操作；使用 sbc --help。")
+    work = os.getcwd()
+    probe = subprocess.run(docker + ["exec", entry["container"], "test", "-d", work],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode:
+        work = entry["home"]
+    command = docker + ["exec", "-i"]
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        command.append("-t")
+    command += ["--user", "0:0" if root else f"{uid}:{account.pw_gid}", "--workdir", work]
+    if root:
+        command += ["--env", "HOME=/root", "--env", "CLAUDE_CONFIG_DIR=/root/.claude"]
+    command += [entry["container"], "bash", "--login"]
+    if action != "shell" or args:
+        words = ([action] + args) if action in ("claude", "codex") else args
+        if not words:
+            raise SystemExit("sbc exec 需要命令。")
+        command += ["-c", "exec " + shlex.join(words)]
+    os.execvp(command[0], command)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

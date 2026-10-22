@@ -15,6 +15,8 @@ from controlled_dev_machine.errors import ConfigError
 
 _INSTANCE_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_MAC_ADDRESS_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,8 @@ class TargetIdentity:
     uid: int
     gid: int
     home: Path
+    hostname: str = "devbox"
+    mac_address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,14 @@ class ProjectMount:
     host_path: Path
     container_path: Path
     read_only: bool
+    propagation: str | None = None
+
+
+@dataclass(frozen=True)
+class ControlledMount:
+    relative_path: Path
+    read_only: bool
+    seed: str = "copy-if-empty"
 
 
 @dataclass(frozen=True)
@@ -80,6 +92,12 @@ class UpstreamConfig:
     port: int | None
     config_path: Path | None
     expected_exit_cidr: str | None = None
+
+
+@dataclass(frozen=True)
+class HostSshConfig:
+    enabled: bool = False
+    port: int = 22
 
 
 @dataclass(frozen=True)
@@ -97,6 +115,7 @@ class HostProfile:
 @dataclass(frozen=True)
 class WorkspaceConfig:
     share_host_home: bool = False
+    controlled_mounts: tuple[ControlledMount, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,6 +136,7 @@ class HostConfig:
     storage: StorageConfig
     mounts: tuple[ProjectMount, ...]
     upstream: UpstreamConfig
+    host_ssh: HostSshConfig
     profile: HostProfile
     workspace: WorkspaceConfig
     service_ports: ServicePorts | None
@@ -189,7 +209,7 @@ def create_host_config(path: Path) -> None:
         (".agents/skills", "rw"),
         (".codex", "rw"),
         (".config/git", "rw"),
-        (".ssh", "ro"),
+        (".ssh", "rw"),
         (".condarc", "rw"),
     ):
         source = home / relative
@@ -233,8 +253,9 @@ def create_host_config(path: Path) -> None:
             "expected_exit_cidr": None,
             "config_path": None,
         },
+        "host_ssh": {"enabled": False, "port": 22},
         "profile": profile,
-        "workspace": {"share_host_home": False},
+        "workspace": {"share_host_home": False, "controlled_mounts": []},
         "service_ports": None,
         "mounts": mounts,
     }
@@ -286,11 +307,26 @@ def load_host_config(path: Path) -> HostConfig:
         raise ConfigError("每个用户只允许一套沙箱，instance 必须为 main")
 
     target_raw = _mapping(root.get("target"), "target")
+    hostname = _string(target_raw.get("hostname", "devbox"), "target.hostname")
+    if not _HOSTNAME_RE.fullmatch(hostname):
+        raise ConfigError(
+            "target.hostname 必须是 1 到 63 位小写字母、数字或连字符，首尾不能是连字符"
+        )
+    mac_address = target_raw.get("mac_address")
+    if mac_address is not None:
+        mac_address = _string(mac_address, "target.mac_address")
+        if (
+            not _MAC_ADDRESS_RE.fullmatch(mac_address)
+            or int(mac_address[:2], 16) & 3 != 2
+        ):
+            raise ConfigError("target.mac_address 必须是小写冒号分隔的 locally-admin unicast MAC")
     target = TargetIdentity(
         name=_string(target_raw.get("name"), "target.name"),
         uid=_nonnegative_int(target_raw.get("uid"), "target.uid"),
         gid=_nonnegative_int(target_raw.get("gid"), "target.gid"),
         home=_absolute_path(target_raw.get("home"), "target.home"),
+        hostname=hostname,
+        mac_address=mac_address,
     )
 
     paths_raw = _mapping(root.get("paths"), "paths")
@@ -365,6 +401,15 @@ def load_host_config(path: Path) -> HostConfig:
         expected_exit_cidr=expected_exit_cidr,
     )
 
+    host_ssh_raw = _mapping(root.get("host_ssh", {}), "host_ssh")
+    host_ssh_enabled = host_ssh_raw.get("enabled", False)
+    if not isinstance(host_ssh_enabled, bool):
+        raise ConfigError("host_ssh.enabled 必须是布尔值")
+    host_ssh_port = _integer(host_ssh_raw.get("port", 22), "host_ssh.port")
+    if host_ssh_port < 1 or host_ssh_port > 65535:
+        raise ConfigError("host_ssh.port 必须在 1 到 65535 之间")
+    host_ssh = HostSshConfig(enabled=host_ssh_enabled, port=host_ssh_port)
+
     profile_raw = _mapping(root.get("profile", {}), "profile")
     environment_value = profile_raw.get("default_conda_env")
     default_conda_env = (
@@ -412,7 +457,19 @@ def load_host_config(path: Path) -> HostConfig:
     share_host_home = workspace_raw.get("share_host_home", False)
     if not isinstance(share_host_home, bool):
         raise ConfigError("workspace.share_host_home 必须是布尔值")
-    workspace = WorkspaceConfig(share_host_home=share_host_home)
+    controlled_raw = workspace_raw.get("controlled_mounts", [])
+    if not isinstance(controlled_raw, list):
+        raise ConfigError("workspace.controlled_mounts 必须是列表")
+    controlled_mounts = tuple(
+        _controlled_mount(item, index)
+        for index, item in enumerate(controlled_raw)
+    )
+    workspace = WorkspaceConfig(
+        share_host_home=share_host_home,
+        controlled_mounts=controlled_mounts,
+    )
+    if controlled_mounts and not share_host_home:
+        raise ConfigError("workspace.controlled_mounts 需要 workspace.share_host_home=true")
     if share_host_home:
         exposed_control_paths = (
             name
@@ -424,6 +481,11 @@ def load_host_config(path: Path) -> HostConfig:
         )
         if exposed := ", ".join(exposed_control_paths):
             raise ConfigError(f"共享宿主 Home 时 {exposed} 必须位于 target.home 之外")
+        if controlled_mounts and _overlap(target.home, paths.persistent_home):
+            raise ConfigError(
+                "workspace.controlled_mounts 启用时 paths.persistent_home 必须位于 target.home 之外"
+            )
+    _validate_controlled_mounts(controlled_mounts, mounts, target.home)
 
     service_ports_raw = root.get("service_ports")
     service_ports: ServicePorts | None = None
@@ -453,6 +515,7 @@ def load_host_config(path: Path) -> HostConfig:
         storage=storage,
         mounts=mounts,
         upstream=upstream,
+        host_ssh=host_ssh,
         profile=profile,
         workspace=workspace,
         service_ports=service_ports,
@@ -556,13 +619,51 @@ def _mount(value: Any, index: int, user_home: Path) -> ProjectMount:
     access = _string(raw.get("access", "rw"), f"mounts[{index}].access")
     if access not in {"ro", "rw"}:
         raise ConfigError(f"mounts[{index}].access 只允许 ro 或 rw")
+    propagation_value = raw.get("propagation")
+    propagation = None if propagation_value in (None, "") else _string(
+        propagation_value, f"mounts[{index}].propagation"
+    )
+    if propagation not in {None, "rprivate", "rslave"}:
+        raise ConfigError(f"mounts[{index}].propagation 只允许 rprivate 或 rslave")
     return ProjectMount(
         host_path=_user_path(raw.get("host_path"), f"mounts[{index}].host_path", user_home),
         container_path=_absolute_path(
             raw.get("container_path"), f"mounts[{index}].container_path"
         ),
         read_only=access == "ro",
+        propagation=propagation,
     )
+
+
+def _controlled_mount(value: Any, index: int) -> ControlledMount:
+    raw = _mapping(value, f"workspace.controlled_mounts[{index}]")
+    text = _string(raw.get("path"), f"workspace.controlled_mounts[{index}].path")
+    relative = Path(text)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or relative == Path(".")
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ConfigError(
+            f"workspace.controlled_mounts[{index}].path 必须是 target.home 下的相对目录"
+        )
+    access = _string(
+        raw.get("access", "rw"), f"workspace.controlled_mounts[{index}].access"
+    )
+    if access not in {"ro", "rw"}:
+        raise ConfigError(
+            f"workspace.controlled_mounts[{index}].access 只允许 ro 或 rw"
+        )
+    seed = _string(
+        raw.get("seed", "copy-if-empty"),
+        f"workspace.controlled_mounts[{index}].seed",
+    )
+    if seed not in {"copy-if-empty", "never"}:
+        raise ConfigError(
+            f"workspace.controlled_mounts[{index}].seed 只允许 copy-if-empty 或 never"
+        )
+    return ControlledMount(relative_path=relative, read_only=access == "ro", seed=seed)
 
 
 def _overlap(left: Path, right: Path) -> bool:
@@ -595,3 +696,32 @@ def _validate_mounts(mounts: tuple[ProjectMount, ...], paths: HostPaths) -> None
             raise ConfigError(f"项目挂载不能暴露控制或审计目录: {mount.host_path}")
         seen_host.add(mount.host_path)
         seen_container.add(mount.container_path)
+
+
+def _validate_controlled_mounts(
+    controlled: tuple[ControlledMount, ...],
+    mounts: tuple[ProjectMount, ...],
+    target_home: Path,
+) -> None:
+    seen: list[Path] = []
+    for item in controlled:
+        target = target_home / item.relative_path
+        if any(_overlap(target, existing) for existing in seen):
+            raise ConfigError(f"workspace.controlled_mounts 目标路径重叠: {target}")
+        for mount in mounts:
+            if not _overlap(target, mount.container_path):
+                continue
+            if mount.container_path != target and mount.container_path.is_relative_to(
+                target
+            ):
+                continue
+            raise ConfigError(f"受控目录不能被 mounts 目标路径覆盖: {target}")
+        if target in {
+            target_home / ".claude" / "CLAUDE.md",
+            target_home / ".bashrc",
+            target_home / ".profile",
+            target_home / ".gitconfig",
+            target_home / ".tmux.conf",
+        }:
+            raise ConfigError(f"受控目录不能覆盖生成的 profile 文件: {target}")
+        seen.append(target)

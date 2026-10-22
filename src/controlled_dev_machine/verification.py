@@ -173,14 +173,18 @@ def _run_environment_neutral(config: HostConfig) -> dict[str, Any]:
             "python3",
             "-c",
             (
-                "import os\n"
+                "import os,shlex\n"
                 "for name in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY',"
                 "'http_proxy','https_proxy','all_proxy','no_proxy','CURL_CA_BUNDLE',"
-                "'GIT_SSL_CAINFO','NODE_EXTRA_CA_CERTS','REQUESTS_CA_BUNDLE',"
-                "'SSL_CERT_FILE'):\n"
+                "'GIT_SSL_CAINFO','NODE_EXTRA_CA_CERTS'):\n"
                 "    if os.environ.get(name): raise SystemExit(f'{name} is set')\n"
-                "if os.environ.get('NODE_USE_SYSTEM_CA') != '1':\n"
+                "for name in ('SSL_CERT_FILE','REQUESTS_CA_BUNDLE'):\n"
+                "    if os.environ.get(name) != '/etc/ssl/certs/ca-certificates.crt':\n"
+                "        raise SystemExit(f'{name} does not use the system CA bundle')\n"
+                "if '--use-system-ca' not in shlex.split(os.environ.get('NODE_OPTIONS', '')):\n"
                 "    raise SystemExit('Node system CA mode is not enabled')\n"
+                "if os.environ.get('NODE_TLS_REJECT_UNAUTHORIZED') == '0':\n"
+                "    raise SystemExit('Node TLS certificate verification is disabled')\n"
             ),
         ],
         timeout=5,

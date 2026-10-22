@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -16,7 +17,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
@@ -219,6 +220,10 @@ def _profile_bundle(
         for path in (
             config.target.home if config.workspace.share_host_home else None,
             *(item.container_path for item in config.mounts),
+            *(
+                config.target.home / item.relative_path
+                for item in config.workspace.controlled_mounts
+            ),
         )
         if path is not None
     )
@@ -230,7 +235,7 @@ def _profile_bundle(
     notice_lines = (
         "--- Controlled development workstation ---",
         (
-            "System identity: Ubuntu container, devbox, "
+            f"System identity: Ubuntu container, {config.target.hostname}, "
             f"{config.profile.timezone}, en_US.UTF-8"
         ),
         f"Shared work paths: {workspace_description or 'none'}",
@@ -253,6 +258,17 @@ def _profile_bundle(
     instructions = (
         f"{host_instructions}\n\n{controlled}\n" if host_instructions else f"{controlled}\n"
     )
+    if config.workspace.share_host_home:
+        source = config.profile.claude_instructions
+        instructions = (
+            f"@{source}\n\n"
+            "<!-- Edit the imported file for shared rules; append local instructions here. -->\n"
+            if source is not None else ""
+        )
+        if source is not None:
+            location = _profile_host_location(config, source)
+            if location.root / location.relative != source:
+                raise DeploymentError("共享 Claude 主提示词必须位于未被私有挂载覆盖的共享 Home")
     bashrc = sources.get("bashrc", "").rstrip()
     conda_executable = (
         config.profile.conda_root / "bin" / "conda"
@@ -289,7 +305,6 @@ fi
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
 unset http_proxy https_proxy all_proxy no_proxy
 unset CURL_CA_BUNDLE GIT_SSL_CAINFO NODE_EXTRA_CA_CERTS
-unset REQUESTS_CA_BUNDLE SSL_CERT_FILE
 unset -f proxy_on proxy_off 2>/dev/null || true
 """.lstrip()
     bashrc += f"""
@@ -326,7 +341,6 @@ fi
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
 unset http_proxy https_proxy all_proxy no_proxy
 unset CURL_CA_BUNDLE GIT_SSL_CAINFO NODE_EXTRA_CA_CERTS
-unset REQUESTS_CA_BUNDLE SSL_CERT_FILE
 unset -f proxy_on proxy_off 2>/dev/null || true
 """
     files = {
@@ -334,15 +348,174 @@ unset -f proxy_on proxy_off 2>/dev/null || true
         ".bashrc": bashrc,
         ".profile": login_profile,
     }
+    if config.workspace.share_host_home:
+        files["controlled-environment.md"] = f"{controlled}\n"
     if "gitconfig" in sources:
         files[".gitconfig"] = _network_neutral_gitconfig(sources["gitconfig"])
     if "tmux_config" in sources:
         files[".tmux.conf"] = sources["tmux_config"]
+    # These digests describe the initialization seed, not mutable user files.
     source_digest.update(b"rendered_profile\0")
     for name, content in sorted(files.items()):
         source_digest.update(name.encode("utf-8") + b"\0")
         source_digest.update(content.encode("utf-8") + b"\0")
     return files, source_digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class _ProfileLocation:
+    root: Path
+    relative: Path
+    read_only: bool
+
+
+def _profile_host_location(config: HostConfig, target: Path) -> _ProfileLocation:
+    """Resolve a user-visible path through its longest declared mount parent."""
+    mappings = [
+        (
+            config.target.home,
+            config.target.home
+            if config.workspace.share_host_home
+            else config.paths.persistent_home,
+            False,
+        ),
+        *(
+            (
+                config.target.home / item.relative_path,
+                _controlled_mount_source(config, item),
+                item.read_only,
+            )
+            for item in config.workspace.controlled_mounts
+        ),
+        *((item.container_path, item.host_path, item.read_only) for item in config.mounts),
+    ]
+    candidates = [
+        item for item in mappings if target.is_relative_to(item[0])
+    ]
+    if not candidates:
+        raise DeploymentError(f"用户 profile 路径没有持久挂载: {target}")
+    _, (visible, source, read_only) = max(
+        enumerate(candidates), key=lambda item: (len(item[1][0].parts), item[0])
+    )
+    relative = target.relative_to(visible)
+    if not relative.parts:
+        return _ProfileLocation(source.parent, Path(source.name), read_only)
+    return _ProfileLocation(source, relative, read_only)
+
+
+def _open_profile_root(path: Path) -> int:
+    """Anchor an absolute data root without following any ancestor symlink."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise DeploymentError(f"用户 profile 数据根必须是无父目录跳转的绝对路径: {path}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _profile_user_identity(uid: int, gid: int) -> Iterator[None]:
+    """Create data as the target user, retaining privilege only to restore identity."""
+    previous_uid, previous_gid = os.geteuid(), os.getegid()
+    if (uid, gid) == (previous_uid, previous_gid):
+        yield
+        return
+    if previous_uid != 0:
+        raise DeploymentError("无权切换到目标用户初始化 profile")
+    previous_groups = os.getgroups()
+    try:
+        account = pwd.getpwuid(uid)
+    except KeyError as exc:
+        raise DeploymentError(f"profile 目标 UID 没有宿主账号: {uid}") from exc
+    groups = os.getgrouplist(account.pw_name, gid)
+    try:
+        os.setgroups(groups)
+        os.setegid(gid)
+        os.seteuid(uid)
+        yield
+    finally:
+        try:
+            os.seteuid(previous_uid)
+        finally:
+            try:
+                os.setegid(previous_gid)
+            finally:
+                os.setgroups(previous_groups)
+
+
+def _seed_profile_file(root: Path, relative: Path, content: str, uid: int, gid: int) -> None:
+    """Create only a missing user file; never replace or reown existing data."""
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise DeploymentError(f"用户 profile 文件必须位于数据根之下: {relative}")
+    destination = root / relative
+    descriptor = -1
+    temporary = f".cdm-seed-{uuid.uuid4().hex}"
+    temporary_created = False
+    try:
+        descriptor = _open_profile_root(root)
+        with _profile_user_identity(uid, gid):
+            try:
+                for name in relative.parts[:-1]:
+                    with suppress(FileExistsError):
+                        os.mkdir(name, mode=0o700, dir_fd=descriptor)
+                    child = os.open(
+                        name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                    os.close(descriptor)
+                    descriptor = child
+                # lstat preserves empty files, directories, and broken links alike.
+                try:
+                    os.stat(relative.name, dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    return
+                file_descriptor = os.open(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o644, dir_fd=descriptor,
+                )
+                temporary_created = True
+                with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                with suppress(FileExistsError):
+                    os.link(
+                        temporary, relative.name, src_dir_fd=descriptor, dst_dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+            finally:
+                if temporary_created:
+                    with suppress(FileNotFoundError):
+                        os.unlink(temporary, dir_fd=descriptor)
+    except OSError as exc:
+        raise DeploymentError(f"无法初始化用户 profile: {destination}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _initialize_user_profile(config: HostConfig, files: dict[str, str]) -> None:
+    home = config.target.home
+    targets = {
+        "CLAUDE.md": home / ".claude/CLAUDE.md",
+        "controlled-environment.md": home / ".claude/rules/controlled-environment.md",
+        **{name: home / name for name in (".bashrc", ".profile", ".gitconfig", ".tmux.conf")},
+    }
+    for name, content in files.items():
+        location = _profile_host_location(config, targets[name])
+        if not location.read_only:
+            _seed_profile_file(
+                location.root, location.relative, content, config.target.uid, config.target.gid,
+            )
 
 
 def _network_neutral_shell(content: str, *, conda_enabled: bool = True) -> str:
@@ -634,6 +807,7 @@ def prepare_runtime(
                 policy_path=str(generation_policy),
             ),
         )
+        _initialize_user_profile(config, profile_files)
         _fsync_directory(generation)
         _activate_generation(config, generation)
         activated = True
@@ -658,7 +832,6 @@ def render_closed_compose(
     )
     plaintext = config.paths.audit / "plaintext"
     review = config.paths.review
-    profile = config.paths.state / "generated" / "current" / "profile"
     common_security: dict[str, Any] = {
         "cap_drop": ["ALL"],
         "security_opt": ["no-new-privileges:true"],
@@ -670,26 +843,25 @@ def render_closed_compose(
             "source": str(item.host_path),
             "target": str(item.container_path),
             "read_only": item.read_only,
-            "bind": {"create_host_path": False},
+            "bind": {
+                "create_host_path": False,
+                **(
+                    {"propagation": item.propagation}
+                    if item.propagation is not None
+                    else {}
+                ),
+            },
         }
         for item in config.mounts
     ]
-    profile_mounts = [
-        _bind(profile / "CLAUDE.md", config.target.home / ".claude/CLAUDE.md"),
-        _bind(profile / ".bashrc", config.target.home / ".bashrc"),
-        _bind(profile / ".profile", config.target.home / ".profile"),
+    controlled_mounts = [
+        _bind(
+            _controlled_mount_source(config, item),
+            config.target.home / item.relative_path,
+            read_only=item.read_only,
+        )
+        for item in config.workspace.controlled_mounts
     ]
-    if config.profile.gitconfig is not None:
-        profile_mounts.append(
-            _bind(profile / ".gitconfig", config.target.home / ".gitconfig")
-        )
-    if config.profile.tmux_config is not None:
-        profile_mounts.append(
-            _bind(profile / ".tmux.conf", config.target.home / ".tmux.conf")
-        )
-    conda_trust_mounts = _conda_trust_mounts(
-        config, target_trust / "ca-certificates.crt"
-    )
     upstream_enabled = config.upstream.kind == "http"
     upstream_port = config.upstream.port if upstream_enabled else 9
     dns_policy_args = _dns_policy_args(manifest)
@@ -706,6 +878,9 @@ def render_closed_compose(
             f"upstream.cdm.test:{manifest.upstream_gateway_address}"
         )
     dns_address = _target_dns_address(manifest)
+    target_extra_hosts = []
+    if config.host_ssh.enabled:
+        target_extra_hosts.append(f"host.docker.internal:{_target_host_address(manifest)}")
     services: dict[str, Any] = {
         "canary": {
             "image": manifest.target_image,
@@ -909,7 +1084,7 @@ def render_closed_compose(
             "image": manifest.target_image,
             "user": f"{config.target.uid}:{config.target.gid}",
             "group_add": ["sudo"],
-            "hostname": "devbox",
+            "hostname": config.target.hostname,
             "command": ["sleep", "infinity"],
             "init": True,
             "stdin_open": True,
@@ -921,7 +1096,9 @@ def render_closed_compose(
                 "TZ": config.profile.timezone,
                 "LANG": "en_US.UTF-8",
                 "LC_ALL": "en_US.UTF-8",
-                "NODE_USE_SYSTEM_CA": "1",
+                "NODE_OPTIONS": "--use-system-ca",
+                "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
+                "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
                 "NVIDIA_VISIBLE_DEVICES": "all",
                 "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
                 **(
@@ -936,6 +1113,7 @@ def render_closed_compose(
                 ),
             },
             "devices": ["nvidia.com/gpu=all"],
+            "extra_hosts": target_extra_hosts,
             "volumes": [
                 _bind(
                     config.target.home
@@ -944,8 +1122,8 @@ def render_closed_compose(
                     config.target.home,
                     read_only=False,
                 ),
+                *controlled_mounts,
                 *project_mounts,
-                *profile_mounts,
                 _bind(
                     target_trust / "ca-certificates.crt",
                     "/etc/ssl/certs/ca-certificates.crt",
@@ -955,10 +1133,16 @@ def render_closed_compose(
                     target_password_hash,
                     "/run/cdm/target-password-hash",
                 ),
-                *conda_trust_mounts,
             ],
             "networks": {
-                "target_net": {"ipv4_address": manifest.target_address},
+                "target_net": {
+                    "ipv4_address": manifest.target_address,
+                    **(
+                        {"mac_address": config.target.mac_address}
+                        if config.target.mac_address is not None
+                        else {}
+                    ),
+                },
             },
             "pids_limit": 4096,
             "stop_grace_period": "2s",
@@ -968,7 +1152,10 @@ def render_closed_compose(
         "name": config.resource_prefix,
         "services": services,
         "networks": {
-            "target_net": _isolated_network(manifest.target_subnet),
+            "target_net": _isolated_network(
+                manifest.target_subnet,
+                host_access=config.host_ssh.enabled,
+            ),
             "canary_net": _isolated_network(manifest.canary_subnet),
             **(
                 {"upstream_net": _upstream_network(manifest.upstream_subnet)}
@@ -1052,18 +1239,21 @@ def compose_start_closed(config: HostConfig, *, timeout_seconds: int = 90) -> No
     _require_policy_files(manifest)
     _require_target_image(config, manifest)
     _require_gateway_image(config, manifest)
-    _require_profile_sources(config, manifest)
     _check_gpu_cdi(config)
     if _service_container_id(config, manifest, "target"):
         raise DeploymentError("环境已经运行；配置变更时先执行 sandboxctl stop")
     _install_host_parent_guard(config, manifest)
     _configure_stopped_host_parent_guard(config, manifest)
+    _configure_stopped_host_ssh_guard(config, manifest)
+    _configure_host_ssh_hosts_allow(config, manifest, enabled=False)
     observed_upstream_ip = _check_upstream(config)
     _stop_audit(config)
     _archive_current_flow(config)
     _compose(config, manifest, "create", "canary", "dns", "gateway")
     try:
         _configure_host_parent_guard(config, manifest)
+        _configure_host_ssh_guard(config, manifest)
+        _configure_host_ssh_hosts_allow(config, manifest, enabled=True)
         _compose(config, manifest, "up", "-d", "canary", "dns", "gateway")
         ca_path = config.paths.state / "proxy-ca" / "mitmproxy-ca-cert.pem"
         deadline = time.monotonic() + timeout_seconds
@@ -1090,6 +1280,8 @@ def compose_start_closed(config: HostConfig, *, timeout_seconds: int = 90) -> No
         _stop_audit(config)
         _compose(config, manifest, "down", "--remove-orphans", check=False)
         _configure_stopped_host_parent_guard(config, manifest)
+        _configure_stopped_host_ssh_guard(config, manifest)
+        _configure_host_ssh_hosts_allow(config, manifest, enabled=False)
         raise
 
 
@@ -1146,6 +1338,8 @@ def compose_stop(config: HostConfig) -> None:
     _compose_path(config, compose_path, "down", "--remove-orphans")
     if manifest is not None:
         _configure_stopped_host_parent_guard(config, manifest)
+        _configure_stopped_host_ssh_guard(config, manifest)
+        _configure_host_ssh_hosts_allow(config, manifest, enabled=False)
     _archive_current_flow(config)
 
 
@@ -1237,7 +1431,23 @@ def compose_shell(config: HostConfig, *, root: bool) -> int:
     manifest = load_runtime(config)
     _require_root()
     user = "0:0" if root else f"{config.target.uid}:{config.target.gid}"
-    result = _compose(config, manifest, "exec", "--user", user, "target", "bash", check=False)
+    term = os.environ.get("TERM")
+    if term in {None, "", "dumb", "unknown", "xterm"}:
+        term = "xterm-256color"
+    terminal_env = ["--env", f"TERM={term}"]
+    if colorterm := os.environ.get("COLORTERM"):
+        terminal_env.extend(("--env", f"COLORTERM={colorterm}"))
+    result = _compose(
+        config,
+        manifest,
+        "exec",
+        *terminal_env,
+        "--user",
+        user,
+        "target",
+        "bash",
+        check=False,
+    )
     return result.returncode
 
 
@@ -1313,6 +1523,7 @@ def _prepare_directories(config: HostConfig) -> None:
             config.target.uid,
             config.target.gid,
         )
+    _prepare_controlled_mounts(config)
     _mkdir(config.paths.state, 0o700, 0, 0)
     _mkdir(config.paths.audit, 0o700, 0, 0)
     for path in (
@@ -1346,6 +1557,42 @@ def _prepare_directories(config: HostConfig) -> None:
     for mount in config.mounts:
         if not (mount.host_path.is_dir() or mount.host_path.is_file()):
             raise DeploymentError(f"挂载源不存在或不是普通文件/目录: {mount.host_path}")
+
+
+def _controlled_mount_source(config: HostConfig, mount: Any) -> Path:
+    return config.paths.persistent_home / ".controlled-mounts" / mount.relative_path
+
+
+def _prepare_controlled_mounts(config: HostConfig) -> None:
+    if not config.workspace.controlled_mounts:
+        return
+    root = config.paths.persistent_home / ".controlled-mounts"
+    _mkdir(root, 0o700, config.target.uid, config.target.gid)
+    for mount in config.workspace.controlled_mounts:
+        source = _controlled_mount_source(config, mount)
+        host_path = config.target.home / mount.relative_path
+        if source.is_symlink() or (source.exists() and not source.is_dir()):
+            raise DeploymentError(f"受控挂载源必须是普通目录: {source}")
+        if not source.exists():
+            _mkdir(source, 0o700, config.target.uid, config.target.gid)
+        if mount.seed == "copy-if-empty" and not any(source.iterdir()):
+            if host_path.is_symlink() or (host_path.exists() and not host_path.is_dir()):
+                raise DeploymentError(f"受控挂载种子必须是普通目录: {host_path}")
+            if host_path.is_dir():
+                shutil.copytree(host_path, source, dirs_exist_ok=True, symlinks=True)
+                _chown_tree(source, config.target.uid, config.target.gid)
+
+
+def _chown_tree(root: Path, uid: int, gid: int) -> None:
+    for directory, dir_names, file_names in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        os.chown(directory_path, uid, gid)
+        for name in [*dir_names, *file_names]:
+            path = directory_path / name
+            if path.is_symlink():
+                os.lchown(path, uid, gid)
+            else:
+                os.chown(path, uid, gid)
 
 
 def _store_policy(config: HostConfig, source: Path, policy: PolicySnapshot) -> Path:
@@ -1484,34 +1731,6 @@ def _ensure_target_trust_bundle(config: HostConfig, manifest: RuntimeManifest) -
         bundle,
         mode=0o644,
     )
-
-
-def _conda_trust_mounts(config: HostConfig, bundle: Path) -> list[dict[str, Any]]:
-    root = config.profile.conda_root
-    if root is None:
-        return []
-    environment_roots = [root]
-    if config.profile.default_conda_env is not None:
-        environment_roots.append(root / "envs" / config.profile.default_conda_env)
-    candidates: list[Path] = []
-    for environment_root in environment_roots:
-        candidates.append(environment_root / "ssl" / "cacert.pem")
-        candidates.extend(
-            sorted(
-                environment_root.glob(
-                    "lib/python*/site-packages/certifi/cacert.pem"
-                )
-            )
-        )
-    targets: list[Path] = []
-    for candidate in candidates:
-        try:
-            regular = candidate.is_file() and not candidate.is_symlink()
-        except OSError:
-            regular = False
-        if regular and candidate not in targets:
-            targets.append(candidate)
-    return [_bind(bundle, target) for target in targets]
 
 
 def _ensure_upstream_trust_bundle(config: HostConfig) -> None:
@@ -1726,6 +1945,97 @@ def _configure_stopped_host_parent_guard(
     _apply_host_nft(table, _stopped_host_parent_guard_script(config, manifest))
 
 
+def _configure_host_ssh_guard(config: HostConfig, manifest: RuntimeManifest) -> None:
+    if not config.host_ssh.enabled:
+        return
+    table = _host_ssh_table(manifest)
+    host_address = _target_host_address(manifest)
+    allow_rule = (
+        f"    ip saddr {manifest.target_address} ip daddr {host_address} "
+        f"tcp dport {config.host_ssh.port} accept"
+    )
+    _apply_host_nft(
+        table,
+        f"""
+table inet {table} {{
+  chain input {{
+    type filter hook input priority -19; policy accept;
+{allow_rule}
+    ip daddr {host_address} tcp dport {config.host_ssh.port} drop
+  }}
+}}
+""",
+    )
+
+
+def _configure_stopped_host_ssh_guard(
+    config: HostConfig, manifest: RuntimeManifest
+) -> None:
+    if not config.host_ssh.enabled:
+        return
+    table = _host_ssh_table(manifest)
+    _apply_host_nft(table, _stopped_host_ssh_guard_script(config, manifest))
+
+
+def _stopped_host_ssh_guard_script(
+    config: HostConfig, manifest: RuntimeManifest
+) -> str:
+    table = _host_ssh_table(manifest)
+    host_address = _target_host_address(manifest)
+    return f"""
+table inet {table} {{
+  chain input {{
+    type filter hook input priority -19; policy accept;
+    ip daddr {host_address} tcp dport {config.host_ssh.port} drop
+  }}
+}}
+"""
+
+
+def _configure_host_ssh_hosts_allow(
+    config: HostConfig, manifest: RuntimeManifest, *, enabled: bool
+) -> None:
+    if not config.host_ssh.enabled:
+        return
+    path = Path("/etc/hosts.allow")
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        raise DeploymentError(f"宿主机 hosts.allow 不是普通文件: {path}")
+    marker = f"# controlled-dev-machine {manifest.resource_prefix} host ssh"
+    entry = f"sshd:{manifest.target_address}:allow"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if enabled:
+        if any(line.strip() == entry for line in lines):
+            return
+        content = "\n".join(lines).rstrip("\n") + f"\n{marker}\n{entry}\n"
+    else:
+        filtered: list[str] = []
+        index = 0
+        while index < len(lines):
+            if lines[index].strip() == marker:
+                index += 1
+                if index < len(lines) and lines[index].strip() == entry:
+                    index += 1
+                continue
+            filtered.append(lines[index])
+            index += 1
+        content = "\n".join(filtered).rstrip("\n") + "\n"
+    _atomic_text(path, content, mode=stat.S_IMODE(metadata.st_mode))
+
+
+def _host_ssh_table(manifest: RuntimeManifest) -> str:
+    suffix = hashlib.sha256(manifest.resource_prefix.encode("ascii")).hexdigest()[:12]
+    return f"cdm_host_ssh_{suffix}"
+
+
+def _target_host_address(manifest: RuntimeManifest) -> str:
+    network = ipaddress.ip_network(manifest.target_subnet)
+    try:
+        return str(next(network.hosts()))
+    except StopIteration as exc:
+        raise DeploymentError("目标网络没有可用的宿主机地址") from exc
+
+
 def _stopped_host_parent_guard_script(
     config: HostConfig, manifest: RuntimeManifest
 ) -> str:
@@ -1779,7 +2089,7 @@ def _install_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) ->
         _host_parent_guard_runner_script(nft, table, nft_path, reload_path),
         mode=0o755,
     )
-    _atomic_text(
+    _install_systemd_unit(
         unit_path,
         (
             "[Unit]\n"
@@ -1794,10 +2104,76 @@ def _install_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) ->
             "[Install]\n"
             "WantedBy=multi-user.target\n"
         ),
+        systemctl=systemctl,
+    )
+    if config.host_ssh.enabled:
+        _install_host_ssh_guard(config, manifest, nft=nft, systemctl=systemctl)
+
+
+def _install_host_ssh_guard(
+    config: HostConfig,
+    manifest: RuntimeManifest,
+    *,
+    nft: str,
+    systemctl: str,
+) -> None:
+    guard_root = Path("/etc/controlled-dev-machine")
+    name = f"{manifest.resource_prefix}-host-ssh-guard"
+    table = _host_ssh_table(manifest)
+    nft_path = guard_root / f"{name}.nft"
+    reload_path = guard_root / f"{name}.reload.nft"
+    runner_path = guard_root / f"{name}.sh"
+    unit_path = Path("/etc/systemd/system") / f"{name}.service"
+    for path in (nft_path, reload_path, runner_path, unit_path):
+        if path.is_symlink():
+            raise DeploymentError(f"宿主 SSH 门禁文件不能是符号链接: {path}")
+    stopped_script = _stopped_host_ssh_guard_script(config, manifest).lstrip()
+    _atomic_text(nft_path, stopped_script, mode=0o644)
+    _atomic_text(
+        reload_path,
+        f"delete table inet {table}\n{stopped_script}",
         mode=0o644,
     )
-    _run([systemctl, "daemon-reload"])
-    _run([systemctl, "enable", unit_path.name])
+    _atomic_text(
+        runner_path,
+        _host_parent_guard_runner_script(nft, table, nft_path, reload_path),
+        mode=0o755,
+    )
+    _install_systemd_unit(
+        unit_path,
+        (
+            "[Unit]\n"
+            "Description=Controlled development machine host SSH guard\n"
+            "DefaultDependencies=no\n"
+            "After=local-fs.target\n"
+            "Before=network-pre.target docker.service\n\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            f"ExecStart={runner_path}\n"
+            "RemainAfterExit=yes\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        ),
+        systemctl=systemctl,
+    )
+
+
+def _install_systemd_unit(unit_path: Path, content: str, *, systemctl: str) -> None:
+    previous = unit_path.read_text(encoding="utf-8") if unit_path.exists() else None
+    if previous != content:
+        previous_mode = stat.S_IMODE(unit_path.stat().st_mode) if previous is not None else 0o644
+        _atomic_text(unit_path, content, mode=0o644)
+        try:
+            _run([systemctl, "daemon-reload"])
+        except Exception:
+            if previous is None:
+                unit_path.unlink()
+            else:
+                _atomic_text(unit_path, previous, mode=previous_mode)
+            raise
+    enabled = unit_path.parent / "multi-user.target.wants" / unit_path.name
+    if not enabled.is_symlink() or enabled.resolve() != unit_path.resolve():
+        _run([systemctl, "enable", "--no-reload", unit_path.name])
 
 
 def _host_parent_guard_runner_script(
@@ -1863,25 +2239,36 @@ def _apply_host_nft(table: str, script: str) -> None:
 
 def _configure_target_network(config: HostConfig, manifest: RuntimeManifest) -> None:
     target_pid = _service_pid(config, manifest, "target")
+    host_ssh_rule = ""
+    host_ssh_block = ""
+    if config.host_ssh.enabled:
+        host_address = _target_host_address(manifest)
+        host_ssh_rule = (
+            f"    ip daddr {host_address} "
+            f"tcp dport {config.host_ssh.port} accept\n"
+        )
+        host_ssh_block = f"    ip daddr {host_address} drop\n"
     _apply_nft(
         target_pid,
-        """
-table inet cdm_control {
-  set audit_tcp_ports { type inet_service; flags timeout; timeout 5s; }
-  set audit_dns_addresses { type ipv4_addr; flags timeout; timeout 5s; }
-  chain input {
+        f"""
+table inet cdm_control {{
+  set audit_tcp_ports {{ type inet_service; flags timeout; timeout 5s; }}
+  set audit_dns_addresses {{ type ipv4_addr; flags timeout; timeout 5s; }}
+  chain input {{
     type filter hook input priority filter; policy drop;
     iifname "lo" accept
     ct state established,related accept
-  }
-  chain output {
+  }}
+  chain output {{
     type filter hook output priority filter; policy drop;
     oifname "lo" accept
     ip daddr @audit_dns_addresses udp dport 53 accept
     ip daddr @audit_dns_addresses tcp dport 53 accept
+{host_ssh_rule.rstrip()}
+{host_ssh_block.rstrip()}
     tcp dport @audit_tcp_ports accept
-  }
-}
+  }}
+}}
 """,
     )
     _verify_nft_table(target_pid)
@@ -2020,13 +2407,15 @@ def _verify_nft_table(pid: int) -> None:
         raise DeploymentError("透明网络防火墙没有默认阻断")
 
 
-def _isolated_network(subnet: str) -> dict[str, Any]:
+def _isolated_network(subnet: str, *, host_access: bool = False) -> dict[str, Any]:
     return {
         "driver": "bridge",
         "internal": True,
         "enable_ipv6": False,
         "driver_opts": {
-            "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
+            "com.docker.network.bridge.gateway_mode_ipv4": (
+                "nat" if host_access else "isolated"
+            ),
             "com.docker.network.bridge.gateway_mode_ipv6": "isolated",
         },
         "ipam": {"config": [{"subnet": subnet}]},
@@ -2047,13 +2436,22 @@ def _upstream_network(subnet: str) -> dict[str, Any]:
     }
 
 
-def _bind(source: Path, target: str | Path, *, read_only: bool = True) -> dict[str, Any]:
+def _bind(
+    source: Path,
+    target: str | Path,
+    *,
+    read_only: bool = True,
+    propagation: str | None = None,
+) -> dict[str, Any]:
     return {
         "type": "bind",
         "source": str(source),
         "target": str(target),
         "read_only": read_only,
-        "bind": {"create_host_path": False},
+        "bind": {
+            "create_host_path": False,
+            **({"propagation": propagation} if propagation is not None else {}),
+        },
     }
 
 
@@ -2236,14 +2634,6 @@ def _require_policy_files(manifest: RuntimeManifest) -> None:
         raise DeploymentError("不可变策略快照与运行清单摘要不符")
     if active.digest() != manifest.policy_digest:
         raise DeploymentError("活动策略副本与运行清单摘要不符；重新执行 sandboxctl init")
-
-
-def _require_profile_sources(config: HostConfig, manifest: RuntimeManifest) -> None:
-    if not manifest.profile_source_digest:
-        return
-    _, current_digest = _profile_bundle(config, Path(manifest.repo_root))
-    if current_digest != manifest.profile_source_digest:
-        raise DeploymentError("宿主 profile 已变化；重新执行 sandboxctl init 后再启动")
 
 
 def _check_gpu_cdi(config: HostConfig) -> None:

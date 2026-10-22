@@ -38,8 +38,14 @@ upstream:
   # 只用于记录父代理配置来源；控制器不会启动或解析它。
   config_path:
 
-# 可选：每次 init 从本机读取这些文本配置，生成受控副本。
-# Claude 提示词会与沙箱网络约束合并；shell 和 Git 配置中的代理会被清除。
+# 可选：允许 target 容器通过目标网络网关访问宿主机 SSH；只放行该容器地址。
+host_ssh:
+  enabled: false
+  port: 10090
+
+# 可选：仅为缺失的日常配置提供 init 种子，已有文件不覆盖。
+# 用户配置保留为可写普通文件；共享 Home 中的现有配置直接共享。
+# Claude 账号目录独立；首次提示词可追加简短沙盒说明，不复制旧认证。
 # default_conda_env 是本机选择，不应在通用代码中写死。
 profile:
   # IANA 时区；按本机出口环境填写，发布默认不携带地域信息。
@@ -55,6 +61,19 @@ profile:
 # 直接把同名宿主 Home 挂到容器 Home。适合专用开发账号；容器内修改会立即写回宿主。
 workspace:
   share_host_home: false
+  # 仅适用于 share_host_home=true。来源由控制器放在 paths.persistent_home/.controlled-mounts，
+  # 父 Home 仍然完整共享，但这里列出的子目录会被单独覆盖。
+  controlled_mounts: []
+# 例如：
+# workspace:
+#   share_host_home: true
+#   controlled_mounts:
+#     - path: .claude
+#       access: rw
+#       seed: copy-if-empty
+#     - path: .codex
+#       access: rw
+#       seed: copy-if-empty
 
 # 可选：通过受控同号 relay 发布一个 TCP 端口段。0.0.0.0 会监听宿主所有 IPv4 接口。
 service_ports:
@@ -68,11 +87,16 @@ mounts: []
 #   - host_path: ~/project
 #     container_path: /home/alice/project
 #     access: rw
+#     # /data 等宿主挂载点需要让运行期间新增的子挂载进入容器时使用 rslave。
+#     # propagation: rslave
 #   - host_path: ~/.claude/skills
 #     container_path: /home/alice/.claude/skills
 #     access: rw
 #   - host_path: ~/.claude/agents
 #     container_path: /home/alice/.claude/agents
+#     access: rw
+#   - host_path: ~/.claude/commands
+#     container_path: /home/alice/.claude/commands
 #     access: rw
 #   - host_path: ~/.agents/skills
 #     container_path: /home/alice/.agents/skills
@@ -85,7 +109,7 @@ mounts: []
 #     access: rw
 #   - host_path: ~/.ssh
 #     container_path: /home/alice/.ssh
-#     access: ro
+#     access: rw
 #   - host_path: ~/.condarc
 #     container_path: /home/alice/.condarc
 #     access: rw
