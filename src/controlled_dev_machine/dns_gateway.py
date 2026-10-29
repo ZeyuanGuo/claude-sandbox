@@ -592,8 +592,18 @@ class DnsGateway:
         self._record_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._response_cache: OrderedDict[tuple[str, int], _CachedResponse] = OrderedDict()
+        # Bounded stripes collapse duplicate cold lookups without unbounded key state.
+        self._query_locks = tuple(threading.Lock() for _ in range(64))
 
     def resolve(self, packet: bytes, peer: str) -> bytes:
+        try:
+            name, query_type, _, _ = _checked_query(packet)
+        except Exception:
+            return self._resolve(packet, peer)
+        with self._query_locks[hash((name, query_type)) % len(self._query_locks)]:
+            return self._resolve(packet, peer)
+
+    def _resolve(self, packet: bytes, peer: str) -> bytes:
         record_written = False
         record: dict[str, object] = {
             "created_at": datetime.now(UTC).isoformat(),
@@ -617,16 +627,27 @@ class DnsGateway:
                 raise ValueError("DNS 域名未被当前策略放行")
             fallback = False
             fallback_reason: str | None = None
-            try:
-                response, headers = self.client.query(packet)
-            except Exception as exc:
-                cached = self._cached_response(name, query_type)
-                if cached is None:
-                    raise
+            cached = self._cached_response(name, query_type)
+            if cached is not None and (
+                cached.expires_at - self.lease_registry.expiry_grace_seconds > time.time()
+            ):
+                # Reuse only the fresh, validated answer. The existing cached
+                # response path keeps client TTL zero and never extends its lease.
                 response = packet[:2] + cached.response[2:]
                 headers = {}
                 fallback = True
-                fallback_reason = f"{type(exc).__name__}: {exc}"
+                fallback_reason = "fresh-validated-cache"
+            else:
+                try:
+                    response, headers = self.client.query(packet)
+                except Exception as exc:
+                    cached = self._cached_response(name, query_type)
+                    if cached is None:
+                        raise
+                    response = packet[:2] + cached.response[2:]
+                    headers = {}
+                    fallback = True
+                    fallback_reason = f"{type(exc).__name__}: {exc}"
             _, _, addresses, ttl = checked_response(packet, response)
             if fallback:
                 fallback_ttl = int(cached.expires_at - time.time())

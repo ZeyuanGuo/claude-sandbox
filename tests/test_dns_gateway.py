@@ -723,3 +723,62 @@ def test_dns_expired_during_audit_never_records_cached_allow(monkeypatch, tmp_pa
     assert records[-2]["action"] == "cached-pending"
     assert records[-1]["action"] == "servfail"
     assert all(record["action"] != "cached-allow" for record in records)
+
+
+def test_fresh_cache_collapses_parallel_queries_and_audits_each_client(tmp_path):
+    import time
+    query, response = _response('93.184.216.34')
+    class Client:
+        calls = 0
+        def query(self, packet):
+            self.calls += 1
+            time.sleep(0.03)
+            return packet[:2] + response[2:], {}
+    client = Client()
+    path = tmp_path / 'parallel.jsonl'
+    gateway = DnsGateway(client, path, allow_public_domains=True)
+    queries = [struct.pack('!H', i) + query[2:] for i in range(24)]
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        replies = list(pool.map(lambda packet: gateway.resolve(packet, '192.0.2.10'), queries))
+    assert client.calls == 1
+    assert len(path.read_text().splitlines()) == len(queries)
+    for request, reply in zip(queries, replies):
+        assert reply[:2] == request[:2]
+        assert checked_response(request, reply)[2] == ('93.184.216.34',)
+
+
+def test_fresh_cache_does_not_extend_original_lease(monkeypatch, tmp_path):
+    now = 1000.0
+    monkeypatch.setattr('controlled_dev_machine.dns_gateway.time.time', lambda: now)
+    query, response = _response('93.184.216.34')
+    class Client:
+        calls = 0
+        def query(self, packet):
+            self.calls += 1
+            return response, {}
+    client = Client()
+    registry = LeaseRegistry(expiry_grace_seconds=60)
+    gateway = DnsGateway(client, tmp_path / 'expiry.jsonl', lease_registry=registry, allow_public_domains=True)
+    gateway.resolve(query, '192.0.2.10')
+    now = 1050.0
+    reply = gateway.resolve(query, '192.0.2.10')
+    assert client.calls == 1
+    assert checked_response(query, reply)[3] == 0
+    now = 1120.0
+    assert registry.authorize('example.com', '93.184.216.34') is None
+
+
+def test_fresh_cache_still_checks_current_domain_policy(tmp_path):
+    query, response = _response('93.184.216.34')
+    class Client:
+        calls = 0
+        def query(self, packet):
+            self.calls += 1
+            return response, {}
+    client = Client()
+    gateway = DnsGateway(client, tmp_path / 'policy.jsonl', allow_public_domains=True)
+    gateway.resolve(query, '192.0.2.10')
+    gateway.allow_public_domains = False
+    denied = gateway.resolve(query, '192.0.2.10')
+    assert struct.unpack('!H', denied[2:4])[0] & 0x000F == 2
+    assert client.calls == 1
