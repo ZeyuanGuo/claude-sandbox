@@ -211,6 +211,30 @@ rules: []
     )
 
 
+def test_gpu_fallback_removes_injection_but_preserves_security_and_image(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    fallback = replace(config, gpu=replace(config.gpu, mode="none"))
+    manifest = _manifest(config, tmp_path)
+    original = render_closed_compose(config, manifest)
+    changed = render_closed_compose(fallback, manifest)
+    assert changed["services"]["target"]["devices"] == []
+    assert changed["services"]["target"]["environment"]["NVIDIA_VISIBLE_DEVICES"] == "void"
+    changed["services"]["target"]["devices"] = original["services"]["target"]["devices"]
+    changed["services"]["target"]["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
+    assert changed == original
+    assert _target_build_digest(config, Path.cwd()) == _target_build_digest(fallback, Path.cwd())
+
+
+def test_gpu_fallback_does_not_query_or_require_host_driver(tmp_path: Path, monkeypatch) -> None:
+    config = _host_config(tmp_path)
+    fallback = replace(config, gpu=replace(config.gpu, mode="none"))
+    def unexpected(*args, **kwargs):
+        raise AssertionError("CPU fallback must not query the GPU driver")
+    monkeypatch.setattr(runtime.shutil, "which", unexpected)
+    monkeypatch.setattr(runtime, "_run", unexpected)
+    runtime._check_gpu_cdi(fallback)
+
+
 def test_target_has_no_publication_or_audit_mount(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
     compose = render_closed_compose(config, _manifest(config, tmp_path))

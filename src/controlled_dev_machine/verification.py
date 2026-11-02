@@ -138,8 +138,17 @@ def run_closed_gate(config: HostConfig, *, timeout_seconds: float = 15.0) -> dic
     # zero-upstream-packet capture so a delayed FIN/ACK cannot pollute them.
     checks.append(_run_upstream_isolation(config, manifest))
 
-    flow_path = config.paths.audit / "plaintext" / "flows.mitm"
-    if not flow_path.is_file() or flow_path.stat().st_size == 0:
+    plaintext_dir = config.paths.audit / "plaintext"
+    flow_candidates = []
+    if plaintext_dir.is_dir():
+        flow_candidates = sorted(plaintext_dir.glob("flows-*.mitm"))
+    flow_candidates.append(plaintext_dir / "flows.mitm")
+    flow_path = next(
+        (candidate for candidate in reversed(flow_candidates)
+         if candidate.is_file() and candidate.stat().st_size > 0),
+        None,
+    )
+    if flow_path is None:
         raise DeploymentError("封闭门禁未发现明文流量文件")
     checks.append({"name": "plaintext-flow-present", "ok": True, "bytes": flow_path.stat().st_size})
     audit = audit_status(config)

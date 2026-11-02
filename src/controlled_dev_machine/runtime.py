@@ -1011,7 +1011,7 @@ def render_closed_compose(
                 "--set",
                 "termlog_verbosity=info",
                 "-w",
-                "/audit/plaintext/flows.mitm",
+                "/audit/plaintext/flows-%Y%m%d-%H.mitm",
                 "-s",
                 "/opt/cdm/gateway/cdm_addon.py",
             ],
@@ -1099,7 +1099,7 @@ def render_closed_compose(
                 "NODE_OPTIONS": "--use-system-ca",
                 "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
                 "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
-                "NVIDIA_VISIBLE_DEVICES": "all",
+                "NVIDIA_VISIBLE_DEVICES": "all" if config.gpu.mode == "all" else "void",
                 "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
                 **(
                     {"CDM_DEFAULT_CONDA_ENV": config.profile.default_conda_env}
@@ -1112,7 +1112,7 @@ def render_closed_compose(
                     else {}
                 ),
             },
-            "devices": ["nvidia.com/gpu=all"],
+            "devices": ["nvidia.com/gpu=all"] if config.gpu.mode == "all" else [],
             "extra_hosts": target_extra_hosts,
             "volumes": [
                 _bind(
@@ -2637,6 +2637,8 @@ def _require_policy_files(manifest: RuntimeManifest) -> None:
 
 
 def _check_gpu_cdi(config: HostConfig) -> None:
+    if config.gpu.mode == "none":
+        return
     if config.gpu.mode != "all":
         raise DeploymentError(f"不支持的 GPU 模式: {config.gpu.mode}")
     if shutil.which("nvidia-ctk") is None:
@@ -2786,10 +2788,12 @@ def _start_audit(
                 "-Z",
                 "root",
                 "-w",
-                "-",
+                str(pcap_root / "target-%Y%m%d-%H%M%S.pcap"),
+                "-G",
+                "3600",
             ],
             pcap_root / "target.tcpdump.log",
-            pcap_root / "target.pcap",
+            None,
         ),
         (
             "gateway-pcap",
@@ -2811,10 +2815,12 @@ def _start_audit(
                 "-Z",
                 "root",
                 "-w",
-                "-",
+                str(pcap_root / "gateway-%Y%m%d-%H%M%S.pcap"),
+                "-G",
+                "3600",
             ],
             pcap_root / "gateway.tcpdump.log",
-            pcap_root / "gateway.pcap",
+            None,
         ),
         (
             "dns-pcap",
@@ -2836,10 +2842,12 @@ def _start_audit(
                 "-Z",
                 "root",
                 "-w",
-                "-",
+                str(pcap_root / "dns-%Y%m%d-%H%M%S.pcap"),
+                "-G",
+                "3600",
             ],
             pcap_root / "dns.tcpdump.log",
-            pcap_root / "dns.pcap",
+            None,
         ),
         (
             "target-connect-ebpf",

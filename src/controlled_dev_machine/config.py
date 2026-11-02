@@ -344,8 +344,8 @@ def load_host_config(path: Path) -> HostConfig:
 
     gpu_raw = _mapping(root.get("gpu", {"mode": "all"}), "gpu")
     gpu_mode = _string(gpu_raw.get("mode", "all"), "gpu.mode")
-    if gpu_mode != "all":
-        raise ConfigError("gpu.mode 当前只允许 all；不启用 GPU 不符合本项目边界")
+    if gpu_mode not in {"all", "none"}:
+        raise ConfigError("gpu.mode 只允许 all 或 none")
     gpu = GpuConfig(mode=gpu_mode)
 
     storage_raw = _mapping(root.get("storage"), "storage")

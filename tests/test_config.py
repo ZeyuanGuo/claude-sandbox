@@ -364,14 +364,20 @@ service_ports:
         load_host_config(path)
 
 
-def test_gpu_mode_cannot_disable_required_gpu_visibility(tmp_path: Path) -> None:
+def test_gpu_mode_can_explicitly_disable_failed_gpu_injection(tmp_path: Path) -> None:
     path = _config(tmp_path).read_text(encoding="utf-8")
     invalid = tmp_path / "invalid-gpu.yaml"
     invalid.write_text(
         path.replace("docker:\n", "gpu:\n  mode: none\n\ndocker:\n"), encoding="utf-8"
     )
+    assert load_host_config(invalid).gpu.mode == "none"
+
+
+def test_gpu_mode_rejects_unknown_mode(tmp_path: Path) -> None:
+    path = _config(tmp_path)
+    path.write_text(path.read_text().replace("docker:\n", "gpu:\n  mode: auto\n\ndocker:\n"))
     with pytest.raises(ConfigError, match="gpu.mode"):
-        load_host_config(invalid)
+        load_host_config(path)
 
 
 def test_only_one_fixed_instance_is_supported_per_user(tmp_path: Path) -> None:
