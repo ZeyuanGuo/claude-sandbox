@@ -193,6 +193,13 @@ class ControlledReviewAddon:
             )
             return
         if destination_error is not None:
+            if destination_error == "controlled DNS resolution failed":
+                # A resolver timeout is a transient network condition, not a verdict
+                # about the request. Abort the flow so the client sees a reset and
+                # retries, instead of an HTTP error it may treat as authoritative.
+                ctx.log.warn("controlled DNS resolution failed; aborting flow as transient")
+                flow.kill()
+                return
             flow.response = _blocked("invalid-destination", destination_error)
             return
         view = HttpRequestView(
