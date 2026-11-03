@@ -27,6 +27,15 @@ sudo apt-get install -y python3 python3-yaml nftables iproute2 util-linux \
   tcpdump bpftrace skopeo curl openssl
 ```
 
+父代理是本项目的外部前置条件，不由 `sandboxctl` 安装。部署者应先让一个支持 HTTPS `CONNECT` 的 HTTP 代理只监听宿主 `127.0.0.1:26940`，并确认它使用期望的公网出口。代理可以由 Clash 或其他实现提供；本项目只连接端口，不解析代理自己的 YAML，也不把代理地址暴露给目标容器。
+
+```bash
+curl --fail --silent --show-error \
+  --proxy http://127.0.0.1:26940 https://api.ipify.org
+```
+
+输出必须落在随后配置的 `upstream.expected_exit_cidr` 内。只有一个固定出口时，把实际输出追加 `/32`；只有 VPN 服务明确保证一段地址池时才填写较大的 CIDR。真实出口属于主机私有配置，不能写入仓库。若父代理需要本地配置文件，可把路径写入 `upstream.config_path` 作为存在性检查；控制器不会用它启动父代理。
+
 ### 2. 取得固定代码
 
 从发布仓库克隆后切到明确的 release tag 或 commit，不使用会移动的分支名作为部署依据：
@@ -34,48 +43,13 @@ sudo apt-get install -y python3 python3-yaml nftables iproute2 util-linux \
 ```bash
 git clone https://github.com/ZeyuanGuo/claude-sandbox.git "$HOME/claude-sandbox"
 cd "$HOME/claude-sandbox"
-release_ref=REPLACE_WITH_RELEASE_TAG_OR_COMMIT
-git checkout "$release_ref"
+git checkout <RELEASE_TAG_OR_COMMIT>
 git status --short
 ```
 
-发布方需记录 commit、策略摘要以及构建后两个镜像的内容摘要。
+当前仓库若尚未配置私有 remote，只能完成本机构建，不能声称已经发布。发布方需记录 commit、策略摘要以及构建后两个镜像的内容摘要。
 
-### 3. 配置固定出口父代理
-
-父代理是本项目的外部前置条件，不由 `sandboxctl` 安装。部署者应先让一个支持 HTTPS `CONNECT` 的 HTTP 代理监听宿主 `11450`，并确认它使用期望的公网出口。DNS 和网关从 Docker 内部桥访问宿主，因此父代理必须监听该桥可达的地址；示例使用 `0.0.0.0`。安全边界由 `sandboxctl` 安装的宿主 nftables 提供：运行时只允许回环及本实例 DNS/网关的固定源地址，停止时只允许回环，其他容器、LAN 和外部来源均被拒绝。代理可以由 Mihomo、Clash 或其他实现提供；父代理必须全局使用指定出口，出口失效时直接失败，不能回退到其他代理或直连。
-
-仓库提供了脱敏的 [`examples/mihomo-11450.example.yaml`](../examples/mihomo-11450.example.yaml)：`11450` 的唯一规则指向固定出口节点，该节点再通过 `dialer-proxy` 使用商业 VPN 作为第一跳。把模板复制到宿主私有目录、填入两级节点参数并设为 `0600`；不要把真实服务器、账号或密码提交到 Git。模板中的 `allow-lan: true` 只用于让 Docker 内部桥可达，不能代替上述 nftables 门禁。使用其他父代理实现时也必须保持“唯一最终出口、失败即失败”的结构。
-
-下面是仓库验收过的 amd64 参考部署。Mihomo 固定为 `v1.18.3`，解压后程序的 SHA-256 是 `6a31325951db7ed8bb42f484fa4c5c4dc02d06488a4cb25f810e8ecb0245163d`：
-
-```bash
-mihomo_root="$HOME/.local/share/claude-sandbox/mihomo"
-mihomo_config="$HOME/.config/claude-sandbox/mihomo-11450.yaml"
-install -d -m 700 "$mihomo_root" "$(dirname "$mihomo_config")"
-curl -fsSL \
-  https://github.com/MetaCubeX/mihomo/releases/download/v1.18.3/mihomo-linux-amd64-compatible-v1.18.3.gz \
-  | gzip -dc > "$mihomo_root/mihomo"
-chmod 700 "$mihomo_root/mihomo"
-printf '%s  %s\n' \
-  6a31325951db7ed8bb42f484fa4c5c4dc02d06488a4cb25f810e8ecb0245163d \
-  "$mihomo_root/mihomo" | sha256sum --check --strict
-install -m 600 examples/mihomo-11450.example.yaml "$mihomo_config"
-```
-
-填好私有配置后先检查并安装用户服务，但先不要启动：
-
-```bash
-"$mihomo_root/mihomo" -t -d "$mihomo_root" -f "$mihomo_config"
-install -Dm644 examples/mihomo-11450.service \
-  "$HOME/.config/systemd/user/claude-sandbox-mihomo.service"
-systemctl --user daemon-reload
-```
-
-不要在 `sandboxctl guard` 之前启动这个服务。父代理配置、程序和运行数据都位于用户目录；迁移时只需重新下载已校验程序并放入该主机自己的私有配置，不复制凭据到仓库。
-示例服务每次启动前都会确认当前用户 `main` 实例的系统级门禁已经 active；门禁安装失败或开机恢复失败时，父代理保持启动失败，不会绑定 `11450`。
-
-### 4. 生成本机配置
+### 3. 生成本机配置
 
 普通用户执行：
 
@@ -84,24 +58,21 @@ cd "$HOME/claude-sandbox"
 bin/sandboxctl config init
 ```
 
-`config init` 从实际系统账号填写用户名、UID、GID 和 Home，拒绝覆盖已有文件。它创建宿主 `~/claude_code_config`，以仓库中的 `config/claude/CLAUDE.md` 初始化全局提示词，并创建设置、规则、skills 和 agents 的独立入口；这些项目分别读写挂载到容器 `~/.claude` 下。它不会创建或挂载宿主 `~/.claude`，Claude 的账号、会话、历史、插件和设备状态只保留在沙箱持久 Home。
-
-生成器还会自动创建 `~/.codex`（不存在时）并以读写方式挂载整棵目录；Codex CLI 首次登录后的状态直接保存在宿主该目录。它在源文件安全且实际存在时接入常用 shell、Git、tmux、`~/.agents/skills`、`~/.config/git`、`~/.ssh`、`~/.local/share/gamma-ssh` 和 `~/.condarc`。Git、skills、agents 和 Conda 配置读写；SSH 配置和关键凭据保持只读。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
+`config init` 从实际系统账号填写用户名、UID、GID 和 Home，拒绝覆盖已有文件。它会自动创建 `~/.codex`（不存在时）并以读写方式挂载整棵目录；Codex CLI 随目标镜像安装，首次登录后状态直接保存在宿主该目录。它还会在源文件安全且实际存在时接入常用 shell/Git/tmux/Claude 文本配置，并同路径挂载现有 Claude skills、agents、`~/.config/git`、`~/.ssh` 和 `~/.condarc`。这些日常配置目录读写，包括 SSH 配置、known_hosts 和用户凭据，保留用户原有属主与权限。它不会挂载整棵宿主 `~/.claude`，Claude 的账号、会话和设备状态保留在沙箱持久 Home。生成器不知道这台服务器的真实出口，因此 `expected_exit_cidr` 初始留空，填写前配置不会通过校验。
 
 默认通用挂载由仓库中的 `config init` 固定生成；只有源路径实际存在时才加入：
 
 | 宿主路径 | 容器路径 | 权限 | 用途 |
 |---|---|---|---|
-| `~/claude_code_config/CLAUDE.md` | `~/.claude/CLAUDE.md` | 读写 | Claude 全局提示词 |
-| `~/claude_code_config/settings.json`、`rules`、`skills`、`agents` | `~/.claude` 下对应路径 | 读写 | Claude 的共享行为配置 |
 | `~/.codex` | 同路径 | 读写 | Codex 配置、登录状态、会话和 skills |
-| `~/.agents/skills` | 同路径 | 读写 | Codex 可见的通用 skills |
+| `~/.claude/skills`、`~/.claude/agents`、`~/.agents/skills` | 同路径 | 读写 | Claude/Codex 可见的通用 skills 与 agents |
 | `~/.config/git` | 同路径 | 读写 | Git 凭据存储和配置数据库 |
-| `~/.ssh` | 同路径 | 只读 | 日常 SSH 配置和密钥 |
-| `~/.local/share/gamma-ssh` | 同路径 | 只读 | SSH `Include` 的主机配置、密钥和 `known_hosts` |
+| `~/.ssh` | 同路径 | 读写 | 日常 SSH 配置、known_hosts 和密钥 |
 | `~/.condarc` | 同路径 | 读写 | Conda 配置 |
 
-`CLAUDE.md` 和上表中的 Claude 行为配置直接读写同步；`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 仍由 `init` 生成受控只读副本。宿主不设置 `CLAUDE_CONFIG_DIR`，默认 `~/.claude` 也不作为挂载源，所以宿主直接运行 Claude Code 时不会自动读取容器配置。Claude 凭据、会话数据库和其他运行状态留在持久 Home。项目目录、Conda 根目录和其他大型数据目录属于主机特定配置，由操作者在 `host.yaml` 中追加。
+`profile` 中的 `.claude/CLAUDE.md`、`.bashrc`、`.profile`、`.gitconfig` 和 `.tmux.conf` 仅作为缺失文件的 `init` 种子，不覆盖已有内容，不以只读单文件挂载限制日常编辑。共享 Home 的普通配置直接共享；Claude 的主指令和设置仍位于独立可写目录，可引用共同的非认证规则。编辑器以临时文件加原子 rename 保存后，内容仍应在重建后保留；不得在恢复时重新覆盖用户修改。项目目录、Conda 根目录和其他大型数据目录属于主机特定配置，由操作者在 `host.yaml` 中追加。
+
+可编辑配置不等于可编辑控制面。CA、machine-id、解析器、审计及网络控制组件仍由控制器管理并保持只读；Claude 旧账号的已识别归档继续隔离，不因开放 SSH 或日常配置而重新暴露。共享 Home 已覆盖的普通目录无需重复挂载；Home 外的 SSH Include 依赖需按实际路径单独接入可写目录，而不是只挂一个不能原子替换的配置文件。
 
 然后编辑 `~/.config/controlled-dev-machine/host.yaml`：
 
@@ -111,20 +82,11 @@ bin/sandboxctl config init
 - 删除不希望交给目标软件的凭据挂载；
 - 确认持久 Home、状态、审计目录和存储保留线；
 - 确认父代理端口与 `expected_exit_cidr`。
-
-需要让容器复用宿主 SSH 配置时，确认宿主 `~/.ssh/config` 能通过 `Include` 找到 `~/.local/share/gamma-ssh/config`，并把对应的 `id_ed25519` 与 `known_hosts` 保持在该目录。只在明确需要时启用下面的精确 Tailscale 路径：
-
-```yaml
-ssh:
-  enabled: true
-  interface: tailscale0
-  allowed_addresses:
-    - 100.72.7.86
-    - 100.117.92.79
-  ports: [22, 10090]
-```
-
-`ssh.allowed_addresses` 只能填写 `100.64.0.0/10` 中、已经从宿主逐一验证过的地址；不能填写整个网段或公网地址。先在宿主用 `ssh -G <主机别名>` 检查最终 HostName、端口、用户、密钥和 `ProxyJump`，再用短命令 `ssh -o BatchMode=yes -o ConnectTimeout=5 <主机别名> true` 验证登录。SSH 开关、接口、地址和端口会写入运行清单快照；只改 `host.yaml` 不会改变当前运行实例，`recover` 和 `audit restart` 也继续使用旧快照。用户确认可以中断后，使用当前策略执行 `stop -> init --policy <当前策略> -> build -> start`。控制器源码属于构建摘要输入，因此即使 SSH 转发不向镜像新增文件，这次代码更新后仍必须重新构建。随后从容器分别验证宿主 SSH 和已登记 Tailscale 目标，并确认未登记地址仍失败。
+- 专用账号需要透明复用整棵 Home 时设置 `workspace.share_host_home: true`，并把 `paths.state`、`paths.audit` 放到共享 Home 之外；
+- 如果需要整棵 Home 透明共享、但把 Claude/Codex 或其他目录交给控制器单独管理，在同一段配置中增加 `workspace.controlled_mounts`。每项只填写相对 Home 的 `path`、`access` 和可选的 `seed`；受控源目录由控制器放在 `paths.persistent_home/.controlled-mounts`，不会再作为宿主 Home 的普通路径暴露。首次使用 `seed: copy-if-empty` 会从现有宿主目录种子，之后容器写入只进入受控源；父 Home 的原目录仍保留，便于核对或回滚；
+- 需要让宿主与沙箱共用 skills、agents 或 commands 时，将这些目录作为普通 `mounts` 显式挂到受控 `.claude` 的同名严格子路径。挂载顺序会保留受控父目录中的账号和会话状态，同时以读写子挂载覆盖所列的非凭据目录；不要穿透 `.credentials.json`、`settings.json` 或整个 `.claude`；
+- `/data` 等包含宿主子挂载的目录可在普通 `mounts` 项中设置 `propagation: rslave`。这会把宿主运行期间新出现的子挂载传入容器，但不把容器侧挂载反向传回宿主；
+- 需要从宿主访问容器服务时填写 `service_ports`，端口段必须在 `1024-65535` 内且最多 1024 个端口。
 
 编辑完成后再校验：
 
@@ -149,8 +111,6 @@ sudo bin/sandboxctl --config /absolute/path/host.yaml doctor --json
 sudo bin/sandboxctl --config /absolute/path/host.yaml storage plan
 sudo bin/sandboxctl --config /absolute/path/host.yaml init \
   --policy policies/strict/0002-claude-account.yaml
-sudo bin/sandboxctl --config /absolute/path/host.yaml guard
-# 先按本机情况设置 HTTP_PROXY/HTTPS_PROXY/NO_PROXY
 sudo -E bin/sandboxctl --config /absolute/path/host.yaml build
 sudo bin/sandboxctl --config /absolute/path/host.yaml start
 sudo bin/sandboxctl --config /absolute/path/host.yaml verify-closed
@@ -158,93 +118,24 @@ sudo bin/sandboxctl --config /absolute/path/host.yaml verify-closed
 
 这套显式路径主要用于迁移预检或故障恢复。正常部署仍使用下节的默认路径；同一用户不要同时启动两个实例。
 
-### 5. 预检、构建和启动
+### 4. 预检、构建和启动
 
 首次部署从严格策略开始：
 
 ```bash
-sudo bin/sandboxctl init --policy policies/strict/0002-claude-account.yaml
-sudo bin/sandboxctl guard
-systemctl --user start claude-sandbox-mihomo.service
-curl --fail --silent --show-error \
-  --proxy http://127.0.0.1:11450 https://api.ipify.org
 sudo bin/sandboxctl doctor --json
 sudo bin/sandboxctl storage plan
-HOST_BUILD_PROXY=http://127.0.0.1:11400  # 按本机实际构建代理修改
-export HTTP_PROXY="$HOST_BUILD_PROXY"
-export HTTPS_PROXY="$HTTP_PROXY"
-export NO_PROXY=127.0.0.1,localhost
+sudo bin/sandboxctl init --policy policies/strict/0002-claude-account.yaml
 sudo -E bin/sandboxctl build
-unset HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy
-sudo bin/sandboxctl start
-sudo bin/sandboxctl verify-closed
-systemctl --user enable claude-sandbox-mihomo.service
-sudo bin/sandboxctl automation install
-```
-
-`guard` 在父代理启动前安装并启用持久 nftables 门禁，此时 `11450` 只允许宿主回环访问；正式 `start` 才原子加入本实例 DNS 和网关的固定来源。这样首次部署也不会在两条命令之间向 LAN、外部或其他容器暴露代理。出口探测结果必须落在 `upstream.expected_exit_cidr` 内；固定出口填写精确 `/32`。`doctor` 任一 `blocked` 都要先修复。`init`、`guard`、`build`、`start` 和 `stop` 对同一实例互斥；运行中执行这些命令会直接拒绝，避免活动容器、门禁、`current` 清单和镜像标签分叉。
-
-基础镜像固定上游 digest，并由 `skopeo` 导入本机 Docker。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 同时核对源码、清单、策略、profile、镜像标签和 image ID。同一标签被重新构建成不同内容时会拒绝启动。构建阶段使用宿主网络；`sudo -E` 会把当前命令已有的标准代理变量临时交给 BuildKit，因此 `127.0.0.1` 上的宿主代理可直接使用。代理值不写入生成的 Compose、镜像或目标运行环境。容器启动后仍没有代理变量，运行流量只走 `11450`。
-
-`start` 会再次核对父代理门禁，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不发布端口，不挂 Docker socket；全部 GPU 可见但不设置独占模式。canary CA 和服务端证书有效期为 30 天；每次 `start` 在证书剩余有效期不足 7 天时先原子更新，再启动容器。
-
-### 重启后快速诊断
-
-重启、断网或 Claude 窗口仍在但请求失败时，先只运行这一条命令：
-
-```bash
-sudo bin/sandboxctl doctor
-```
-
-它在只读模式下检查宿主前置条件、运行清单与代码摘要、镜像内容、四个容器、systemd 自动化、父代理、基础审计、三处 PCAP、目标容器内的 `ping0.cc` 与 `api.anthropic.com` DNS/HTTPS，以及 Claude 版本和登录状态。每个非通过项会同时显示事实和下一条建议命令；机器或后续工具读取结构化结果时使用 `sudo bin/sandboxctl doctor --json`。该命令不会重启、重建、清理或修改正在运行的容器。
-
-优先按诊断项执行最小修复：
-
-```bash
-# 容器仍在运行，只是基础审计失活或目标网络被 watchdog 收回
-sudo bin/sandboxctl audit restart
-
-# 不确定容器是否被 Docker 保留；由 recover 自动选择启动或只恢复审计
-sudo bin/sandboxctl recover
-
-# 父代理用户服务未 active
-systemctl --user restart claude-sandbox-mihomo.service
-
-# 自动启动或审计轮转 unit 未启用
-sudo bin/sandboxctl automation install
-```
-
-`audit restart` 只作用于当前实例：它不停止或重建容器，不接触其他用户的进程；只有四个服务都已运行且 DNS、网关、canary healthy 时才会执行。源码、策略或镜像摘要不一致时，doctor 会把它标为“下次启动前需重建”；届时在确认当前任务可以中断后再执行 `stop -> init -> build -> start`。完整网络门禁验收仍需显式运行 `sudo bin/sandboxctl verify-closed`，doctor 不会自动运行这项可能耗时较长的检查。
-
-只有首次 `verify-closed` 和实际开发环境检查均通过后才运行 `automation install`。该命令写入并启用本实例的 systemd 自动启动单元和审计轮转定时器，但不会立即启动或重启任何服务。下次开机时，系统级单元先恢复用户服务、检查父代理，再调用 `recover`：容器已被 Docker 保留时只恢复审计和目标网络，容器不存在时才走完整 `start`；任一前置检查失败都会停止启动。轮转定时器每 15 分钟调用一次 `storage rotate`。安装后可只读检查配置，不要在生产中的实例上手动启动这些单元：
-
-```bash
-systemctl is-enabled cdm-u$(id -u)-main.service \
-  cdm-u$(id -u)-main-audit-rotate.timer
-systemctl status cdm-u$(id -u)-main.service \
-  cdm-u$(id -u)-main-audit-rotate.timer --no-pager
-```
-
-### 更换父代理或固定出口
-
-父代理地址、端口和期望出口只属于运行配置，不属于目标或网关镜像。先保留旧配置并停止当前沙箱和旧父代理；确认两者都已停止后，再修改父代理私有配置与 `host.yaml`：
-
-```bash
-sudo bin/sandboxctl stop
-systemctl --user stop claude-sandbox-mihomo.service
-# 现在修改父代理私有配置和 host.yaml
-bin/sandboxctl config validate
-current_policy=policies/daily/0001-public-web.yaml  # 按当前策略修改
-sudo bin/sandboxctl init --policy "$current_policy"
-sudo bin/sandboxctl guard
-systemctl --user start claude-sandbox-mihomo.service
-curl --fail --silent --show-error \
-  --proxy http://127.0.0.1:11450 https://api.ipify.org
 sudo bin/sandboxctl start
 sudo bin/sandboxctl verify-closed
 ```
 
-不要为这类改动执行 `build`。只有 `start` 明确报告目标或网关镜像缺失、构建输入变化或内容摘要不符时，才在停止状态运行 `sudo -E bin/sandboxctl build`，然后重新启动。固定出口填精确 `/32`；启动时控制器会通过父代理查询公网地址，不匹配即拒绝启动。
+`doctor` 任一 `blocked` 都要先修复。`init`、`build`、`start` 和 `stop` 对同一实例互斥；运行中执行 `init` 或 `build` 会直接拒绝，避免活动容器、`current` 清单和镜像标签分叉。
+
+基础镜像固定上游 digest，优先由 `skopeo` 导入本机 Docker；旧版 skopeo 与 Docker Engine API 不兼容时自动回退到同一 digest 的 Docker CLI pull，再以 immutable image ID 打标签。目标和网关镜像名称包含各自构建输入摘要，镜像内也保存同一摘要。`build` 还把实际 Docker image ID 写入 root-only 的 `paths.state/images/`；同一构建摘要如果已有不同 image ID，构建会拒绝覆盖记录。`start` 核对源码、运行清单、策略、镜像标签和 image ID；用户日常配置不属于不可变运行 profile，正常编辑不应触发源文件漂移拒绝。同一标签被重新构建成不同内容时会拒绝启动。构建时如需代理，只给当前构建命令设置 `HTTP_PROXY`/`HTTPS_PROXY`，这些变量不会写入目标运行环境。
+
+`start` 安装本实例的宿主 nftables 父代理门禁和 systemd 恢复单元，再创建没有直接公网路由的目标、DNS、网关和 canary。目标容器不挂 Docker socket；只有配置了 `service_ports` 时才启动同号 TCP relay。relay 先在宿主命名空间监听声明端口，再进入目标网络命名空间连接 `127.0.0.1:同号端口`，并以无补充组的 `65534:65534` 运行；不会为目标网络接口增加入站放行。全部 GPU 可见但不设置独占模式。
 
 `verify-closed` 证明网络门禁和审计路径，不等于项目环境、Claude 登录或真实开发任务已经可用。新主机还要进入 shell 检查实际路径：
 
@@ -274,7 +165,7 @@ sudo bin/sandboxctl shell
 sudo bin/sandboxctl root-shell
 ```
 
-`shell` 和 `root-shell` 会自动把调用端非空的 `TERM` 和 `COLORTERM` 传入容器，使交互 shell、彩色提示符和全屏 TUI 使用当前终端的能力。用户不需要另外导出终端变量；非交互探针仍使用独立的无 TTY 执行路径。
+`shell` 和 `root-shell` 会自动把宿主调用端的 `TERM` 以及非空的 `COLORTERM` 传入交互 shell，使容器使用与当前终端一致的颜色和 TUI 能力。调用端没有可用终端声明、声明为 `dumb`/`unknown`，或只有 8 色的 `xterm` 时，入口会内建回退到镜像已提供 terminfo 的 `xterm-256color`；用户不需要导出变量、重载 `.bashrc` 或增加启动参数。非交互探针不注入这些变量。若显示异常，再在宿主和容器内分别检查 `printf '%s %s\n' "$TERM" "$COLORTERM"` 与 `tput colors`。
 
 停止整套环境：
 
@@ -342,3 +233,27 @@ sudo bin/sandboxctl storage plan
 - 审计日志可独立归档，但不复制活动 runtime、CA 私钥、nftables 状态或 systemd 运行文件。
 
 目标机重新执行 `doctor -> init -> build -> start -> verify-closed`，再验证 Python/GPU/Git/Claude 真实任务。只有这些新证据通过，才能说该服务器复现成功；源服务器的运行编号和测试结论不能直接继承。
+
+## 多台服务器共享项目
+
+项目文件可以放在共同的 NFS 目录，各台服务器仍分别运行自己的 Docker、策略网关和审计。共享的是文件内容；保存文件不会更新已经构建的镜像，也不会重启已有容器。主机实际 UID/GID、挂载、GPU、出口和完整网络门禁需要逐机验证。
+
+共享 Home 时，将主机配置放在各机本地 `/etc/controlled-dev-machine/<用户名>/host.yaml`，再让共享的 `~/.config/controlled-dev-machine/host.yaml` 成为指向该绝对路径的符号链接。相同链接在每台服务器上解析到各自本地文件，原有 `bin/sandboxctl` 入口与显式 `--config` 用法保持一致。配置中的用户名、UID/GID、Home 必须匹配所在服务器。
+
+| 内容 | 存放与更新方式 |
+| --- | --- |
+| 项目源码、Dockerfile、通用策略、文档 | NFS 上一份共享目录；本地磁盘副本可通过 Unison 双向同步 |
+| `host.yaml`、控制器 Python | 每机本地；入口在存在时优先使用 `/opt/controlled-dev-machine/venv/bin/python`，`CDM_PYTHON` 可显式指定 |
+| Docker 镜像、容器、网络、CDI | 每机独立；相同构建输入可导出、导入镜像，并在目标机核对两个镜像的内容 ID |
+| `paths.state`、`paths.audit`、CA、受控 Home | 每机本地、位于共享 Home 和项目挂载之外；由所在主机单独管理 |
+| Git 提交、分支、暂存区 | 本地与 NFS 副本各自管理；文件同步排除 `.git`，发布版本由 Git 显式对齐 |
+
+Unison 同步的范围应限定为登记的项目，排除虚拟环境、缓存、运行状态和审计目录。冲突不设置自动优先来源；同一文件两端均被修改时保留各自内容，核对后合并。定时器的间隔从上次同步结束开始计算，网络中断时变更留在原端，恢复连接后再同步。同步范围、服务名称、日志和停用命令记录在各次主机部署记录中。
+
+更新共享源码后，各机分别停止、重新生成配置、构建、启动和验收。在其他机器上仍有任务运行时，它们继续使用原镜像；这属于待部署变更，不能以文件摘要相同代替镜像与运行验证。复用导出的镜像前核对完整构建摘要，导入后核对 image ID，再在该机独立登记镜像记录；运行清单、CA 和活动审计文件由目标机重新生成。
+
+由 systemd 管理的实例必须通过所在服务停止和启动，例如 `systemctl stop cdm-gzy.service -> sandboxctl init --policy <策略> -> sandboxctl build -> systemctl start cdm-gzy.service -> sandboxctl verify-closed`；未使用服务管理的实例才直接使用 `sandboxctl stop/start`。不要在 `RemainAfterExit=yes` 的服务仍为 active 时直接停止容器，否则后续 `systemctl start` 可能不会再次执行启动命令。正式服务应保留审计子进程，临时部署单元退出时清理整个 cgroup 会使网络因审计失效而关闭。
+
+多个 Docker daemon 使用各自的数据目录，符合 [Docker 的存储要求](https://docs.docker.com/engine/daemon/)。NFS 内的账号、会话数据库和工具缓存是否支持并发写入由各软件决定；本项目的文件读写验证不证明这些数据库能被多个进程同时使用。需要独立状态时，使用 `workspace.controlled_mounts`，将可共享的配置或 skills 作为明确子挂载接入。
+
+未验证与待确认：本节描述部署方式，各机是否已经通过验收以现场记录为准；文档本身不证明任一服务器的运行状态。

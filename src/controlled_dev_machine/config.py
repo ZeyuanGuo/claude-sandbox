@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 import os
 import pwd
 import re
@@ -16,6 +15,8 @@ from controlled_dev_machine.errors import ConfigError
 
 _INSTANCE_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_MAC_ADDRESS_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,8 @@ class TargetIdentity:
     uid: int
     gid: int
     home: Path
+    hostname: str = "devbox"
+    mac_address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,11 +68,6 @@ class StorageConfig:
     pcap_limit_gib: float
     plaintext_limit_gib: float
     structured_limit_gib: float
-    pcap_retention_hours: float
-    plaintext_retention_hours: float
-    structured_retention_days: float
-    pcap_roll_size_mib: int
-    pcap_roll_files: int
 
 
 @dataclass(frozen=True)
@@ -77,6 +75,14 @@ class ProjectMount:
     host_path: Path
     container_path: Path
     read_only: bool
+    propagation: str | None = None
+
+
+@dataclass(frozen=True)
+class ControlledMount:
+    relative_path: Path
+    read_only: bool
+    seed: str = "copy-if-empty"
 
 
 @dataclass(frozen=True)
@@ -89,11 +95,9 @@ class UpstreamConfig:
 
 
 @dataclass(frozen=True)
-class SshConfig:
-    enabled: bool
-    interface: str
-    allowed_addresses: tuple[str, ...]
-    ports: tuple[int, ...]
+class HostSshConfig:
+    enabled: bool = False
+    port: int = 22
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,19 @@ class HostProfile:
 
 
 @dataclass(frozen=True)
+class WorkspaceConfig:
+    share_host_home: bool = False
+    controlled_mounts: tuple[ControlledMount, ...] = ()
+
+
+@dataclass(frozen=True)
+class ServicePorts:
+    bind_address: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
 class HostConfig:
     schema_version: int
     instance: str
@@ -119,8 +136,10 @@ class HostConfig:
     storage: StorageConfig
     mounts: tuple[ProjectMount, ...]
     upstream: UpstreamConfig
-    ssh: SshConfig
+    host_ssh: HostSshConfig
     profile: HostProfile
+    workspace: WorkspaceConfig
+    service_ports: ServicePorts | None
 
     @property
     def resource_prefix(self) -> str:
@@ -162,58 +181,8 @@ def create_host_config(path: Path) -> None:
     account = invoking_account()
     home = Path(account.pw_dir)
 
-    claude_config = home / "claude_code_config"
-    if claude_config.is_symlink():
-        try:
-            resolved = claude_config.resolve(strict=True)
-            allowed = (home / ".local/share/controlled-dev-machine/home").resolve(
-                strict=True
-            ) / "claude_code_config"
-        except OSError as exc:
-            raise ConfigError(f"Claude 配置目录类型异常: {claude_config}") from exc
-        if resolved != allowed or not resolved.is_dir():
-            raise ConfigError(f"Claude 配置目录类型异常: {claude_config}")
-    elif claude_config.exists() and not claude_config.is_dir():
-        raise ConfigError(f"Claude 配置目录类型异常: {claude_config}")
-    claude_config.mkdir(mode=0o700, exist_ok=True)
-    for directory in ("rules", "skills", "agents"):
-        child = claude_config / directory
-        if child.is_symlink():
-            if directory != "rules":
-                raise ConfigError(f"Claude 配置目录类型异常: {child}")
-            try:
-                resolved_child = child.resolve(strict=True)
-                expected_child = (
-                    home / ".local/share/controlled-dev-machine/home/.claude/rules"
-                ).resolve(strict=True)
-            except OSError as exc:
-                raise ConfigError(f"Claude 配置目录类型异常: {child}") from exc
-            if resolved_child != expected_child or not resolved_child.is_dir():
-                raise ConfigError(f"Claude 配置目录类型异常: {child}")
-            continue
-        if child.exists() and not child.is_dir():
-            raise ConfigError(f"Claude 配置目录类型异常: {child}")
-        child.mkdir(mode=0o700, exist_ok=True)
-    claude_instructions = claude_config / "CLAUDE.md"
-    if claude_instructions.is_symlink() or (
-        claude_instructions.exists() and not claude_instructions.is_file()
-    ):
-        raise ConfigError(f"Claude 配置文件类型异常: {claude_instructions}")
-    if not claude_instructions.exists():
-        seed = (
-            Path(__file__).resolve().parents[2] / "config" / "claude" / "CLAUDE.md"
-        )
-        claude_instructions.write_text(seed.read_text(encoding="utf-8"), encoding="utf-8")
-    claude_settings = claude_config / "settings.json"
-    if claude_settings.is_symlink() or (
-        claude_settings.exists() and not claude_settings.is_file()
-    ):
-        raise ConfigError(f"Claude 配置文件类型异常: {claude_settings}")
-    if not claude_settings.exists():
-        claude_settings.write_text("{}\n", encoding="utf-8")
-
     profile_candidates = {
-        "claude_instructions": claude_instructions,
+        "claude_instructions": home / ".claude" / "CLAUDE.md",
         "bashrc": home / ".bashrc",
         "login_profile": home / ".profile",
         "gitconfig": home / ".gitconfig",
@@ -234,37 +203,22 @@ def create_host_config(path: Path) -> None:
         codex_home.mkdir(mode=0o700)
 
     mounts = []
-    for host_relative, container_relative, access in (
-        ("claude_code_config/settings.json", ".claude/settings.json", "rw"),
-        ("claude_code_config/rules", ".claude/rules", "rw"),
-        ("claude_code_config/skills", ".claude/skills", "rw"),
-        ("claude_code_config/agents", ".claude/agents", "rw"),
-        (".agents/skills", ".agents/skills", "rw"),
-        (".codex", ".codex", "rw"),
-        (".config/git", ".config/git", "rw"),
-        (".ssh", ".ssh", "ro"),
-        (".local/share/gamma-ssh", ".local/share/gamma-ssh", "ro"),
-        (".condarc", ".condarc", "rw"),
+    for relative, access in (
+        (".claude/skills", "rw"),
+        (".claude/agents", "rw"),
+        (".agents/skills", "rw"),
+        (".codex", "rw"),
+        (".config/git", "rw"),
+        (".ssh", "rw"),
+        (".condarc", "rw"),
     ):
-        source = home / host_relative
-        if source.is_symlink():
-            if host_relative != "claude_code_config/rules":
-                continue
-            try:
-                resolved_source = source.resolve(strict=True)
-                expected_source = (
-                    home / ".local/share/controlled-dev-machine/home/.claude/rules"
-                ).resolve(strict=True)
-            except OSError:
-                continue
-            if resolved_source != expected_source:
-                continue
-        if not (source.is_file() or source.is_dir()):
+        source = home / relative
+        if source.is_symlink() or not (source.is_file() or source.is_dir()):
             continue
         mounts.append(
             {
-                "host_path": f"~/{host_relative}",
-                "container_path": str(home / container_relative),
+                "host_path": f"~/{relative}",
+                "container_path": str(home / relative),
                 "access": access,
             }
         )
@@ -291,26 +245,18 @@ def create_host_config(path: Path) -> None:
             "pcap_limit_gib": 100,
             "plaintext_limit_gib": 50,
             "structured_limit_gib": 10,
-            "pcap_retention_hours": 72,
-            "plaintext_retention_hours": 72,
-            "structured_retention_days": 30,
-            "pcap_roll_size_mib": 64,
-            "pcap_roll_files": 4,
         },
         "upstream": {
             "kind": "http",
             "host": "127.0.0.1",
-            "port": 11450,
+            "port": 26940,
             "expected_exit_cidr": None,
             "config_path": None,
         },
-        "ssh": {
-            "enabled": False,
-            "interface": "tailscale0",
-            "allowed_addresses": [],
-            "ports": [22, 10090],
-        },
+        "host_ssh": {"enabled": False, "port": 22},
         "profile": profile,
+        "workspace": {"share_host_home": False, "controlled_mounts": []},
+        "service_ports": None,
         "mounts": mounts,
     }
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -361,11 +307,26 @@ def load_host_config(path: Path) -> HostConfig:
         raise ConfigError("每个用户只允许一套沙箱，instance 必须为 main")
 
     target_raw = _mapping(root.get("target"), "target")
+    hostname = _string(target_raw.get("hostname", "devbox"), "target.hostname")
+    if not _HOSTNAME_RE.fullmatch(hostname):
+        raise ConfigError(
+            "target.hostname 必须是 1 到 63 位小写字母、数字或连字符，首尾不能是连字符"
+        )
+    mac_address = target_raw.get("mac_address")
+    if mac_address is not None:
+        mac_address = _string(mac_address, "target.mac_address")
+        if (
+            not _MAC_ADDRESS_RE.fullmatch(mac_address)
+            or int(mac_address[:2], 16) & 3 != 2
+        ):
+            raise ConfigError("target.mac_address 必须是小写冒号分隔的 locally-admin unicast MAC")
     target = TargetIdentity(
         name=_string(target_raw.get("name"), "target.name"),
         uid=_nonnegative_int(target_raw.get("uid"), "target.uid"),
         gid=_nonnegative_int(target_raw.get("gid"), "target.gid"),
         home=_absolute_path(target_raw.get("home"), "target.home"),
+        hostname=hostname,
+        mac_address=mac_address,
     )
 
     paths_raw = _mapping(root.get("paths"), "paths")
@@ -383,8 +344,8 @@ def load_host_config(path: Path) -> HostConfig:
 
     gpu_raw = _mapping(root.get("gpu", {"mode": "all"}), "gpu")
     gpu_mode = _string(gpu_raw.get("mode", "all"), "gpu.mode")
-    if gpu_mode != "all":
-        raise ConfigError("gpu.mode 当前只允许 all；不启用 GPU 不符合本项目边界")
+    if gpu_mode not in {"all", "none"}:
+        raise ConfigError("gpu.mode 只允许 all 或 none")
     gpu = GpuConfig(mode=gpu_mode)
 
     storage_raw = _mapping(root.get("storage"), "storage")
@@ -399,26 +360,6 @@ def load_host_config(path: Path) -> HostConfig:
         ),
         structured_limit_gib=_positive_number(
             storage_raw.get("structured_limit_gib"), "storage.structured_limit_gib"
-        ),
-        pcap_retention_hours=_positive_number(
-            storage_raw.get("pcap_retention_hours", 72),
-            "storage.pcap_retention_hours",
-        ),
-        plaintext_retention_hours=_positive_number(
-            storage_raw.get("plaintext_retention_hours", 72),
-            "storage.plaintext_retention_hours",
-        ),
-        structured_retention_days=_positive_number(
-            storage_raw.get("structured_retention_days", 30),
-            "storage.structured_retention_days",
-        ),
-        pcap_roll_size_mib=_positive_int(
-            storage_raw.get("pcap_roll_size_mib", 64),
-            "storage.pcap_roll_size_mib",
-        ),
-        pcap_roll_files=_positive_int(
-            storage_raw.get("pcap_roll_files", 4),
-            "storage.pcap_roll_files",
         ),
     )
 
@@ -460,65 +401,14 @@ def load_host_config(path: Path) -> HostConfig:
         expected_exit_cidr=expected_exit_cidr,
     )
 
-    ssh_raw = _mapping(
-        root.get(
-            "ssh",
-            {
-                "enabled": False,
-                "interface": "tailscale0",
-                "allowed_addresses": [],
-                "ports": [22, 10090],
-            },
-        ),
-        "ssh",
-    )
-    ssh_enabled = ssh_raw.get("enabled", False)
-    if not isinstance(ssh_enabled, bool):
-        raise ConfigError("ssh.enabled 必须是布尔值")
-    ssh_interface = _string(ssh_raw.get("interface", "tailscale0"), "ssh.interface")
-    if re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", ssh_interface) is None:
-        raise ConfigError("ssh.interface 必须是有效的网络接口名")
-    address_values = ssh_raw.get("allowed_addresses", [])
-    if not isinstance(address_values, list) or not all(
-        isinstance(value, str) for value in address_values
-    ):
-        raise ConfigError("ssh.allowed_addresses 必须是 IPv4 地址列表")
-    allowed_addresses: list[str] = []
-    for index, value in enumerate(address_values):
-        try:
-            address = ipaddress.ip_address(value.strip())
-        except ValueError as exc:
-            raise ConfigError(f"ssh.allowed_addresses[{index}] 必须是 IPv4 地址") from exc
-        if not isinstance(address, ipaddress.IPv4Address):
-            raise ConfigError(f"ssh.allowed_addresses[{index}] 必须是 IPv4 地址")
-        if address not in ipaddress.ip_network("100.64.0.0/10"):
-            raise ConfigError("ssh.allowed_addresses 只能使用 Tailscale IPv4 地址范围")
-        normalized = str(address)
-        if normalized in allowed_addresses:
-            raise ConfigError(f"ssh.allowed_addresses 不能重复: {normalized}")
-        allowed_addresses.append(normalized)
-    if ssh_enabled and not allowed_addresses:
-        raise ConfigError("启用 SSH 时必须填写 ssh.allowed_addresses")
-    port_values = ssh_raw.get("ports", [22, 10090])
-    if not isinstance(port_values, list) or not all(
-        isinstance(value, int) and not isinstance(value, bool) for value in port_values
-    ):
-        raise ConfigError("ssh.ports 必须是整数列表")
-    ports: list[int] = []
-    for value in port_values:
-        if value < 1 or value > 65535:
-            raise ConfigError("ssh.ports 必须在 1 到 65535 之间")
-        if value in ports:
-            raise ConfigError(f"ssh.ports 不能重复: {value}")
-        ports.append(value)
-    if ssh_enabled and not ports:
-        raise ConfigError("启用 SSH 时必须填写 ssh.ports")
-    ssh = SshConfig(
-        enabled=ssh_enabled,
-        interface=ssh_interface,
-        allowed_addresses=tuple(allowed_addresses),
-        ports=tuple(ports),
-    )
+    host_ssh_raw = _mapping(root.get("host_ssh", {}), "host_ssh")
+    host_ssh_enabled = host_ssh_raw.get("enabled", False)
+    if not isinstance(host_ssh_enabled, bool):
+        raise ConfigError("host_ssh.enabled 必须是布尔值")
+    host_ssh_port = _integer(host_ssh_raw.get("port", 22), "host_ssh.port")
+    if host_ssh_port < 1 or host_ssh_port > 65535:
+        raise ConfigError("host_ssh.port 必须在 1 到 65535 之间")
+    host_ssh = HostSshConfig(enabled=host_ssh_enabled, port=host_ssh_port)
 
     profile_raw = _mapping(root.get("profile", {}), "profile")
     environment_value = profile_raw.get("default_conda_env")
@@ -563,6 +453,58 @@ def load_host_config(path: Path) -> HostConfig:
         timezone=timezone,
     )
 
+    workspace_raw = _mapping(root.get("workspace", {}), "workspace")
+    share_host_home = workspace_raw.get("share_host_home", False)
+    if not isinstance(share_host_home, bool):
+        raise ConfigError("workspace.share_host_home 必须是布尔值")
+    controlled_raw = workspace_raw.get("controlled_mounts", [])
+    if not isinstance(controlled_raw, list):
+        raise ConfigError("workspace.controlled_mounts 必须是列表")
+    controlled_mounts = tuple(
+        _controlled_mount(item, index)
+        for index, item in enumerate(controlled_raw)
+    )
+    workspace = WorkspaceConfig(
+        share_host_home=share_host_home,
+        controlled_mounts=controlled_mounts,
+    )
+    if controlled_mounts and not share_host_home:
+        raise ConfigError("workspace.controlled_mounts 需要 workspace.share_host_home=true")
+    if share_host_home:
+        exposed_control_paths = (
+            name
+            for name, value in (
+                ("paths.state", paths.state),
+                ("paths.audit", paths.audit),
+            )
+            if _overlap(target.home, value)
+        )
+        if exposed := ", ".join(exposed_control_paths):
+            raise ConfigError(f"共享宿主 Home 时 {exposed} 必须位于 target.home 之外")
+        if controlled_mounts and _overlap(target.home, paths.persistent_home):
+            raise ConfigError(
+                "workspace.controlled_mounts 启用时 paths.persistent_home 必须位于 target.home 之外"
+            )
+    _validate_controlled_mounts(controlled_mounts, mounts, target.home)
+
+    service_ports_raw = root.get("service_ports")
+    service_ports: ServicePorts | None = None
+    if service_ports_raw is not None:
+        service_ports_mapping = _mapping(service_ports_raw, "service_ports")
+        bind_address = _ipv4_address(
+            service_ports_mapping.get("bind_address", "127.0.0.1"),
+            "service_ports.bind_address",
+        )
+        start = _integer(service_ports_mapping.get("start"), "service_ports.start")
+        end = _integer(service_ports_mapping.get("end"), "service_ports.end")
+        if start < 1024 or end > 65535 or start > end:
+            raise ConfigError(
+                "service_ports 必须是 1024 到 65535 范围内的有序非特权端口段"
+            )
+        if end - start + 1 > 1024:
+            raise ConfigError("service_ports 一次最多发布 1024 个端口")
+        service_ports = ServicePorts(bind_address=bind_address, start=start, end=end)
+
     return HostConfig(
         schema_version=schema_version,
         instance=instance,
@@ -573,8 +515,10 @@ def load_host_config(path: Path) -> HostConfig:
         storage=storage,
         mounts=mounts,
         upstream=upstream,
-        ssh=ssh,
+        host_ssh=host_ssh,
         profile=profile,
+        workspace=workspace,
+        service_ports=service_ports,
     )
 
 
@@ -607,12 +551,6 @@ def _positive_number(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
         raise ConfigError(f"{name} 必须是正数")
     return float(value)
-
-
-def _positive_int(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ConfigError(f"{name} 必须是正整数")
-    return value
 
 
 def _absolute_path(value: Any, name: str) -> Path:
@@ -651,6 +589,20 @@ def _public_network(value: Any, name: str) -> str:
     return str(network)
 
 
+def _ipv4_address(value: Any, name: str) -> str:
+    import ipaddress
+
+    text = _string(value, name)
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError as exc:
+        raise ConfigError(f"{name} 必须是有效的 IPv4 地址") from exc
+    invalid_unspecified = address.is_unspecified and text != "0.0.0.0"
+    if address.version != 4 or address.is_multicast or invalid_unspecified:
+        raise ConfigError(f"{name} 必须是有效的 IPv4 单播地址或 0.0.0.0")
+    return str(address)
+
+
 def _threshold(value: Any, name: str) -> StorageThreshold:
     raw = _mapping(value, name)
     min_free_gib = _positive_number(raw.get("min_free_gib"), f"{name}.min_free_gib")
@@ -667,13 +619,51 @@ def _mount(value: Any, index: int, user_home: Path) -> ProjectMount:
     access = _string(raw.get("access", "rw"), f"mounts[{index}].access")
     if access not in {"ro", "rw"}:
         raise ConfigError(f"mounts[{index}].access 只允许 ro 或 rw")
+    propagation_value = raw.get("propagation")
+    propagation = None if propagation_value in (None, "") else _string(
+        propagation_value, f"mounts[{index}].propagation"
+    )
+    if propagation not in {None, "rprivate", "rslave"}:
+        raise ConfigError(f"mounts[{index}].propagation 只允许 rprivate 或 rslave")
     return ProjectMount(
         host_path=_user_path(raw.get("host_path"), f"mounts[{index}].host_path", user_home),
         container_path=_absolute_path(
             raw.get("container_path"), f"mounts[{index}].container_path"
         ),
         read_only=access == "ro",
+        propagation=propagation,
     )
+
+
+def _controlled_mount(value: Any, index: int) -> ControlledMount:
+    raw = _mapping(value, f"workspace.controlled_mounts[{index}]")
+    text = _string(raw.get("path"), f"workspace.controlled_mounts[{index}].path")
+    relative = Path(text)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or relative == Path(".")
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ConfigError(
+            f"workspace.controlled_mounts[{index}].path 必须是 target.home 下的相对目录"
+        )
+    access = _string(
+        raw.get("access", "rw"), f"workspace.controlled_mounts[{index}].access"
+    )
+    if access not in {"ro", "rw"}:
+        raise ConfigError(
+            f"workspace.controlled_mounts[{index}].access 只允许 ro 或 rw"
+        )
+    seed = _string(
+        raw.get("seed", "copy-if-empty"),
+        f"workspace.controlled_mounts[{index}].seed",
+    )
+    if seed not in {"copy-if-empty", "never"}:
+        raise ConfigError(
+            f"workspace.controlled_mounts[{index}].seed 只允许 copy-if-empty 或 never"
+        )
+    return ControlledMount(relative_path=relative, read_only=access == "ro", seed=seed)
 
 
 def _overlap(left: Path, right: Path) -> bool:
@@ -706,3 +696,32 @@ def _validate_mounts(mounts: tuple[ProjectMount, ...], paths: HostPaths) -> None
             raise ConfigError(f"项目挂载不能暴露控制或审计目录: {mount.host_path}")
         seen_host.add(mount.host_path)
         seen_container.add(mount.container_path)
+
+
+def _validate_controlled_mounts(
+    controlled: tuple[ControlledMount, ...],
+    mounts: tuple[ProjectMount, ...],
+    target_home: Path,
+) -> None:
+    seen: list[Path] = []
+    for item in controlled:
+        target = target_home / item.relative_path
+        if any(_overlap(target, existing) for existing in seen):
+            raise ConfigError(f"workspace.controlled_mounts 目标路径重叠: {target}")
+        for mount in mounts:
+            if not _overlap(target, mount.container_path):
+                continue
+            if mount.container_path != target and mount.container_path.is_relative_to(
+                target
+            ):
+                continue
+            raise ConfigError(f"受控目录不能被 mounts 目标路径覆盖: {target}")
+        if target in {
+            target_home / ".claude" / "CLAUDE.md",
+            target_home / ".bashrc",
+            target_home / ".profile",
+            target_home / ".gitconfig",
+            target_home / ".tmux.conf",
+        }:
+            raise ConfigError(f"受控目录不能覆盖生成的 profile 文件: {target}")
+        seen.append(target)

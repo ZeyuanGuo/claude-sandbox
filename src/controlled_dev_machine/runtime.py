@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -42,22 +43,13 @@ _MITMPROXY_SOURCE = (
 _MITMPROXY_LOCAL = "cdm-base-mitmproxy:12.2.3-sha256-68afa70d"
 _GATEWAY_UID = 1000
 _GATEWAY_GID = 1000
+_SERVICE_RELAY_UID = 65534
+_SERVICE_RELAY_GID = 65534
+_BUILD_PROVENANCE = False
+_BUILD_SBOM = False
+_COMPOSE_BUILD_ATTESTATION_ARGS = ("--provenance=false", "--sbom=false")
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _LIFECYCLE_LOCK_ROOT = Path("/run/controlled-dev-machine-locks")
-_PCAP_OUTPUT_ROOT = Path("/run/controlled-dev-machine-pcap")
-_MUTABLE_PROFILE_FILES = frozenset({"CLAUDE.md"})
-_BUILD_PROXY_VARIABLES = (
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "no_proxy",
-)
-_CANARY_CERT_VALIDITY_DAYS = 30
-_CANARY_CERT_REFRESH_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -87,10 +79,6 @@ class RuntimeManifest:
     profile_digest: str = ""
     profile_source_digest: str = ""
     target_build_digest: str = ""
-    ssh_enabled: bool = False
-    ssh_interface: str = "tailscale0"
-    ssh_allowed_addresses: tuple[str, ...] = ()
-    ssh_ports: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -110,6 +98,7 @@ def _gateway_build_digest(root: Path) -> str:
         root / "images/gateway/Dockerfile",
         root / "gateway/mitmproxy/cdm_addon.py",
         root / "gateway/mitmproxy/entrypoint.sh",
+        root / "config/claude/CLAUDE.md",
         root / "src/controlled_dev_machine/connect.bt",
         *sorted((root / "src").rglob("*.py")),
     ]
@@ -132,6 +121,9 @@ def _target_build_digest(config: HostConfig, root: Path) -> str:
         raise DeploymentError(f"目标镜像构建输入缺失或不是普通文件: {dockerfile}")
     inputs = {
         "base_image": _UBUNTU_LOCAL,
+        "build_provenance": _BUILD_PROVENANCE,
+        "build_sbom": _BUILD_SBOM,
+        "compose_build_attestation_args": _COMPOSE_BUILD_ATTESTATION_ARGS,
         "target_name": config.target.name,
         "target_uid": str(config.target.uid),
         "target_gid": str(config.target.gid),
@@ -191,8 +183,11 @@ def _locked_lifecycle(function: Callable[..., Any]) -> Callable[..., Any]:
     return wrapped
 
 
-def _profile_bundle(config: HostConfig, root: Path) -> tuple[dict[str, str], str]:
+def _profile_bundle(
+    config: HostConfig, root: Path
+) -> tuple[dict[str, str], str]:
     source_paths = {
+        "claude_instructions": config.profile.claude_instructions,
         "bashrc": config.profile.bashrc,
         "login_profile": config.profile.login_profile,
         "gitconfig": config.profile.gitconfig,
@@ -200,8 +195,6 @@ def _profile_bundle(config: HostConfig, root: Path) -> tuple[dict[str, str], str
     }
     sources: dict[str, str] = {}
     source_digest = hashlib.sha256()
-    if config.profile.claude_instructions is not None:
-        _read_profile_source(config, config.profile.claude_instructions)
     for name, path in source_paths.items():
         source_digest.update(name.encode("utf-8") + b"\0")
         if path is None:
@@ -212,13 +205,82 @@ def _profile_bundle(config: HostConfig, root: Path) -> tuple[dict[str, str], str
         source_digest.update(str(path).encode("utf-8") + b"\0")
         source_digest.update(content.encode("utf-8") + b"\0")
 
+    controlled_path = root / "config/claude/CLAUDE.md"
+    if controlled_path.is_symlink() or not controlled_path.is_file():
+        raise DeploymentError(f"沙箱 Claude 约束文件缺失: {controlled_path}")
+    controlled = controlled_path.read_text(encoding="utf-8").rstrip()
+    source_digest.update(b"controlled_claude\0")
+    source_digest.update(controlled.encode("utf-8") + b"\0")
     environment = config.profile.default_conda_env or ""
     source_digest.update(b"default_conda_env\0" + environment.encode("utf-8") + b"\0")
     conda_root = str(config.profile.conda_root or "")
     source_digest.update(b"conda_root\0" + conda_root.encode("utf-8") + b"\0")
+    workspace_description = ", ".join(
+        str(path)
+        for path in (
+            config.target.home if config.workspace.share_host_home else None,
+            *(item.container_path for item in config.mounts),
+            *(
+                config.target.home / item.relative_path
+                for item in config.workspace.controlled_mounts
+            ),
+        )
+        if path is not None
+    )
+    service_ports = (
+        f"{config.service_ports.bind_address}:{config.service_ports.start}-{config.service_ports.end}"
+        if config.service_ports is not None
+        else "none"
+    )
+    notice_lines = (
+        "--- Controlled development workstation ---",
+        (
+            f"System identity: Ubuntu container, {config.target.hostname}, "
+            f"{config.profile.timezone}, en_US.UTF-8"
+        ),
+        f"Shared work paths: {workspace_description or 'none'}",
+        f"Published TCP ports: {service_ports}",
+        "Outbound Web traffic uses the controlled gateway and is audited.",
+        "Host-visible work files and inbound services use the listed paths and ports.",
+    )
+    shell_notice = "\n".join(
+        "        "
+        + shlex.quote(line)
+        + (" \\" if index < len(notice_lines) - 1 else "")
+        for index, line in enumerate(notice_lines)
+    )
+    source_digest.update(
+        b"workspace_description\0" + workspace_description.encode("utf-8") + b"\0"
+    )
+    source_digest.update(b"service_ports\0" + service_ports.encode("utf-8") + b"\0")
 
+    host_instructions = sources.get("claude_instructions", "").rstrip()
+    instructions = (
+        f"{host_instructions}\n\n{controlled}\n" if host_instructions else f"{controlled}\n"
+    )
+    if config.workspace.share_host_home:
+        source = config.profile.claude_instructions
+        instructions = (
+            f"@{source}\n\n"
+            "<!-- Edit the imported file for shared rules; append local instructions here. -->\n"
+            if source is not None else ""
+        )
+        if source is not None:
+            location = _profile_host_location(config, source)
+            if location.root / location.relative != source:
+                raise DeploymentError("共享 Claude 主提示词必须位于未被私有挂载覆盖的共享 Home")
     bashrc = sources.get("bashrc", "").rstrip()
-    bashrc = _network_neutral_shell(bashrc)
+    conda_executable = (
+        config.profile.conda_root / "bin" / "conda"
+        if config.profile.conda_root is not None
+        else None
+    )
+    conda_available = (
+        conda_executable is not None
+        and conda_executable.is_file()
+        and os.access(conda_executable, os.X_OK)
+    )
+    bashrc = _network_neutral_shell(bashrc, conda_enabled=conda_available)
     if bashrc:
         bashrc += "\n"
     bashrc += """
@@ -243,9 +305,16 @@ fi
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
 unset http_proxy https_proxy all_proxy no_proxy
 unset CURL_CA_BUNDLE GIT_SSL_CAINFO NODE_EXTRA_CA_CERTS
-unset REQUESTS_CA_BUNDLE SSL_CERT_FILE
 unset -f proxy_on proxy_off 2>/dev/null || true
 """.lstrip()
+    bashrc += f"""
+
+# Managed interactive-shell notice.
+if [[ $- == *i* ]]; then
+    printf '%s\\n' \\
+{shell_notice}
+fi
+"""
 
     login_profile = sources.get("login_profile")
     if login_profile is None:
@@ -254,12 +323,16 @@ unset -f proxy_on proxy_off 2>/dev/null || true
 fi
 """
     else:
-        login_profile = _network_neutral_shell(login_profile.rstrip()) + "\n"
+        login_profile = (
+            _network_neutral_shell(
+                login_profile.rstrip(), conda_enabled=conda_available
+            )
+            + "\n"
+        )
     login_profile += """
 
 # Managed by controlled-dev-machine. A host profile may alter PATH or network
 # variables after sourcing .bashrc, so restore the transparent-network state.
-export PATH="$HOME/.local/bin:$PATH"
 if [ -n "${CDM_DEFAULT_CONDA_ENV:-}" ] \
     && [ -n "${CDM_CONDA_ROOT:-}" ] \
     && [ -d "$CDM_CONDA_ROOT/envs/$CDM_DEFAULT_CONDA_ENV/bin" ]; then
@@ -268,31 +341,214 @@ fi
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
 unset http_proxy https_proxy all_proxy no_proxy
 unset CURL_CA_BUNDLE GIT_SSL_CAINFO NODE_EXTRA_CA_CERTS
-unset REQUESTS_CA_BUNDLE SSL_CERT_FILE
 unset -f proxy_on proxy_off 2>/dev/null || true
 """
     files = {
+        "CLAUDE.md": instructions,
         ".bashrc": bashrc,
         ".profile": login_profile,
     }
+    if config.workspace.share_host_home:
+        files["controlled-environment.md"] = f"{controlled}\n"
     if "gitconfig" in sources:
         files[".gitconfig"] = _network_neutral_gitconfig(sources["gitconfig"])
     if "tmux_config" in sources:
         files[".tmux.conf"] = sources["tmux_config"]
+    # These digests describe the initialization seed, not mutable user files.
+    source_digest.update(b"rendered_profile\0")
+    for name, content in sorted(files.items()):
+        source_digest.update(name.encode("utf-8") + b"\0")
+        source_digest.update(content.encode("utf-8") + b"\0")
     return files, source_digest.hexdigest()
 
 
-def _network_neutral_shell(content: str) -> str:
+@dataclass(frozen=True)
+class _ProfileLocation:
+    root: Path
+    relative: Path
+    read_only: bool
+
+
+def _profile_host_location(config: HostConfig, target: Path) -> _ProfileLocation:
+    """Resolve a user-visible path through its longest declared mount parent."""
+    mappings = [
+        (
+            config.target.home,
+            config.target.home
+            if config.workspace.share_host_home
+            else config.paths.persistent_home,
+            False,
+        ),
+        *(
+            (
+                config.target.home / item.relative_path,
+                _controlled_mount_source(config, item),
+                item.read_only,
+            )
+            for item in config.workspace.controlled_mounts
+        ),
+        *((item.container_path, item.host_path, item.read_only) for item in config.mounts),
+    ]
+    candidates = [
+        item for item in mappings if target.is_relative_to(item[0])
+    ]
+    if not candidates:
+        raise DeploymentError(f"用户 profile 路径没有持久挂载: {target}")
+    _, (visible, source, read_only) = max(
+        enumerate(candidates), key=lambda item: (len(item[1][0].parts), item[0])
+    )
+    relative = target.relative_to(visible)
+    if not relative.parts:
+        return _ProfileLocation(source.parent, Path(source.name), read_only)
+    return _ProfileLocation(source, relative, read_only)
+
+
+def _open_profile_root(path: Path) -> int:
+    """Anchor an absolute data root without following any ancestor symlink."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise DeploymentError(f"用户 profile 数据根必须是无父目录跳转的绝对路径: {path}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _profile_user_identity(uid: int, gid: int) -> Iterator[None]:
+    """Create data as the target user, retaining privilege only to restore identity."""
+    previous_uid, previous_gid = os.geteuid(), os.getegid()
+    if (uid, gid) == (previous_uid, previous_gid):
+        yield
+        return
+    if previous_uid != 0:
+        raise DeploymentError("无权切换到目标用户初始化 profile")
+    previous_groups = os.getgroups()
+    try:
+        account = pwd.getpwuid(uid)
+    except KeyError as exc:
+        raise DeploymentError(f"profile 目标 UID 没有宿主账号: {uid}") from exc
+    groups = os.getgrouplist(account.pw_name, gid)
+    try:
+        os.setgroups(groups)
+        os.setegid(gid)
+        os.seteuid(uid)
+        yield
+    finally:
+        try:
+            os.seteuid(previous_uid)
+        finally:
+            try:
+                os.setegid(previous_gid)
+            finally:
+                os.setgroups(previous_groups)
+
+
+def _seed_profile_file(root: Path, relative: Path, content: str, uid: int, gid: int) -> None:
+    """Create only a missing user file; never replace or reown existing data."""
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise DeploymentError(f"用户 profile 文件必须位于数据根之下: {relative}")
+    destination = root / relative
+    descriptor = -1
+    temporary = f".cdm-seed-{uuid.uuid4().hex}"
+    temporary_created = False
+    try:
+        descriptor = _open_profile_root(root)
+        with _profile_user_identity(uid, gid):
+            try:
+                for name in relative.parts[:-1]:
+                    with suppress(FileExistsError):
+                        os.mkdir(name, mode=0o700, dir_fd=descriptor)
+                    child = os.open(
+                        name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                    os.close(descriptor)
+                    descriptor = child
+                # lstat preserves empty files, directories, and broken links alike.
+                try:
+                    os.stat(relative.name, dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    return
+                file_descriptor = os.open(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o644, dir_fd=descriptor,
+                )
+                temporary_created = True
+                with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                with suppress(FileExistsError):
+                    os.link(
+                        temporary, relative.name, src_dir_fd=descriptor, dst_dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+            finally:
+                if temporary_created:
+                    with suppress(FileNotFoundError):
+                        os.unlink(temporary, dir_fd=descriptor)
+    except OSError as exc:
+        raise DeploymentError(f"无法初始化用户 profile: {destination}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _initialize_user_profile(config: HostConfig, files: dict[str, str]) -> None:
+    home = config.target.home
+    targets = {
+        "CLAUDE.md": home / ".claude/CLAUDE.md",
+        "controlled-environment.md": home / ".claude/rules/controlled-environment.md",
+        **{name: home / name for name in (".bashrc", ".profile", ".gitconfig", ".tmux.conf")},
+    }
+    for name, content in files.items():
+        location = _profile_host_location(config, targets[name])
+        if not location.read_only:
+            _seed_profile_file(
+                location.root, location.relative, content, config.target.uid, config.target.gid,
+            )
+
+
+def _network_neutral_shell(content: str, *, conda_enabled: bool = True) -> str:
     lines = []
     invocation = re.compile(r"^\s*proxy_(?:on|off)(?:\s+[^#;]+)?\s*(?:#.*)?$")
+    conda_activation = re.compile(r"^\s*conda\s+activate\b.*$")
+    conda_block_start = re.compile(r"^\s*#\s*>>>\s*conda initialize\s*>>>")
+    conda_block_end = re.compile(r"^\s*#\s*<<<\s*conda initialize\s*<<<")
+    absolute_source = re.compile(
+        r"^\s*(?:\.|source)\s+[\"']?(/[^\"'\s]+)[\"']?\s*$"
+    )
     network_assignment = re.compile(
         r"^\s*(?:export\s+)?(?:HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|"
         r"http_proxy|https_proxy|all_proxy|no_proxy|CURL_CA_BUNDLE|"
         r"GIT_SSL_CAINFO|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE|SSL_CERT_FILE)="
     )
+    in_conda_block = False
     for line in content.splitlines():
-        if not invocation.fullmatch(line) and not network_assignment.match(line):
-            lines.append(line)
+        if not conda_enabled and conda_block_start.match(line):
+            in_conda_block = True
+            continue
+        if in_conda_block:
+            if conda_block_end.match(line):
+                in_conda_block = False
+            continue
+        if not conda_enabled and conda_activation.fullmatch(line):
+            continue
+        source_match = absolute_source.fullmatch(line)
+        if source_match and not Path(source_match.group(1)).is_file():
+            continue
+        if invocation.fullmatch(line) or network_assignment.match(line):
+            continue
+        lines.append(line)
     return "\n".join(lines).rstrip()
 
 
@@ -362,13 +618,6 @@ def _profile_digest(files: dict[str, str]) -> str:
     return digest.hexdigest()
 
 
-def _profile_integrity_digest(files: dict[str, str]) -> str:
-    """Hash profile files whose contents are controlled by the runtime."""
-    return _profile_digest(
-        {name: content for name, content in files.items() if name not in _MUTABLE_PROFILE_FILES}
-    )
-
-
 def _profile_directory_digest(path: Path) -> str:
     if path.is_symlink() or not path.is_dir():
         raise DeploymentError(f"运行 profile 缺失或类型异常: {path}")
@@ -380,10 +629,12 @@ def _profile_directory_digest(path: Path) -> str:
             files[item.name] = item.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise DeploymentError(f"无法读取运行 profile: {item}") from exc
-    return _profile_integrity_digest(files)
+    return _profile_digest(files)
 
 
-def _host_password_hash(username: str, shadow_path: Path = Path("/etc/shadow")) -> str:
+def _host_password_hash(
+    username: str, shadow_path: Path = Path("/etc/shadow")
+) -> str:
     try:
         content = shadow_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -394,7 +645,9 @@ def _host_password_hash(username: str, shadow_path: Path = Path("/etc/shadow")) 
             continue
         password_hash = fields[1]
         if not password_hash or password_hash.startswith(("!", "*")):
-            raise DeploymentError(f"宿主用户 {username} 没有可用于容器 sudo 的密码")
+            raise DeploymentError(
+                f"宿主用户 {username} 没有可用于容器 sudo 的密码"
+            )
         return password_hash
     raise DeploymentError(f"宿主密码信息中找不到用户 {username}")
 
@@ -412,10 +665,6 @@ def load_runtime(config: HostConfig) -> RuntimeManifest:
     _require_current_generation(config)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if "ssh_allowed_addresses" in raw:
-            raw["ssh_allowed_addresses"] = tuple(raw["ssh_allowed_addresses"])
-        if "ssh_ports" in raw:
-            raw["ssh_ports"] = tuple(raw["ssh_ports"])
         manifest = RuntimeManifest(**raw)
     except FileNotFoundError as exc:
         raise DeploymentError("运行环境尚未初始化；先执行 sandboxctl init") from exc
@@ -423,7 +672,6 @@ def load_runtime(config: HostConfig) -> RuntimeManifest:
         raise DeploymentError(f"运行清单损坏: {path}") from exc
     if manifest.schema_version != 4 or manifest.resource_prefix != config.resource_prefix:
         raise DeploymentError("运行清单与当前主机配置不一致")
-    _validate_manifest_ssh(manifest)
     expected = config.paths.state / "generated" / "current" / "compose.closed.yaml"
     if Path(manifest.compose_path) != expected:
         raise DeploymentError("运行清单中的 Compose 路径不属于当前实例")
@@ -440,30 +688,6 @@ def load_runtime(config: HostConfig) -> RuntimeManifest:
         if _profile_directory_digest(profile_path) != manifest.profile_digest:
             raise DeploymentError("运行 profile 与运行清单摘要不一致")
     return manifest
-
-
-def _validate_manifest_ssh(manifest: RuntimeManifest) -> None:
-    if not isinstance(manifest.ssh_enabled, bool):
-        raise DeploymentError("运行清单中的 SSH 开关无效")
-    if re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", manifest.ssh_interface) is None:
-        raise DeploymentError("运行清单中的 SSH 网络接口无效")
-    if manifest.ssh_enabled and (
-        not manifest.ssh_allowed_addresses or not manifest.ssh_ports
-    ):
-        raise DeploymentError("运行清单中的 SSH 地址或端口为空")
-    tailscale_network = ipaddress.ip_network("100.64.0.0/10")
-    for value in manifest.ssh_allowed_addresses:
-        try:
-            address = ipaddress.ip_address(value)
-        except ValueError as exc:
-            raise DeploymentError("运行清单中的 SSH 地址无效") from exc
-        if not isinstance(address, ipaddress.IPv4Address) or address not in tailscale_network:
-            raise DeploymentError("运行清单中的 SSH 地址不属于 Tailscale IPv4 范围")
-    if any(
-        not isinstance(port, int) or isinstance(port, bool) or port < 1 or port > 65535
-        for port in manifest.ssh_ports
-    ):
-        raise DeploymentError("运行清单中的 SSH 端口无效")
 
 
 @_locked_lifecycle
@@ -503,7 +727,7 @@ def prepare_runtime(
     gateway_build_digest = _gateway_build_digest(root)
     target_build_digest = _target_build_digest(config, root)
     profile_files, profile_source_digest = _profile_bundle(config, root)
-    profile_digest = _profile_integrity_digest(profile_files)
+    profile_digest = _profile_digest(profile_files)
     generated = config.paths.state / "generated"
     generation_root = generated / "generations"
     generation_name = (
@@ -535,10 +759,6 @@ def prepare_runtime(
         profile_digest=profile_digest,
         profile_source_digest=profile_source_digest,
         target_build_digest=target_build_digest,
-        ssh_enabled=config.ssh.enabled,
-        ssh_interface=config.ssh.interface,
-        ssh_allowed_addresses=config.ssh.allowed_addresses,
-        ssh_ports=config.ssh.ports,
         **addresses,
     )
     generation_policy = generation / "policy.active.yaml"
@@ -587,6 +807,7 @@ def prepare_runtime(
                 policy_path=str(generation_policy),
             ),
         )
+        _initialize_user_profile(config, profile_files)
         _fsync_directory(generation)
         _activate_generation(config, generation)
         activated = True
@@ -596,7 +817,9 @@ def prepare_runtime(
     return manifest
 
 
-def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict[str, Any]:
+def render_closed_compose(
+    config: HostConfig, manifest: RuntimeManifest
+) -> dict[str, Any]:
     root = Path(manifest.repo_root)
     proxy_ca = config.paths.state / "proxy-ca"
     canary = config.paths.state / "canary"
@@ -604,10 +827,11 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
     dns_control = config.paths.state / "dns-control"
     target_trust = config.paths.state / "target-trust"
     target_resolver = config.paths.state / "generated/current/target-resolv.conf"
-    target_password_hash = config.paths.state / "generated/current/target-password-hash"
+    target_password_hash = (
+        config.paths.state / "generated/current/target-password-hash"
+    )
     plaintext = config.paths.audit / "plaintext"
     review = config.paths.review
-    profile = config.paths.state / "generated" / "current" / "profile"
     common_security: dict[str, Any] = {
         "cap_drop": ["ALL"],
         "security_opt": ["no-new-privileges:true"],
@@ -619,27 +843,25 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
             "source": str(item.host_path),
             "target": str(item.container_path),
             "read_only": item.read_only,
-            "bind": {"create_host_path": False},
+            "bind": {
+                "create_host_path": False,
+                **(
+                    {"propagation": item.propagation}
+                    if item.propagation is not None
+                    else {}
+                ),
+            },
         }
         for item in config.mounts
     ]
-    profile_mounts = [
-        _bind(profile / ".bashrc", config.target.home / ".bashrc"),
-        _bind(profile / ".profile", config.target.home / ".profile"),
-    ]
-    if config.profile.claude_instructions is not None:
-        profile_mounts.append(
-            _bind(
-                config.profile.claude_instructions,
-                config.target.home / ".claude/CLAUDE.md",
-                read_only=False,
-            )
+    controlled_mounts = [
+        _bind(
+            _controlled_mount_source(config, item),
+            config.target.home / item.relative_path,
+            read_only=item.read_only,
         )
-    if config.profile.gitconfig is not None:
-        profile_mounts.append(_bind(profile / ".gitconfig", config.target.home / ".gitconfig"))
-    if config.profile.tmux_config is not None:
-        profile_mounts.append(_bind(profile / ".tmux.conf", config.target.home / ".tmux.conf"))
-    conda_trust_mounts = _conda_trust_mounts(config, target_trust / "ca-certificates.crt")
+        for item in config.workspace.controlled_mounts
+    ]
     upstream_enabled = config.upstream.kind == "http"
     upstream_port = config.upstream.port if upstream_enabled else 9
     dns_policy_args = _dns_policy_args(manifest)
@@ -649,9 +871,16 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
     }
     gateway_extra_hosts = [f"canary.test:{manifest.canary_address}"]
     if upstream_enabled:
-        gateway_networks["upstream_net"] = {"ipv4_address": manifest.gateway_upstream_address}
-        gateway_extra_hosts.append(f"upstream.cdm.test:{manifest.upstream_gateway_address}")
+        gateway_networks["upstream_net"] = {
+            "ipv4_address": manifest.gateway_upstream_address
+        }
+        gateway_extra_hosts.append(
+            f"upstream.cdm.test:{manifest.upstream_gateway_address}"
+        )
     dns_address = _target_dns_address(manifest)
+    target_extra_hosts = []
+    if config.host_ssh.enabled:
+        target_extra_hosts.append(f"host.docker.internal:{_target_host_address(manifest)}")
     services: dict[str, Any] = {
         "canary": {
             "image": manifest.target_image,
@@ -725,7 +954,11 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
             "networks": {
                 "target_net": {"ipv4_address": dns_address},
                 **(
-                    {"upstream_net": {"ipv4_address": manifest.dns_upstream_address}}
+                    {
+                        "upstream_net": {
+                            "ipv4_address": manifest.dns_upstream_address
+                        }
+                    }
                     if upstream_enabled
                     else {}
                 ),
@@ -748,7 +981,8 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
             "build": {
                 "context": str(root),
                 "dockerfile": str(root / "images/gateway/Dockerfile"),
-                "network": "host",
+                "provenance": _BUILD_PROVENANCE,
+                "sbom": _BUILD_SBOM,
                 "args": {
                     "BASE_IMAGE": _MITMPROXY_LOCAL,
                     "GATEWAY_BUILD_DIGEST": manifest.gateway_build_digest,
@@ -777,7 +1011,7 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
                 "--set",
                 "termlog_verbosity=info",
                 "-w",
-                "/audit/plaintext/flows.mitm",
+                "/audit/plaintext/flows-%Y%m%d-%H.mitm",
                 "-s",
                 "/opt/cdm/gateway/cdm_addon.py",
             ],
@@ -835,7 +1069,8 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
             "build": {
                 "context": str(root),
                 "dockerfile": str(root / "images/target/Dockerfile"),
-                "network": "host",
+                "provenance": _BUILD_PROVENANCE,
+                "sbom": _BUILD_SBOM,
                 "args": {
                     "BASE_IMAGE": _UBUNTU_LOCAL,
                     "TARGET_NAME": config.target.name,
@@ -849,21 +1084,22 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
             "image": manifest.target_image,
             "user": f"{config.target.uid}:{config.target.gid}",
             "group_add": ["sudo"],
-            "hostname": "devbox",
+            "hostname": config.target.hostname,
             "command": ["sleep", "infinity"],
             "init": True,
             "stdin_open": True,
             "tty": True,
             "environment": {
                 "HOME": str(config.target.home),
-                "PATH": f"{config.target.home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "CLAUDE_CONFIG_DIR": str(config.target.home / ".claude"),
                 "USER": config.target.name,
                 "TZ": config.profile.timezone,
                 "LANG": "en_US.UTF-8",
                 "LC_ALL": "en_US.UTF-8",
-                "NODE_USE_SYSTEM_CA": "1",
-                "NVIDIA_VISIBLE_DEVICES": "all",
+                "NODE_OPTIONS": "--use-system-ca",
+                "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
+                "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
+                "NVIDIA_VISIBLE_DEVICES": "all" if config.gpu.mode == "all" else "void",
                 "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
                 **(
                     {"CDM_DEFAULT_CONDA_ENV": config.profile.default_conda_env}
@@ -876,11 +1112,18 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
                     else {}
                 ),
             },
-            "devices": ["nvidia.com/gpu=all"],
+            "devices": ["nvidia.com/gpu=all"] if config.gpu.mode == "all" else [],
+            "extra_hosts": target_extra_hosts,
             "volumes": [
-                _bind(config.paths.persistent_home, config.target.home, read_only=False),
+                _bind(
+                    config.target.home
+                    if config.workspace.share_host_home
+                    else config.paths.persistent_home,
+                    config.target.home,
+                    read_only=False,
+                ),
+                *controlled_mounts,
                 *project_mounts,
-                *profile_mounts,
                 _bind(
                     target_trust / "ca-certificates.crt",
                     "/etc/ssl/certs/ca-certificates.crt",
@@ -890,10 +1133,16 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
                     target_password_hash,
                     "/run/cdm/target-password-hash",
                 ),
-                *conda_trust_mounts,
             ],
             "networks": {
-                "target_net": {"ipv4_address": manifest.target_address},
+                "target_net": {
+                    "ipv4_address": manifest.target_address,
+                    **(
+                        {"mac_address": config.target.mac_address}
+                        if config.target.mac_address is not None
+                        else {}
+                    ),
+                },
             },
             "pids_limit": 4096,
             "stop_grace_period": "2s",
@@ -903,7 +1152,10 @@ def render_closed_compose(config: HostConfig, manifest: RuntimeManifest) -> dict
         "name": config.resource_prefix,
         "services": services,
         "networks": {
-            "target_net": _isolated_network(manifest.target_subnet),
+            "target_net": _isolated_network(
+                manifest.target_subnet,
+                host_access=config.host_ssh.enabled,
+            ),
             "canary_net": _isolated_network(manifest.canary_subnet),
             **(
                 {"upstream_net": _upstream_network(manifest.upstream_subnet)}
@@ -924,39 +1176,19 @@ def compose_build(config: HostConfig) -> None:
         config,
         manifest,
         "build",
-        *_build_proxy_options(),
+        *_COMPOSE_BUILD_ATTESTATION_ARGS,
         "target",
         "gateway",
     )
     _pin_built_images(config, manifest)
 
 
-def _build_proxy_options() -> tuple[str, ...]:
-    options: list[str] = []
-    for variable in _BUILD_PROXY_VARIABLES:
-        if os.environ.get(variable):
-            # Compose reads the value from its inherited environment. Keeping
-            # the value out of argv also avoids persisting it in generated YAML.
-            options.extend(("--build-arg", variable))
-    return tuple(options)
-
-
-@_locked_lifecycle
-def prepare_parent_guard(config: HostConfig) -> None:
-    """Install the persistent loopback-only guard before the parent proxy starts."""
-    manifest = load_runtime(config)
-    _require_root()
-    _require_instance_stopped(config, operation="guard")
-    _install_host_parent_guard(config, manifest)
-    _configure_stopped_host_parent_guard(config, manifest)
-
-
 def sync_base_images(config: HostConfig) -> None:
     _require_root()
     if os.uname().machine not in {"x86_64", "amd64"}:
         raise DeploymentError("当前基础镜像导入器只固定了 amd64 manifest")
-    if not shutil.which("skopeo"):
-        raise DeploymentError("缺少 skopeo；它用于绕过失效的共享 Docker registry mirror")
+    if not shutil.which("skopeo") and not shutil.which("docker"):
+        raise DeploymentError("缺少 skopeo 和 docker；无法导入固定基础镜像")
     for source, local in (
         (_UBUNTU_SOURCE, _UBUNTU_LOCAL),
         (_MITMPROXY_SOURCE, _MITMPROXY_LOCAL),
@@ -964,19 +1196,40 @@ def sync_base_images(config: HostConfig) -> None:
         exists = _docker(config, "image", "inspect", local, check=False, capture=True)
         if exists.returncode == 0:
             continue
-        _run(
-            [
-                "skopeo",
-                "copy",
-                "--override-os",
-                "linux",
-                "--override-arch",
-                "amd64",
-                source,
-                f"docker-daemon:{local}",
-            ],
-            env=_docker_env(config),
-        )
+        if shutil.which("skopeo"):
+            copied = _run(
+                [
+                    "skopeo",
+                    "copy",
+                    "--override-os",
+                    "linux",
+                    "--override-arch",
+                    "amd64",
+                    source,
+                    f"docker-daemon:{local}",
+                ],
+                env=_docker_env(config),
+                check=False,
+            )
+            if copied.returncode == 0:
+                continue
+        # Older distro skopeo builds speak Docker API 1.22 and cannot write to
+        # current engines. Pull the same digest with the Docker CLI, then tag
+        # the immutable image ID used by the generated Compose file.
+        reference = source.removeprefix("docker://")
+        _docker(config, "pull", reference)
+        image_id = _docker(
+            config,
+            "image",
+            "inspect",
+            reference,
+            "--format",
+            "{{.Id}}",
+            capture=True,
+        ).stdout.strip()
+        if not _IMAGE_ID_RE.fullmatch(image_id):
+            raise DeploymentError(f"固定基础镜像 ID 无效: {image_id}")
+        _docker(config, "image", "tag", image_id, local)
 
 
 @_locked_lifecycle
@@ -986,20 +1239,21 @@ def compose_start_closed(config: HostConfig, *, timeout_seconds: int = 90) -> No
     _require_policy_files(manifest)
     _require_target_image(config, manifest)
     _require_gateway_image(config, manifest)
-    _require_profile_sources(config, manifest)
     _check_gpu_cdi(config)
     if _service_container_id(config, manifest, "target"):
         raise DeploymentError("环境已经运行；配置变更时先执行 sandboxctl stop")
-    _ensure_canary_certificates(config)
-    _ensure_upstream_trust_bundle(config)
     _install_host_parent_guard(config, manifest)
     _configure_stopped_host_parent_guard(config, manifest)
+    _configure_stopped_host_ssh_guard(config, manifest)
+    _configure_host_ssh_hosts_allow(config, manifest, enabled=False)
     observed_upstream_ip = _check_upstream(config)
     _stop_audit(config)
     _archive_current_flow(config)
     _compose(config, manifest, "create", "canary", "dns", "gateway")
     try:
         _configure_host_parent_guard(config, manifest)
+        _configure_host_ssh_guard(config, manifest)
+        _configure_host_ssh_hosts_allow(config, manifest, enabled=True)
         _compose(config, manifest, "up", "-d", "canary", "dns", "gateway")
         ca_path = config.paths.state / "proxy-ca" / "mitmproxy-ca-cert.pem"
         deadline = time.monotonic() + timeout_seconds
@@ -1023,15 +1277,11 @@ def compose_start_closed(config: HostConfig, *, timeout_seconds: int = 90) -> No
         _enable_target_route(config, manifest)
     except Exception:
         _disable_target_route(config, manifest)
-        cleanup_error: Exception | None = None
-        try:
-            _stop_audit(config)
-        except Exception as exc:
-            cleanup_error = exc
+        _stop_audit(config)
         _compose(config, manifest, "down", "--remove-orphans", check=False)
         _configure_stopped_host_parent_guard(config, manifest)
-        if cleanup_error is not None:
-            raise cleanup_error from None
+        _configure_stopped_host_ssh_guard(config, manifest)
+        _configure_host_ssh_hosts_allow(config, manifest, enabled=False)
         raise
 
 
@@ -1084,16 +1334,12 @@ def compose_stop(config: HostConfig) -> None:
             raise exc
     if manifest is not None:
         _disable_target_route(config, manifest)
-    cleanup_error: Exception | None = None
-    try:
-        _stop_audit(config)
-    except Exception as exc:
-        cleanup_error = exc
+    _stop_audit(config)
     _compose_path(config, compose_path, "down", "--remove-orphans")
     if manifest is not None:
         _configure_stopped_host_parent_guard(config, manifest)
-    if cleanup_error is not None:
-        raise cleanup_error
+        _configure_stopped_host_ssh_guard(config, manifest)
+        _configure_host_ssh_hosts_allow(config, manifest, enabled=False)
     _archive_current_flow(config)
 
 
@@ -1145,7 +1391,9 @@ def audit_status(config: HostConfig) -> dict[str, object]:
     processes: list[dict[str, object]] = []
     for entry in entries:
         processes.append(process_status(entry, name_field="kind"))
-    namespace_status = [process_status(namespace, name_field="name") for namespace in namespaces]
+    namespace_status = [
+        process_status(namespace, name_field="name") for namespace in namespaces
+    ]
     expected_processes = {
         "target-pcap",
         "gateway-pcap",
@@ -1153,6 +1401,8 @@ def audit_status(config: HostConfig) -> dict[str, object]:
         "target-connect-ebpf",
         "network-watchdog",
     }
+    if config.service_ports is not None:
+        expected_processes.add("service-relay")
     process_names = [str(item["kind"]) for item in processes]
     if len(process_names) != len(expected_processes) or set(process_names) != expected_processes:
         raise DeploymentError(f"审计运行清单探针集合不完整: {path}")
@@ -1177,59 +1427,16 @@ def audit_status(config: HostConfig) -> dict[str, object]:
     }
 
 
-@_locked_lifecycle
-def restart_audit(config: HostConfig) -> None:
-    """Restart only this instance's audit probes and restore its target route."""
-    _require_root()
-    manifest = load_runtime(config)
-    for service in ("canary", "dns", "gateway", "target"):
-        if not _service_container_id(config, manifest, service):
-            raise DeploymentError(f"服务未运行，不能只恢复审计: {service}")
-    if not _service_healthy(config, manifest, "canary"):
-        raise DeploymentError("canary 容器未 healthy，不能恢复审计")
-    if not _service_healthy(config, manifest, "dns"):
-        raise DeploymentError("DNS 容器未 healthy，不能恢复审计")
-    if not _service_healthy(config, manifest, "gateway"):
-        raise DeploymentError("网关容器未 healthy，不能恢复审计")
-    _require_policy_files(manifest)
-    _disable_target_route(config, manifest)
-    _stop_audit(config)
-    try:
-        observed_upstream_ip = _check_upstream(config)
-        _configure_host_parent_guard(config, manifest)
-        _configure_infrastructure_network(config, manifest)
-        _configure_target_network(config, manifest)
-        _start_audit(config, manifest, observed_upstream_ip=observed_upstream_ip)
-        _enable_target_route(config, manifest)
-    except Exception:
-        _disable_target_route(config, manifest)
-        with suppress(Exception):
-            _stop_audit(config)
-        raise
-
-
-def recover_runtime(config: HostConfig) -> str:
-    """Start a stopped instance or restore audit around live containers."""
-    manifest = load_runtime(config)
-    services = ("canary", "dns", "gateway", "target")
-    running = [service for service in services if _service_container_id(config, manifest, service)]
-    if not running:
-        compose_start_closed(config)
-        return "started"
-    if set(running) != set(services):
-        raise DeploymentError("受控容器只恢复了一部分，拒绝猜测；先运行 sandboxctl doctor 查看现场")
-    restart_audit(config)
-    return "audit_restarted"
-
-
 def compose_shell(config: HostConfig, *, root: bool) -> int:
     manifest = load_runtime(config)
     _require_root()
     user = "0:0" if root else f"{config.target.uid}:{config.target.gid}"
-    terminal_env: list[str] = []
-    for name in ("TERM", "COLORTERM"):
-        if value := os.environ.get(name):
-            terminal_env.extend(("--env", f"{name}={value}"))
+    term = os.environ.get("TERM")
+    if term in {None, "", "dumb", "unknown", "xterm"}:
+        term = "xterm-256color"
+    terminal_env = ["--env", f"TERM={term}"]
+    if colorterm := os.environ.get("COLORTERM"):
+        terminal_env.extend(("--env", f"COLORTERM={colorterm}"))
     result = _compose(
         config,
         manifest,
@@ -1299,13 +1506,24 @@ def compose_exec_async(
 
 
 def _prepare_directories(config: HostConfig) -> None:
-    _mkdir(config.paths.persistent_home, 0o700, config.target.uid, config.target.gid)
-    _mkdir(
-        config.paths.persistent_home / ".claude",
-        0o700,
-        config.target.uid,
-        config.target.gid,
-    )
+    if config.workspace.share_host_home:
+        if not config.target.home.is_dir():
+            raise DeploymentError("共享宿主 Home 必须存在且属于目标用户")
+        metadata = config.target.home.stat()
+        if metadata.st_uid != config.target.uid or metadata.st_gid != config.target.gid:
+            raise DeploymentError("共享宿主 Home 必须存在且属于目标用户")
+        claude_home = config.target.home / ".claude"
+        if not claude_home.is_dir():
+            raise DeploymentError("共享宿主 Home 缺少 .claude 目录")
+    else:
+        _mkdir(config.paths.persistent_home, 0o700, config.target.uid, config.target.gid)
+        _mkdir(
+            config.paths.persistent_home / ".claude",
+            0o700,
+            config.target.uid,
+            config.target.gid,
+        )
+    _prepare_controlled_mounts(config)
     _mkdir(config.paths.state, 0o700, 0, 0)
     _mkdir(config.paths.audit, 0o700, 0, 0)
     for path in (
@@ -1341,6 +1559,42 @@ def _prepare_directories(config: HostConfig) -> None:
             raise DeploymentError(f"挂载源不存在或不是普通文件/目录: {mount.host_path}")
 
 
+def _controlled_mount_source(config: HostConfig, mount: Any) -> Path:
+    return config.paths.persistent_home / ".controlled-mounts" / mount.relative_path
+
+
+def _prepare_controlled_mounts(config: HostConfig) -> None:
+    if not config.workspace.controlled_mounts:
+        return
+    root = config.paths.persistent_home / ".controlled-mounts"
+    _mkdir(root, 0o700, config.target.uid, config.target.gid)
+    for mount in config.workspace.controlled_mounts:
+        source = _controlled_mount_source(config, mount)
+        host_path = config.target.home / mount.relative_path
+        if source.is_symlink() or (source.exists() and not source.is_dir()):
+            raise DeploymentError(f"受控挂载源必须是普通目录: {source}")
+        if not source.exists():
+            _mkdir(source, 0o700, config.target.uid, config.target.gid)
+        if mount.seed == "copy-if-empty" and not any(source.iterdir()):
+            if host_path.is_symlink() or (host_path.exists() and not host_path.is_dir()):
+                raise DeploymentError(f"受控挂载种子必须是普通目录: {host_path}")
+            if host_path.is_dir():
+                shutil.copytree(host_path, source, dirs_exist_ok=True, symlinks=True)
+                _chown_tree(source, config.target.uid, config.target.gid)
+
+
+def _chown_tree(root: Path, uid: int, gid: int) -> None:
+    for directory, dir_names, file_names in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        os.chown(directory_path, uid, gid)
+        for name in [*dir_names, *file_names]:
+            path = directory_path / name
+            if path.is_symlink():
+                os.lchown(path, uid, gid)
+            else:
+                os.chown(path, uid, gid)
+
+
 def _store_policy(config: HostConfig, source: Path, policy: PolicySnapshot) -> Path:
     target = config.paths.state / "policies" / f"{policy.digest()}.yaml"
     content = source.read_text(encoding="utf-8")
@@ -1355,7 +1609,9 @@ def _store_policy(config: HostConfig, source: Path, policy: PolicySnapshot) -> P
 
 def _require_deployable_policy(policy: PolicySnapshot) -> None:
     if policy.deployment != "active":
-        raise DeploymentError(f"策略 {policy.policy_id} 标记为 {policy.deployment}，不能部署")
+        raise DeploymentError(
+            f"策略 {policy.policy_id} 标记为 {policy.deployment}，不能部署"
+        )
     if policy.mode == "strict" and policy.web_default not in {"block", "review"}:
         raise DeploymentError("strict 策略必须默认阻断或逐请求审核")
     if policy.mode == "daily" and policy.web_default != "allow_audited_public":
@@ -1367,11 +1623,7 @@ def _require_deployable_policy(policy: PolicySnapshot) -> None:
 def _ensure_canary_certificates(config: HostConfig) -> None:
     canary = config.paths.state / "canary"
     expected = (canary / "ca.key", canary / "ca.crt", canary / "server.key", canary / "server.crt")
-    refresh_seconds = _CANARY_CERT_REFRESH_DAYS * 24 * 60 * 60
-    if all(path.is_file() for path in expected) and all(
-        _certificate_valid_for(path, refresh_seconds)
-        for path in (canary / "ca.crt", canary / "server.crt")
-    ):
+    if all(path.is_file() for path in expected):
         return
     with tempfile.TemporaryDirectory(prefix="cert-build-", dir=canary) as temp_text:
         temp = Path(temp_text)
@@ -1384,7 +1636,7 @@ def _ensure_canary_certificates(config: HostConfig) -> None:
                 "rsa:3072",
                 "-sha256",
                 "-days",
-                str(_CANARY_CERT_VALIDITY_DAYS),
+                "30",
                 "-nodes",
                 "-subj",
                 "/CN=CDM Canary Test CA",
@@ -1435,7 +1687,7 @@ def _ensure_canary_certificates(config: HostConfig) -> None:
                 str(temp / "ca.key"),
                 "-CAcreateserial",
                 "-days",
-                str(_CANARY_CERT_VALIDITY_DAYS),
+                "30",
                 "-sha256",
                 "-extfile",
                 str(extensions),
@@ -1447,15 +1699,6 @@ def _ensure_canary_certificates(config: HostConfig) -> None:
             destination = canary / name
             os.replace(temp / name, destination)
             os.chmod(destination, 0o600 if name.endswith(".key") else 0o644)
-
-
-def _certificate_valid_for(path: Path, seconds: int) -> bool:
-    result = _run(
-        ["openssl", "x509", "-checkend", str(seconds), "-noout", "-in", str(path)],
-        check=False,
-        capture=True,
-    )
-    return result.returncode == 0
 
 
 def _ensure_target_trust_bundle(config: HostConfig, manifest: RuntimeManifest) -> None:
@@ -1488,30 +1731,6 @@ def _ensure_target_trust_bundle(config: HostConfig, manifest: RuntimeManifest) -
         bundle,
         mode=0o644,
     )
-
-
-def _conda_trust_mounts(config: HostConfig, bundle: Path) -> list[dict[str, Any]]:
-    root = config.profile.conda_root
-    if root is None:
-        return []
-    environment_roots = [root]
-    if config.profile.default_conda_env is not None:
-        environment_roots.append(root / "envs" / config.profile.default_conda_env)
-    candidates: list[Path] = []
-    for environment_root in environment_roots:
-        candidates.append(environment_root / "ssl" / "cacert.pem")
-        candidates.extend(
-            sorted(environment_root.glob("lib/python*/site-packages/certifi/cacert.pem"))
-        )
-    targets: list[Path] = []
-    for candidate in candidates:
-        try:
-            regular = candidate.is_file() and not candidate.is_symlink()
-        except OSError:
-            regular = False
-        if regular and candidate not in targets:
-            targets.append(candidate)
-    return [_bind(bundle, target) for target in targets]
 
 
 def _ensure_upstream_trust_bundle(config: HostConfig) -> None:
@@ -1609,10 +1828,16 @@ def _target_dns_address(manifest: RuntimeManifest) -> str:
 
 
 def _target_resolver_content(manifest: RuntimeManifest) -> str:
-    return f"nameserver {_target_dns_address(manifest)}\nsearch .\noptions edns0 trust-ad ndots:0\n"
+    return (
+        f"nameserver {_target_dns_address(manifest)}\n"
+        "search .\n"
+        "options edns0 trust-ad ndots:0\n"
+    )
 
 
-def _configure_infrastructure_network(config: HostConfig, manifest: RuntimeManifest) -> None:
+def _configure_infrastructure_network(
+    config: HostConfig, manifest: RuntimeManifest
+) -> None:
     if config.upstream.kind != "http" or config.upstream.port is None:
         raise DeploymentError("透明网络要求本机 HTTP 父代理")
     gateway_pid = _service_pid(config, manifest, "gateway")
@@ -1622,19 +1847,6 @@ def _configure_infrastructure_network(config: HostConfig, manifest: RuntimeManif
     if dns_upstream_address != upstream_address:
         raise DeploymentError("网关与 DNS 看到的父代理地址不一致")
     tcp_ports = _nft_port_set(_transparent_tcp_ports(manifest))
-    ssh_sets = ""
-    ssh_forward = ""
-    if manifest.ssh_enabled:
-        ssh_sets = """
-  set audit_ssh_addresses { type ipv4_addr; flags timeout; timeout 5s; }
-  set audit_ssh_ports { type inet_service; flags timeout; timeout 5s; }
-"""
-        ssh_forward = f"""
-    ip saddr @audit_ssh_addresses ip daddr {manifest.target_address}
-      tcp sport @audit_ssh_ports ct state established,related accept
-    ip saddr {manifest.target_address} ip daddr @audit_ssh_addresses
-      tcp dport @audit_ssh_ports accept
-"""
     _apply_nft(
         gateway_pid,
         f"""
@@ -1642,7 +1854,6 @@ table inet cdm_control {{
   set audit_parent_addresses {{ type ipv4_addr; flags timeout; timeout 5s; }}
   set audit_canary_addresses {{ type ipv4_addr; flags timeout; timeout 5s; }}
   set audit_target_addresses {{ type ipv4_addr; flags timeout; timeout 5s; }}
-{ssh_sets}
   chain prerouting {{
     type nat hook prerouting priority dstnat; policy accept;
     ip saddr {manifest.target_address} tcp dport {{ {tcp_ports} }} redirect to :8080
@@ -1655,7 +1866,6 @@ table inet cdm_control {{
   }}
   chain forward {{
     type filter hook forward priority filter; policy drop;
-{ssh_forward}
   }}
   chain output {{
     type filter hook output priority filter; policy drop;
@@ -1692,94 +1902,29 @@ table inet cdm_control {{
     )
     _verify_nft_table(gateway_pid)
     _verify_nft_table(dns_pid)
-    if manifest.ssh_enabled:
-        _configure_gateway_ssh_route(manifest, gateway_pid, upstream_address)
 
 
-def _configure_gateway_ssh_route(
-    manifest: RuntimeManifest, gateway_pid: int, upstream_address: str
+def _configure_host_parent_guard(
+    config: HostConfig, manifest: RuntimeManifest
 ) -> None:
-    """Route the exact Tailscale SSH destinations through the host bridge."""
-    _run(
-        [
-            "nsenter",
-            "--target",
-            str(gateway_pid),
-            "--net",
-            "--",
-            "sysctl",
-            "-w",
-            "net.ipv4.ip_forward=1",
-        ]
-    )
-    for address in manifest.ssh_allowed_addresses:
-        _run(
-            [
-                "nsenter",
-                "--target",
-                str(gateway_pid),
-                "--net",
-                "--",
-                "ip",
-                "route",
-                "replace",
-                f"{address}/32",
-                "via",
-                upstream_address,
-            ]
-        )
-
-
-def _configure_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) -> None:
     if config.upstream.kind != "http" or config.upstream.port is None:
         raise DeploymentError("宿主父代理防火墙要求本机 HTTP 父代理")
     bridge = _upstream_bridge_name(config, manifest)
     table = _host_parent_table(manifest)
-    sources = ", ".join((manifest.gateway_upstream_address, manifest.dns_upstream_address))
-    ssh_sets = ""
-    ssh_input_rule = ""
-    ssh_chains = ""
-    if manifest.ssh_enabled:
-        ssh_addresses = _nft_ipv4_set(manifest.ssh_allowed_addresses)
-        ssh_ports = _nft_port_set(manifest.ssh_ports)
-        ssh_sets = f"""
-  set ssh_addresses {{ type ipv4_addr; elements = {{ {ssh_addresses} }} }}
-  set ssh_ports {{ type inet_service; elements = {{ {ssh_ports} }} }}
-"""
-        ssh_input_rule = f"""
-    iifname "{bridge}" ip saddr {manifest.target_address}
-      ip daddr @ssh_addresses tcp dport @ssh_ports accept
-"""
-        ssh_chains = f"""
-  chain forward {{
-    type filter hook forward priority -20; policy accept;
-    iifname "{manifest.ssh_interface}" oifname "{bridge}" ip saddr @ssh_addresses
-      ip daddr {manifest.target_address} tcp sport @ssh_ports ct state established,related accept
-    iifname "{bridge}" oifname "{manifest.ssh_interface}" ip saddr {manifest.target_address}
-      ip daddr @ssh_addresses tcp dport @ssh_ports accept
-    iifname "{bridge}" oifname "{manifest.ssh_interface}" ip saddr {manifest.target_address}
-      ip daddr @ssh_addresses tcp dport @ssh_ports drop
-  }}
-  chain postrouting {{
-    type nat hook postrouting priority srcnat; policy accept;
-    oifname "{manifest.ssh_interface}" ip saddr {manifest.target_address}
-      ip daddr @ssh_addresses tcp dport @ssh_ports masquerade
-  }}
-"""
+    sources = ", ".join(
+        (manifest.gateway_upstream_address, manifest.dns_upstream_address)
+    )
     _apply_host_nft(
         table,
         f"""
 table inet {table} {{
-{ssh_sets}
   chain input {{
     type filter hook input priority -20; policy accept;
     iifname "lo" tcp dport {config.upstream.port} accept
     iifname "{bridge}" ip saddr {{ {sources} }} tcp dport {config.upstream.port} accept
-{ssh_input_rule}
     iifname "{bridge}" drop
     tcp dport {config.upstream.port} drop
   }}
-{ssh_chains}
 }}
 """,
     )
@@ -1789,139 +1934,111 @@ table inet {table} {{
     )
     if f"tcp dport {config.upstream.port} drop" not in result.stdout:
         raise DeploymentError("宿主父代理防火墙没有默认拒绝规则")
-    _configure_host_ssh_forward_rules(manifest, bridge)
 
 
-def _configure_stopped_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) -> None:
+def _configure_stopped_host_parent_guard(
+    config: HostConfig, manifest: RuntimeManifest
+) -> None:
     if config.upstream.kind != "http" or config.upstream.port is None:
         raise DeploymentError("宿主父代理防火墙要求本机 HTTP 父代理")
-    _remove_host_ssh_forward_rules(manifest)
     table = _host_parent_table(manifest)
     _apply_host_nft(table, _stopped_host_parent_guard_script(config, manifest))
 
 
-def _configure_host_ssh_forward_rules(
-    manifest: RuntimeManifest, bridge: str
+def _configure_host_ssh_guard(config: HostConfig, manifest: RuntimeManifest) -> None:
+    if not config.host_ssh.enabled:
+        return
+    table = _host_ssh_table(manifest)
+    host_address = _target_host_address(manifest)
+    allow_rule = (
+        f"    ip saddr {manifest.target_address} ip daddr {host_address} "
+        f"tcp dport {config.host_ssh.port} accept"
+    )
+    _apply_host_nft(
+        table,
+        f"""
+table inet {table} {{
+  chain input {{
+    type filter hook input priority -19; policy accept;
+{allow_rule}
+    ip daddr {host_address} tcp dport {config.host_ssh.port} drop
+  }}
+}}
+""",
+    )
+
+
+def _configure_stopped_host_ssh_guard(
+    config: HostConfig, manifest: RuntimeManifest
 ) -> None:
-    _remove_host_ssh_forward_rules(manifest)
-    if not manifest.ssh_enabled:
+    if not config.host_ssh.enabled:
         return
-    if not _network_interface_exists(manifest.ssh_interface):
-        raise DeploymentError(f"SSH 网络接口不存在: {manifest.ssh_interface}")
-    iptables = shutil.which("iptables")
-    if iptables is None:
-        raise DeploymentError("Tailscale SSH 转发要求宿主提供 iptables")
-    _run(
-        [
-            "ip",
-            "route",
-            "replace",
-            f"{manifest.target_address}/32",
-            "via",
-            manifest.gateway_upstream_address,
-            "dev",
-            bridge,
-        ]
-    )
-    comment = _host_ssh_forward_comment(manifest)
-    for address in manifest.ssh_allowed_addresses:
-        for port in manifest.ssh_ports:
-            _run(
-                [
-                    iptables,
-                    "-w",
-                    "-I",
-                    "DOCKER-USER",
-                    "1",
-                    "-i",
-                    bridge,
-                    "-o",
-                    manifest.ssh_interface,
-                    "-s",
-                    manifest.target_address,
-                    "-d",
-                    address,
-                    "-p",
-                    "tcp",
-                    "--dport",
-                    str(port),
-                    "-m",
-                    "comment",
-                    "--comment",
-                    comment,
-                    "-j",
-                    "ACCEPT",
-                ]
-            )
-            _run(
-                [
-                    iptables,
-                    "-w",
-                    "-I",
-                    "DOCKER-USER",
-                    "1",
-                    "-i",
-                    manifest.ssh_interface,
-                    "-o",
-                    bridge,
-                    "-s",
-                    address,
-                    "-d",
-                    manifest.target_address,
-                    "-p",
-                    "tcp",
-                    "--sport",
-                    str(port),
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "ESTABLISHED,RELATED",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    comment,
-                    "-j",
-                    "ACCEPT",
-                ]
-            )
+    table = _host_ssh_table(manifest)
+    _apply_host_nft(table, _stopped_host_ssh_guard_script(config, manifest))
 
 
-def _remove_host_ssh_forward_rules(manifest: RuntimeManifest) -> None:
-    iptables = shutil.which("iptables")
-    if iptables is None:
+def _stopped_host_ssh_guard_script(
+    config: HostConfig, manifest: RuntimeManifest
+) -> str:
+    table = _host_ssh_table(manifest)
+    host_address = _target_host_address(manifest)
+    return f"""
+table inet {table} {{
+  chain input {{
+    type filter hook input priority -19; policy accept;
+    ip daddr {host_address} tcp dport {config.host_ssh.port} drop
+  }}
+}}
+"""
+
+
+def _configure_host_ssh_hosts_allow(
+    config: HostConfig, manifest: RuntimeManifest, *, enabled: bool
+) -> None:
+    if not config.host_ssh.enabled:
         return
-    result = _run(
-        [iptables, "-w", "-S", "DOCKER-USER"],
-        check=False,
-        capture=True,
-    )
-    if result.returncode != 0:
-        return
-    comment = _host_ssh_forward_comment(manifest)
-    for line in result.stdout.splitlines():
-        try:
-            rule = shlex.split(line)
-        except ValueError as exc:
-            raise DeploymentError("无法解析宿主 DOCKER-USER 规则") from exc
-        if not rule or rule[0] != "-A":
-            continue
-        if "--comment" not in rule:
-            continue
-        index = rule.index("--comment")
-        if index + 1 >= len(rule) or rule[index + 1] != comment:
-            continue
-        _run([iptables, "-w", "-D", *rule[1:]])
+    path = Path("/etc/hosts.allow")
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        raise DeploymentError(f"宿主机 hosts.allow 不是普通文件: {path}")
+    marker = f"# controlled-dev-machine {manifest.resource_prefix} host ssh"
+    entry = f"sshd:{manifest.target_address}:allow"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if enabled:
+        if any(line.strip() == entry for line in lines):
+            return
+        content = "\n".join(lines).rstrip("\n") + f"\n{marker}\n{entry}\n"
+    else:
+        filtered: list[str] = []
+        index = 0
+        while index < len(lines):
+            if lines[index].strip() == marker:
+                index += 1
+                if index < len(lines) and lines[index].strip() == entry:
+                    index += 1
+                continue
+            filtered.append(lines[index])
+            index += 1
+        content = "\n".join(filtered).rstrip("\n") + "\n"
+    _atomic_text(path, content, mode=stat.S_IMODE(metadata.st_mode))
 
 
-def _host_ssh_forward_comment(manifest: RuntimeManifest) -> str:
-    return f"{manifest.resource_prefix}-ssh"
+def _host_ssh_table(manifest: RuntimeManifest) -> str:
+    suffix = hashlib.sha256(manifest.resource_prefix.encode("ascii")).hexdigest()[:12]
+    return f"cdm_host_ssh_{suffix}"
 
 
-def _network_interface_exists(interface: str) -> bool:
-    return Path("/sys/class/net", interface).is_dir()
+def _target_host_address(manifest: RuntimeManifest) -> str:
+    network = ipaddress.ip_network(manifest.target_subnet)
+    try:
+        return str(next(network.hosts()))
+    except StopIteration as exc:
+        raise DeploymentError("目标网络没有可用的宿主机地址") from exc
 
 
-def _stopped_host_parent_guard_script(config: HostConfig, manifest: RuntimeManifest) -> str:
+def _stopped_host_parent_guard_script(
+    config: HostConfig, manifest: RuntimeManifest
+) -> str:
     if config.upstream.port is None:
         raise DeploymentError("宿主父代理端口未配置")
     table = _host_parent_table(manifest)
@@ -1943,8 +2060,6 @@ def _install_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) ->
     systemctl = shutil.which("systemctl")
     if nft is None or systemctl is None:
         raise DeploymentError("持久父代理门禁要求宿主提供 nft 和 systemctl")
-    if manifest.ssh_enabled and shutil.which("iptables") is None:
-        raise DeploymentError("Tailscale SSH 转发要求宿主提供 iptables")
 
     guard_root = Path("/etc/controlled-dev-machine")
     _mkdir(guard_root, 0o755, 0, 0)
@@ -1974,12 +2089,7 @@ def _install_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) ->
         _host_parent_guard_runner_script(nft, table, nft_path, reload_path),
         mode=0o755,
     )
-    forwarding_preflight = (
-        "ExecStartPre=/usr/bin/sysctl -w net.ipv4.ip_forward=1\n"
-        if manifest.ssh_enabled
-        else ""
-    )
-    _atomic_text(
+    _install_systemd_unit(
         unit_path,
         (
             "[Unit]\n"
@@ -1989,16 +2099,81 @@ def _install_host_parent_guard(config: HostConfig, manifest: RuntimeManifest) ->
             "Before=network-pre.target docker.service\n\n"
             "[Service]\n"
             "Type=oneshot\n"
-            + forwarding_preflight
-            + f"ExecStart={runner_path}\n"
-            + "RemainAfterExit=yes\n\n"
-            + "[Install]\n"
-            + "WantedBy=multi-user.target\n"
+            f"ExecStart={runner_path}\n"
+            "RemainAfterExit=yes\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
         ),
+        systemctl=systemctl,
+    )
+    if config.host_ssh.enabled:
+        _install_host_ssh_guard(config, manifest, nft=nft, systemctl=systemctl)
+
+
+def _install_host_ssh_guard(
+    config: HostConfig,
+    manifest: RuntimeManifest,
+    *,
+    nft: str,
+    systemctl: str,
+) -> None:
+    guard_root = Path("/etc/controlled-dev-machine")
+    name = f"{manifest.resource_prefix}-host-ssh-guard"
+    table = _host_ssh_table(manifest)
+    nft_path = guard_root / f"{name}.nft"
+    reload_path = guard_root / f"{name}.reload.nft"
+    runner_path = guard_root / f"{name}.sh"
+    unit_path = Path("/etc/systemd/system") / f"{name}.service"
+    for path in (nft_path, reload_path, runner_path, unit_path):
+        if path.is_symlink():
+            raise DeploymentError(f"宿主 SSH 门禁文件不能是符号链接: {path}")
+    stopped_script = _stopped_host_ssh_guard_script(config, manifest).lstrip()
+    _atomic_text(nft_path, stopped_script, mode=0o644)
+    _atomic_text(
+        reload_path,
+        f"delete table inet {table}\n{stopped_script}",
         mode=0o644,
     )
-    _run([systemctl, "daemon-reload"])
-    _run([systemctl, "enable", unit_path.name])
+    _atomic_text(
+        runner_path,
+        _host_parent_guard_runner_script(nft, table, nft_path, reload_path),
+        mode=0o755,
+    )
+    _install_systemd_unit(
+        unit_path,
+        (
+            "[Unit]\n"
+            "Description=Controlled development machine host SSH guard\n"
+            "DefaultDependencies=no\n"
+            "After=local-fs.target\n"
+            "Before=network-pre.target docker.service\n\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            f"ExecStart={runner_path}\n"
+            "RemainAfterExit=yes\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        ),
+        systemctl=systemctl,
+    )
+
+
+def _install_systemd_unit(unit_path: Path, content: str, *, systemctl: str) -> None:
+    previous = unit_path.read_text(encoding="utf-8") if unit_path.exists() else None
+    if previous != content:
+        previous_mode = stat.S_IMODE(unit_path.stat().st_mode) if previous is not None else 0o644
+        _atomic_text(unit_path, content, mode=0o644)
+        try:
+            _run([systemctl, "daemon-reload"])
+        except Exception:
+            if previous is None:
+                unit_path.unlink()
+            else:
+                _atomic_text(unit_path, previous, mode=previous_mode)
+            raise
+    enabled = unit_path.parent / "multi-user.target.wants" / unit_path.name
+    if not enabled.is_symlink() or enabled.resolve() != unit_path.resolve():
+        _run([systemctl, "enable", "--no-reload", unit_path.name])
 
 
 def _host_parent_guard_runner_script(
@@ -2016,7 +2191,6 @@ def _host_parent_guard_runner_script(
 
 
 def _remove_host_parent_guard(manifest: RuntimeManifest) -> None:
-    _remove_host_ssh_forward_rules(manifest)
     table = _host_parent_table(manifest)
     result = _run(
         ["nft", "list", "table", "inet", table],
@@ -2065,41 +2239,36 @@ def _apply_host_nft(table: str, script: str) -> None:
 
 def _configure_target_network(config: HostConfig, manifest: RuntimeManifest) -> None:
     target_pid = _service_pid(config, manifest, "target")
-    ssh_rules = ""
-    ssh_sets = ""
-    if manifest.ssh_enabled:
-        ssh_sets = """
-  set audit_ssh_addresses { type ipv4_addr; flags timeout; timeout 5s; }
-  set audit_ssh_ports { type inet_service; flags timeout; timeout 5s; }
-"""
-        ssh_rules = """
-    ip daddr @audit_ssh_addresses tcp dport @audit_ssh_ports accept
-"""
+    host_ssh_rule = ""
+    host_ssh_block = ""
+    if config.host_ssh.enabled:
+        host_address = _target_host_address(manifest)
+        host_ssh_rule = (
+            f"    ip daddr {host_address} "
+            f"tcp dport {config.host_ssh.port} accept\n"
+        )
+        host_ssh_block = f"    ip daddr {host_address} drop\n"
     _apply_nft(
         target_pid,
-        """
-table inet cdm_control {
-  set audit_tcp_ports { type inet_service; flags timeout; timeout 5s; }
-  set audit_dns_addresses { type ipv4_addr; flags timeout; timeout 5s; }
-"""
-        + ssh_sets
-        + """
-  chain input {
+        f"""
+table inet cdm_control {{
+  set audit_tcp_ports {{ type inet_service; flags timeout; timeout 5s; }}
+  set audit_dns_addresses {{ type ipv4_addr; flags timeout; timeout 5s; }}
+  chain input {{
     type filter hook input priority filter; policy drop;
     iifname "lo" accept
     ct state established,related accept
-  }
-  chain output {
+  }}
+  chain output {{
     type filter hook output priority filter; policy drop;
     oifname "lo" accept
     ip daddr @audit_dns_addresses udp dport 53 accept
     ip daddr @audit_dns_addresses tcp dport 53 accept
+{host_ssh_rule.rstrip()}
+{host_ssh_block.rstrip()}
     tcp dport @audit_tcp_ports accept
-"""
-        + ssh_rules
-        + """
-  }
-}
+  }}
+}}
 """,
     )
     _verify_nft_table(target_pid)
@@ -2164,21 +2333,6 @@ def _nft_port_set(ports: tuple[int, ...]) -> str:
     if not ports or any(port < 1 or port > 65535 for port in ports):
         raise DeploymentError("透明网络 TCP 端口集合无效")
     return ", ".join(str(port) for port in ports)
-
-
-def _nft_ipv4_set(addresses: tuple[str, ...]) -> str:
-    if not addresses:
-        raise DeploymentError("IPv4 地址集合不能为空")
-    normalized: list[str] = []
-    for value in addresses:
-        try:
-            address = ipaddress.ip_address(value)
-        except ValueError as exc:
-            raise DeploymentError(f"IPv4 地址集合包含无效地址: {value}") from exc
-        if not isinstance(address, ipaddress.IPv4Address):
-            raise DeploymentError(f"IPv4 地址集合包含非 IPv4 地址: {value}")
-        normalized.append(str(address))
-    return ", ".join(normalized)
 
 
 def _container_host_address(pid: int, hostname: str) -> str:
@@ -2253,13 +2407,15 @@ def _verify_nft_table(pid: int) -> None:
         raise DeploymentError("透明网络防火墙没有默认阻断")
 
 
-def _isolated_network(subnet: str) -> dict[str, Any]:
+def _isolated_network(subnet: str, *, host_access: bool = False) -> dict[str, Any]:
     return {
         "driver": "bridge",
         "internal": True,
         "enable_ipv6": False,
         "driver_opts": {
-            "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
+            "com.docker.network.bridge.gateway_mode_ipv4": (
+                "nat" if host_access else "isolated"
+            ),
             "com.docker.network.bridge.gateway_mode_ipv6": "isolated",
         },
         "ipam": {"config": [{"subnet": subnet}]},
@@ -2272,17 +2428,30 @@ def _upstream_network(subnet: str) -> dict[str, Any]:
         "driver": "bridge",
         "internal": True,
         "enable_ipv6": False,
-        "ipam": {"config": [{"subnet": subnet, "gateway": str(next(network.hosts()))}]},
+        "ipam": {
+            "config": [
+                {"subnet": subnet, "gateway": str(next(network.hosts()))}
+            ]
+        },
     }
 
 
-def _bind(source: Path, target: str | Path, *, read_only: bool = True) -> dict[str, Any]:
+def _bind(
+    source: Path,
+    target: str | Path,
+    *,
+    read_only: bool = True,
+    propagation: str | None = None,
+) -> dict[str, Any]:
     return {
         "type": "bind",
         "source": str(source),
         "target": str(target),
         "read_only": read_only,
-        "bind": {"create_host_path": False},
+        "bind": {
+            "create_host_path": False,
+            **({"propagation": propagation} if propagation is not None else {}),
+        },
     }
 
 
@@ -2309,7 +2478,9 @@ def _service_healthy(config: HostConfig, manifest: RuntimeManifest, service: str
 def _require_gateway_image(config: HostConfig, manifest: RuntimeManifest) -> None:
     current_digest = _gateway_build_digest(Path(manifest.repo_root))
     if current_digest != manifest.gateway_build_digest:
-        raise DeploymentError("网关源码已变化；重新执行 sandboxctl init、build 后再启动")
+        raise DeploymentError(
+            "网关源码已变化；重新执行 sandboxctl init、build 后再启动"
+        )
     result = _docker(
         config,
         "image",
@@ -2321,7 +2492,9 @@ def _require_gateway_image(config: HostConfig, manifest: RuntimeManifest) -> Non
         check=False,
     )
     if result.returncode != 0 or result.stdout.strip() != manifest.gateway_build_digest:
-        raise DeploymentError("网关镜像不存在或构建摘要不符；重新执行 sandboxctl build 后再启动")
+        raise DeploymentError(
+            "网关镜像不存在或构建摘要不符；重新执行 sandboxctl build 后再启动"
+        )
     _require_pinned_image_id(config, manifest, "gateway", manifest.gateway_image)
 
 
@@ -2330,7 +2503,9 @@ def _require_target_image(config: HostConfig, manifest: RuntimeManifest) -> None
         raise DeploymentError("目标镜像缺少构建摘要；重新执行 sandboxctl init、build")
     current_digest = _target_build_digest(config, Path(manifest.repo_root))
     if current_digest != manifest.target_build_digest:
-        raise DeploymentError("目标镜像构建输入已变化；重新执行 sandboxctl init、build 后再启动")
+        raise DeploymentError(
+            "目标镜像构建输入已变化；重新执行 sandboxctl init、build 后再启动"
+        )
     result = _docker(
         config,
         "image",
@@ -2342,15 +2517,15 @@ def _require_target_image(config: HostConfig, manifest: RuntimeManifest) -> None
         check=False,
     )
     if result.returncode != 0 or result.stdout.strip() != manifest.target_build_digest:
-        raise DeploymentError("目标镜像不存在或构建摘要不符；重新执行 sandboxctl build 后再启动")
+        raise DeploymentError(
+            "目标镜像不存在或构建摘要不符；重新执行 sandboxctl build 后再启动"
+        )
     _require_pinned_image_id(config, manifest, "target", manifest.target_image)
 
 
 def _image_record_path(config: HostConfig, manifest: RuntimeManifest) -> Path:
-    return (
-        config.paths.state
-        / "images"
-        / (f"{manifest.target_build_digest}-{manifest.gateway_build_digest}.json")
+    return config.paths.state / "images" / (
+        f"{manifest.target_build_digest}-{manifest.gateway_build_digest}.json"
     )
 
 
@@ -2394,7 +2569,9 @@ def _pin_built_images(config: HostConfig, manifest: RuntimeManifest) -> None:
         if not isinstance(previous, dict) or any(
             previous.get(key) != record[key] for key in immutable_keys
         ):
-            raise DeploymentError("同一构建摘要已经登记了不同的镜像内容；恢复旧镜像或更换构建输入")
+            raise DeploymentError(
+                "同一构建摘要已经登记了不同的镜像内容；恢复旧镜像或更换构建输入"
+            )
         return
     _atomic_text(path, json.dumps(record, indent=2, sort_keys=True) + "\n", mode=0o600)
 
@@ -2459,15 +2636,9 @@ def _require_policy_files(manifest: RuntimeManifest) -> None:
         raise DeploymentError("活动策略副本与运行清单摘要不符；重新执行 sandboxctl init")
 
 
-def _require_profile_sources(config: HostConfig, manifest: RuntimeManifest) -> None:
-    if not manifest.profile_source_digest:
-        return
-    _, current_digest = _profile_bundle(config, Path(manifest.repo_root))
-    if current_digest != manifest.profile_source_digest:
-        raise DeploymentError("宿主 profile 已变化；重新执行 sandboxctl init 后再启动")
-
-
 def _check_gpu_cdi(config: HostConfig) -> None:
+    if config.gpu.mode == "none":
+        return
     if config.gpu.mode != "all":
         raise DeploymentError(f"不支持的 GPU 模式: {config.gpu.mode}")
     if shutil.which("nvidia-ctk") is None:
@@ -2515,8 +2686,36 @@ def _check_upstream(config: HostConfig) -> str | None:
     return str(address)
 
 
-def _service_container_id(config: HostConfig, manifest: RuntimeManifest, service: str) -> str:
-    return _compose(config, manifest, "ps", "-q", service, capture=True, check=False).stdout.strip()
+def _service_container_id(
+    config: HostConfig, manifest: RuntimeManifest, service: str
+) -> str:
+    return _compose(
+        config, manifest, "ps", "-q", service, capture=True, check=False
+    ).stdout.strip()
+
+
+def _service_relay_command(
+    config: HostConfig, manifest: RuntimeManifest, target_pid: int
+) -> list[str] | None:
+    ports = config.service_ports
+    if ports is None:
+        return None
+    return [
+        sys.executable,
+        str(Path(manifest.repo_root) / "src/controlled_dev_machine/service_relay.py"),
+        "--bind-address",
+        ports.bind_address,
+        "--start",
+        str(ports.start),
+        "--end",
+        str(ports.end),
+        "--target-netns",
+        f"/proc/{target_pid}/ns/net",
+        "--uid",
+        str(_SERVICE_RELAY_UID),
+        "--gid",
+        str(_SERVICE_RELAY_GID),
+    ]
 
 
 def _start_audit(
@@ -2525,11 +2724,8 @@ def _start_audit(
     *,
     observed_upstream_ip: str | None = None,
 ) -> None:
-    if any(
-        shutil.which(command) is None
-        for command in ("nsenter", "tcpdump", "mount", "mountpoint", "umount")
-    ):
-        raise DeploymentError("缺少 nsenter、tcpdump 或绑定挂载命令，拒绝启动未审计的目标容器")
+    if shutil.which("nsenter") is None or shutil.which("tcpdump") is None:
+        raise DeploymentError("缺少 nsenter 或 tcpdump，拒绝启动未审计的目标容器")
     if shutil.which("bpftrace") is None:
         raise DeploymentError("缺少 bpftrace，拒绝启动未审计的目标容器")
     target_pid = _service_pid(config, manifest, "target")
@@ -2552,7 +2748,6 @@ def _start_audit(
     cgroup_id = _bpftrace_cgroup_id(cgroup_path)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
     pcap_root = config.paths.audit / "pcap" / run_id
-    pcap_output_root = _prepare_pcap_output_alias(config) / run_id
     structured_root = config.paths.audit / "structured" / run_id
     _mkdir(pcap_root, 0o700, 0, 0)
     _mkdir(structured_root, 0o700, 0, 0)
@@ -2572,22 +2767,85 @@ def _start_audit(
         "entries": [],
     }
     _write_audit_state(config, state)
-    commands = (
+    commands = [
         (
             "target-pcap",
-            _pcap_command(config, target_pid, pcap_output_root / "target.pcap"),
+            [
+                "nsenter",
+                "--target",
+                str(target_pid),
+                "--net",
+                "--",
+                "tcpdump",
+                "-i",
+                "any",
+                "-U",
+                "-s",
+                "0",
+                "-B",
+                "4096",
+                "-nn",
+                "-Z",
+                "root",
+                "-w",
+                str(pcap_root / "target-%Y%m%d-%H%M%S.pcap"),
+                "-G",
+                "3600",
+            ],
             pcap_root / "target.tcpdump.log",
             None,
         ),
         (
             "gateway-pcap",
-            _pcap_command(config, gateway_pid, pcap_output_root / "gateway.pcap"),
+            [
+                "nsenter",
+                "--target",
+                str(gateway_pid),
+                "--net",
+                "--",
+                "tcpdump",
+                "-i",
+                "any",
+                "-U",
+                "-s",
+                "0",
+                "-B",
+                "4096",
+                "-nn",
+                "-Z",
+                "root",
+                "-w",
+                str(pcap_root / "gateway-%Y%m%d-%H%M%S.pcap"),
+                "-G",
+                "3600",
+            ],
             pcap_root / "gateway.tcpdump.log",
             None,
         ),
         (
             "dns-pcap",
-            _pcap_command(config, dns_pid, pcap_output_root / "dns.pcap"),
+            [
+                "nsenter",
+                "--target",
+                str(dns_pid),
+                "--net",
+                "--",
+                "tcpdump",
+                "-i",
+                "any",
+                "-U",
+                "-s",
+                "0",
+                "-B",
+                "4096",
+                "-nn",
+                "-Z",
+                "root",
+                "-w",
+                str(pcap_root / "dns-%Y%m%d-%H%M%S.pcap"),
+                "-G",
+                "3600",
+            ],
             pcap_root / "dns.tcpdump.log",
             None,
         ),
@@ -2602,13 +2860,21 @@ def _start_audit(
             structured_root / "connect.bpftrace.log",
             structured_root / "connect.log",
         ),
-    )
+    ]
+    relay_command = _service_relay_command(config, manifest, target_pid)
+    if relay_command is not None:
+        commands.append(
+            (
+                "service-relay",
+                relay_command,
+                structured_root / "service-relay.log",
+                None,
+            )
+        )
     started: list[dict[str, object]] = []
-    started_processes: list[subprocess.Popen[bytes]] = []
     try:
         for kind, command, error_log, capture_path in commands:
             process = _spawn_audit_process(command, error_log, capture_path)
-            started_processes.append(process)
             starttime = _proc_starttime(process.pid)
             entry = {
                 "kind": kind,
@@ -2640,7 +2906,9 @@ def _start_audit(
                         _proc_starttime(process.pid) if process.poll() is None else None
                     )
                     current_identity = (
-                        process_identity(process.pid) if current_starttime == starttime else None
+                        process_identity(process.pid)
+                        if current_starttime == starttime
+                        else None
                     )
                 except (DeploymentError, OSError):
                     current_identity = None
@@ -2654,64 +2922,6 @@ def _start_audit(
         dns_upstream_address = _container_host_address(dns_pid, "upstream.cdm.test")
         target_network = ipaddress.ip_network(manifest.target_subnet)
         dns_address = str(list(target_network.hosts())[3])
-        target_watchdog_sets = [
-            {
-                "name": "audit_tcp_ports",
-                "kind": "port",
-                "values": list(_transparent_tcp_ports(manifest)),
-            },
-            {
-                "name": "audit_dns_addresses",
-                "kind": "ipv4",
-                "values": [dns_address],
-            },
-        ]
-        gateway_watchdog_sets = [
-            {
-                "name": "audit_parent_addresses",
-                "kind": "ipv4",
-                "values": [upstream_address],
-            },
-            {
-                "name": "audit_canary_addresses",
-                "kind": "ipv4",
-                "values": [manifest.canary_address],
-            },
-            {
-                "name": "audit_target_addresses",
-                "kind": "ipv4",
-                "values": [manifest.target_address],
-            },
-        ]
-        if manifest.ssh_enabled:
-            target_watchdog_sets.extend(
-                (
-                    {
-                        "name": "audit_ssh_addresses",
-                        "kind": "ipv4",
-                        "values": list(manifest.ssh_allowed_addresses),
-                    },
-                    {
-                        "name": "audit_ssh_ports",
-                        "kind": "port",
-                        "values": list(manifest.ssh_ports),
-                    },
-                )
-            )
-            gateway_watchdog_sets.extend(
-                (
-                    {
-                        "name": "audit_ssh_addresses",
-                        "kind": "ipv4",
-                        "values": list(manifest.ssh_allowed_addresses),
-                    },
-                    {
-                        "name": "audit_ssh_ports",
-                        "kind": "port",
-                        "values": list(manifest.ssh_ports),
-                    },
-                )
-            )
         watchdog = {
             "schema_version": 2,
             "lease_seconds": 5,
@@ -2729,14 +2939,41 @@ def _start_audit(
                     "pid": target_pid,
                     "starttime": namespaces[0]["starttime"],
                     "identity": namespaces[0]["identity"],
-                    "sets": target_watchdog_sets,
+                    "sets": [
+                        {
+                            "name": "audit_tcp_ports",
+                            "kind": "port",
+                            "values": list(_transparent_tcp_ports(manifest)),
+                        },
+                        {
+                            "name": "audit_dns_addresses",
+                            "kind": "ipv4",
+                            "values": [dns_address],
+                        },
+                    ],
                 },
                 {
                     "name": "gateway",
                     "pid": gateway_pid,
                     "starttime": namespaces[1]["starttime"],
                     "identity": namespaces[1]["identity"],
-                    "sets": gateway_watchdog_sets,
+                    "sets": [
+                        {
+                            "name": "audit_parent_addresses",
+                            "kind": "ipv4",
+                            "values": [upstream_address],
+                        },
+                        {
+                            "name": "audit_canary_addresses",
+                            "kind": "ipv4",
+                            "values": [manifest.canary_address],
+                        },
+                        {
+                            "name": "audit_target_addresses",
+                            "kind": "ipv4",
+                            "values": [manifest.target_address],
+                        },
+                    ],
                 },
                 {
                     "name": "dns",
@@ -2766,7 +3003,10 @@ def _start_audit(
         watchdog_process = _spawn_audit_process(
             [
                 sys.executable,
-                str(Path(manifest.repo_root) / "src/controlled_dev_machine/network_watchdog.py"),
+                str(
+                    Path(manifest.repo_root)
+                    / "src/controlled_dev_machine/network_watchdog.py"
+                ),
                 "--config",
                 str(watchdog_config),
                 "--ready",
@@ -2781,7 +3021,10 @@ def _start_audit(
             "starttime": _proc_starttime(watchdog_process.pid),
             "command": [
                 sys.executable,
-                str(Path(manifest.repo_root) / "src/controlled_dev_machine/network_watchdog.py"),
+                str(
+                    Path(manifest.repo_root)
+                    / "src/controlled_dev_machine/network_watchdog.py"
+                ),
                 "--config",
                 str(watchdog_config),
                 "--ready",
@@ -2803,152 +3046,27 @@ def _start_audit(
             time.sleep(0.1)
         else:
             raise DeploymentError("网络审计监督未在期限内续期防火墙")
-    except Exception as exc:
-        cleanup_errors: list[str] = []
-        for process in reversed(started_processes):
-            try:
-                _terminate_spawned_audit_process(process)
-            except Exception as cleanup_exc:
-                cleanup_errors.append(str(cleanup_exc))
-        if cleanup_errors:
-            raise DeploymentError(
-                "审计启动失败，且探针清理未完成: " + "; ".join(cleanup_errors)
-            ) from exc
+    except Exception:
+        state["entries"] = started
+        _write_audit_state(config, state)
         raise
-
-
-def _pcap_command(config: HostConfig, pid: int, output: Path) -> list[str]:
-    return [
-        "nsenter",
-        "--target",
-        str(pid),
-        "--net",
-        "--",
-        "tcpdump",
-        "-i",
-        "any",
-        "-U",
-        "-s",
-        "0",
-        "-B",
-        "4096",
-        "-nn",
-        "-Z",
-        "root",
-        "-C",
-        str(_pcap_roll_size_million_bytes(config.storage.pcap_roll_size_mib)),
-        "-W",
-        str(config.storage.pcap_roll_files),
-        "-w",
-        str(output),
-    ]
-
-
-def _pcap_roll_size_million_bytes(size_mib: int) -> int:
-    """tcpdump -C uses decimal megabytes; keep the configured MiB budget close."""
-    return max(1, size_mib * 1024**2 // 1_000_000)
-
-
-def _pcap_output_alias(config: HostConfig) -> Path:
-    return _PCAP_OUTPUT_ROOT / config.resource_prefix
-
-
-def _prepare_pcap_output_alias(config: HostConfig) -> Path:
-    source = config.paths.audit / "pcap"
-    if source.is_symlink() or not source.is_dir():
-        raise DeploymentError(f"PCAP 审计目录类型异常: {source}")
-    root = _PCAP_OUTPUT_ROOT
-    if root.is_symlink() or (root.exists() and not root.is_dir()):
-        raise DeploymentError(f"PCAP 写入目录类型异常: {root}")
-    root.mkdir(mode=0o700, exist_ok=True)
-    metadata = root.lstat()
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & 0o077
-    ):
-        raise DeploymentError(f"PCAP 写入目录权限异常: {root}")
-
-    alias = _pcap_output_alias(config)
-    if alias.is_symlink() or (alias.exists() and not alias.is_dir()):
-        raise DeploymentError(f"PCAP 写入路径类型异常: {alias}")
-    if not alias.exists():
-        alias.mkdir(mode=0o700)
-    if _path_is_mountpoint(alias):
-        if not _same_file(alias, source):
-            raise DeploymentError(f"PCAP 写入路径指向其他目录: {alias}")
-        return alias
-    if any(alias.iterdir()):
-        raise DeploymentError(f"PCAP 写入路径不是空目录: {alias}")
-    _run(["mount", "--bind", "--", str(source), str(alias)])
-    if not _path_is_mountpoint(alias) or not _same_file(alias, source):
-        _run(["umount", "--", str(alias)], check=False)
-        raise DeploymentError(f"PCAP 写入路径绑定失败: {alias}")
-    return alias
-
-
-def _remove_pcap_output_alias(config: HostConfig) -> None:
-    source = config.paths.audit / "pcap"
-    alias = _pcap_output_alias(config)
-    if alias.is_symlink() or (alias.exists() and not alias.is_dir()):
-        raise DeploymentError(f"PCAP 写入路径类型异常: {alias}")
-    if not alias.exists():
-        return
-    if _path_is_mountpoint(alias):
-        if not _same_file(alias, source):
-            raise DeploymentError(f"PCAP 写入路径指向其他目录: {alias}")
-        _run(["umount", "--", str(alias)])
-    if any(alias.iterdir()):
-        raise DeploymentError(f"PCAP 写入路径卸载后不是空目录: {alias}")
-    alias.rmdir()
-
-
-def _path_is_mountpoint(path: Path) -> bool:
-    result = _run(
-        ["mountpoint", "--quiet", "--", str(path)],
-        check=False,
-        capture=True,
-    )
-    return result.returncode == 0
-
-
-def _same_file(left: Path, right: Path) -> bool:
-    try:
-        return left.samefile(right)
-    except OSError:
-        return False
-
-
-def _terminate_spawned_audit_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        process.wait()
-        return
-    with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGINT)
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        if process.poll() is None:
-            with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-        process.wait(timeout=2)
 
 
 def _stop_audit(config: HostConfig) -> None:
     path = _active_audit_path(config)
-    if path.exists():
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-            entries = state.get("entries", [])
-            if not isinstance(entries, list):
-                raise ValueError("entries is not a list")
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise DeploymentError(f"审计运行清单损坏，拒绝猜测并停止: {path}") from exc
-        for entry in entries:
-            if not isinstance(entry, dict):
-                raise DeploymentError(f"审计运行清单包含异常进程项: {path}")
-            _terminate_owned_process(entry)
-    _remove_pcap_output_alias(config)
+    if not path.exists():
+        return
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        entries = state.get("entries", [])
+        if not isinstance(entries, list):
+            raise ValueError("entries is not a list")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise DeploymentError(f"审计运行清单损坏，拒绝猜测并停止: {path}") from exc
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise DeploymentError(f"审计运行清单包含异常进程项: {path}")
+        _terminate_owned_process(entry)
     path.unlink(missing_ok=True)
 
 
@@ -3007,12 +3125,27 @@ def _target_cgroup_path(pid: int) -> str:
 
 def _bpftrace_cgroup_id(path: str) -> int:
     expression = f'BEGIN {{ printf("%llu\\n", cgroupid("{path}")); exit(); }}'
-    result = _run(["bpftrace", "-e", expression], capture=True)
+    result = _run(["bpftrace", "-e", expression], capture=True, check=False)
     for line in result.stdout.splitlines():
         line = line.strip()
         if line.isdecimal():
             return int(line)
-    raise DeploymentError(f"无法解析目标 cgroup ID: {path}")
+    # Ubuntu's packaged bpftrace 0.14 can fail to attach its BEGIN trigger
+    # because the stripped binary lacks BEGIN_trigger. For cgroup v2, the
+    # kernel cgroup ID used by bpftrace's /cgroup filter is the directory
+    # inode, so use that exact local value while retaining later probe checks.
+    cgroup_root = Path("/sys/fs/cgroup")
+    cgroup_path = Path(path)
+    try:
+        if cgroup_path != cgroup_root and cgroup_root not in cgroup_path.parents:
+            raise ValueError("cgroup path outside cgroup v2 root")
+        metadata = cgroup_path.stat()
+    except (OSError, ValueError) as exc:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise DeploymentError(f"无法解析目标 cgroup ID: {path}; {detail}") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_ino <= 0:
+        raise DeploymentError(f"目标 cgroup 路径无效: {path}")
+    return metadata.st_ino
 
 
 def _spawn_audit_process(
@@ -3023,14 +3156,15 @@ def _spawn_audit_process(
     try:
         process_command = list(command)
         if capture_path is not None:
-            capture_descriptor = os.open(capture_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            capture_descriptor = os.open(
+                capture_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
         process = subprocess.Popen(
             process_command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL if capture_descriptor is None else capture_descriptor,
             stderr=descriptor,
             start_new_session=True,
-            umask=0o077,
         )
     finally:
         os.close(descriptor)
@@ -3049,6 +3183,9 @@ def _wait_audit_probe_ready(
     if kind.endswith("-pcap"):
         ready_path = error_log
         marker = "listening on"
+    elif kind == "service-relay":
+        ready_path = error_log
+        marker = "service relay ready"
     else:
         raise DeploymentError(f"未知审计探针类型，无法确认就绪: {kind}")
     deadline = time.monotonic() + timeout_seconds
@@ -3235,7 +3372,9 @@ def _docker(
     capture: bool = False,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    return _run(["docker", *args], capture=capture, check=check, env=_docker_env(config))
+    return _run(
+        ["docker", *args], capture=capture, check=check, env=_docker_env(config)
+    )
 
 
 def _docker_env(config: HostConfig) -> dict[str, str]:
@@ -3302,6 +3441,8 @@ def _load_existing_manifest(
     schema_version = raw.get("schema_version")
     if schema_version not in {1, 2, 3, 4}:
         raise DeploymentError(f"不支持迁移运行清单 schema_version={schema_version}")
+    if path == current_path and schema_version == 4:
+        return load_runtime(config)
     try:
         if raw.get("resource_prefix") != config.resource_prefix:
             raise ValueError
@@ -3394,7 +3535,9 @@ def _activate_generation(config: HostConfig, generation: Path) -> None:
         "target-password-hash",
     }
     if {
-        item.name for item in generation.iterdir() if item.is_file() and not item.is_symlink()
+        item.name
+        for item in generation.iterdir()
+        if item.is_file() and not item.is_symlink()
     } != required:
         raise DeploymentError("运行 generation 文件集合不完整")
     temporary = generated / f".current.{uuid.uuid4().hex}"

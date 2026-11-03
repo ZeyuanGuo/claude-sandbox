@@ -1,5 +1,7 @@
 # 受控开发机实施计划
 
+端口示例已迁移到 `269xx`；已运行实例和历史验证仍可能使用旧 `114xx`。更新持久配置不表示运行中的网关、DNS 和会话已经重启。
+
 ## 目标
 
 在共享 GPU 服务器上，为一个用户长期运行一套受控开发机。目标软件可以正常读写登记的项目、运行命令和使用全部 GPU，但不能直接接触宿主网络、局域网或绕过受控网关访问公网。
@@ -16,8 +18,8 @@
 - 登记的项目目录可以直接读写。每台服务器自行选择项目，通用代码不写死项目名称。
 - 全部 GPU 可见并允许使用，不修改 GPU 的独占模式，也不自动停止其他用户的任务。
 - 任何涉及其他用户进程的停止、暂停或修改，都必须先获得本次明确确认。
-- 不开放沙箱 Web 端口，不建设 VNC 或浏览器转发。当前主要入口是 shell 和 TUI。
-- 网络从全断开始。新软件和新认证方式先使用严格策略，未知 Web 请求在连接真实上游前暂停；解释核心流量并完成真实任务后，可以单独生成日常策略。公开仓库提供公共 Web 日常策略：普通公网 HTTP/HTTPS 默认放行并记录，其他直接 IP、未登记 SSH、外部 DNS、特殊主机名、已知加密 DNS、非 Web 端口和默认 UDP/QUIC 仍保持阻断。历史私有 API 端点不随发布策略提供。
+- 默认不开放沙箱 Web 端口，不建设 VNC 或浏览器转发；主机配置可以显式发布受限 TCP 端口段供开发服务使用。当前主要入口是 shell 和 TUI。
+- 网络从全断开始。新软件和新认证方式先使用严格策略，未知 Web 请求在连接真实上游前暂停；解释核心流量并完成真实任务后，可以单独生成日常策略。公开仓库提供公共 Web 日常策略：普通公网 HTTP/HTTPS 默认放行并记录，其他直接 IP、外部 DNS、特殊主机名、已知加密 DNS、非 Web 端口和默认 UDP/QUIC 仍保持阻断。历史私有 API 端点不随发布策略提供。
 - 普通 TLS 默认解密。解密失败不能自动改成密文直通。
 - 上游 VPN 或代理只负责把已批准流量送到目标出口，不负责决定放行什么。
 - 策略、镜像、控制代码和文档可以私有发布；项目、开发环境、凭据和普通日志只留在各服务器本地。
@@ -66,7 +68,7 @@
                                                \-> 父代理连接已经解析的公网 IP
 ```
 
-目标容器没有代理变量，也不能连接宿主代理、Docker socket、审计目录和网关管理接口。只有受控 DNS 和网关加入无公网路由的内部 `upstream_net`，并通过固定网桥宿主地址访问 `11450`。宿主 nftables 只放行这两个固定来源，并阻断该网桥访问其他宿主端口。父代理的具体实现和 VPN/IP 集成由本机负责，不进入通用仓库。
+目标容器没有代理变量，也不能连接宿主代理、Docker socket、审计目录和网关管理接口。只有受控 DNS 和网关加入无公网路由的内部 `upstream_net`，并通过固定网桥宿主地址访问 `26940`。宿主 nftables 只放行这两个固定来源，并阻断该网桥访问其他宿主端口。父代理的具体实现和 VPN/IP 集成由本机负责，不进入通用仓库。
 
 当前使用 `Docker internal network + 受控 DoH + DNS-IP租约 + nftables透明重定向 + mitmproxy transparent + 宿主父 HTTP 代理`。DNS 和 Web 都经父代理出站；Web 上游按受控 DNS 返回的 IP 连接，原域名继续用于 SNI 和证书校验。严格策略暂停未知 Web；日常策略允许普通公网 Web，但继续阻断直接 IP、特殊主机名、异常端口和不可解密连接。
 
@@ -101,7 +103,7 @@ examples/            不含秘密的主机配置示例
 
 实际路径可以在主机配置中修改。配置中的 `~` 和相对 Home 路径必须相对目标用户的 Home 解析，不能使用启动 `sandboxctl` 的 root 账号 Home。项目路径尽量使用 Home 相对形式记录，并在容器内映射到相同绝对路径，例如宿主和容器都使用 `/home/alice/project`。
 
-`host.yaml` 至少声明：目标用户及其 Home、UID/GID、持久 Home、项目挂载、本地开发环境、GPU 暴露、审计目录、上游配置位置、期望出口、各数据类型硬上限、分区保留线和默认策略。上游凭据、CA 私钥和账号令牌只引用本地只读文件，不能直接写入仓库配置。
+`host.yaml` 至少声明：目标用户及其 Home、UID/GID、持久 Home、可选的共享宿主 Home、项目挂载、本地开发环境、GPU 暴露、可选服务端口段、审计目录、上游配置位置、期望出口、各数据类型硬上限、分区保留线和默认策略。上游凭据、CA 私钥和账号令牌只引用本地只读文件，不能直接写入仓库配置。
 
 控制层只维护三类核心数据：
 
@@ -127,15 +129,12 @@ sudo sandboxctl status
 sudo sandboxctl shell
 sudo sandboxctl root-shell
 sudo sandboxctl storage plan
-sudo sandboxctl automation install
 sudo sandboxctl audit status
-sudo sandboxctl audit restart
-sudo sandboxctl recover
 sudo sandboxctl doctor
 sudo sandboxctl verify-closed
 ```
 
-自动化的 `policy set`、上游切换和 `target test claude-code` 仍属于后续实现；`storage rotate` 和 `automation install` 已提供，但需在首次验收后安装，且当前只启用不立即启动。策略切换目前使用 `stop -> init --policy -> build -> start -> verify-closed`。Claude Code 的历史 API-key 基线已完成严格逐请求发现，并在本机日常策略下通过自动与人工真实任务；公开仓库只提供脱敏后的通用策略。
+自动化的 `policy set`、存储清理执行、上游切换和 `target test claude-code` 仍属于后续实现，不把规划入口当成当前可用命令。策略切换目前使用 `stop -> init --policy -> build -> start -> verify-closed`。Claude Code 的历史 API-key 基线已完成严格逐请求发现，并在本机日常策略下通过自动与人工真实任务；公开仓库只提供脱敏后的通用策略。
 
 `root-shell` 内部使用 `docker exec --user root`。宿主密码明文不进入脚本、配置、镜像或日志；`init` 会读取宿主密码哈希并通过 root-only 运行文件配置容器内 `sudo`。命令只能管理本用户登记的容器、网络和 cgroup；发现目标落到其他范围时必须拒绝执行。
 
@@ -164,7 +163,7 @@ sudo sandboxctl verify-closed
 - 实现 `sandboxctl doctor`、配置校验、计划预览和资源归属检查。
 - 每次 root 操作先解析准确对象，再限制到本用户的容器、网络接口、nftables 表和状态目录。
 - 不执行全局 `iptables -F`、`nft flush ruleset`、`docker system prune`、GPU 模式修改或不带范围的进程终止。
-- 空间不足时先生成定向清理计划；自动轮转只删除本项目中已结束且超过保留期的审计对象，并再次检查路径归属。共享 Docker 对象和其他用户内容只能报告，不能自动删除。
+- 空间不足时只生成定向清理计划。执行命令必须引用这份不可修改的计划，并再次检查路径归属；共享 Docker 对象和其他用户内容只能报告，不能自动删除。
 - 所有创建动作可重复执行；部分失败时回到网络全断状态。
 
 产物：CLI 骨架、配置解析、dry-run 输出、操作审计。
@@ -177,9 +176,9 @@ sudo sandboxctl verify-closed
 
 - 使用固定 digest 的 Ubuntu 24.04 基础镜像，创建与宿主 UID/GID 一致的普通用户，并按本机密码哈希配置容器内 `sudo`。
 - 按主机私有配置设置时区，配置英文 locale、常见英文字体、中性主机名、bash、tmux、编辑器、Git、Python、常用诊断和构建工具。
-- 使用独立持久 Home，不复制整个宿主 Home、shell 历史或整棵 `.claude`。`config init` 生成受控 shell/profile 副本，并按后续明确选择默认挂载宿主 Git/SSH 等常用开发配置。
+- 默认使用独立持久 Home，不复制整个宿主 Home、shell 历史或整棵 `.claude`；专用开发账号可设置 `workspace.share_host_home: true` 直接共享同名 Home。`config init` 生成受控 shell/profile 副本，并按后续明确选择默认挂载宿主 Git/SSH 等常用开发配置。
 - 基础设施容器丢弃全部 capability 并启用 `no-new-privileges`；目标容器为支持 setuid `sudo` 保留 Docker 默认 capability 集，但不使用 `--privileged`，不获得 `NET_ADMIN`、Docker socket或宿主命名空间。
-- 不发布端口，不挂载 Docker socket、宿主 `/proc`、`/sys` 或 `/run`。
+- 默认不发布端口；若配置 `service_ports`，由受控宿主 relay 只监听声明的同号 TCP 端口段，进入目标 netns 后连接 `127.0.0.1:同号端口`，不开放目标网络接口入站。不挂载 Docker socket、宿主 `/proc`、`/sys` 或 `/run`。
 - 使用 NVIDIA Container Toolkit CDI 把全部 GPU 提供给目标容器，设置 `compute,utility` 能力；不修改 GPU 独占模式，不自动停止其他任务。
 
 产物：基础镜像、固定软件清单、持久 Home、shell 与 root 进入文档。
@@ -192,17 +191,17 @@ sudo sandboxctl verify-closed
 
 - 目标只加入 Docker `internal` 的 `target_net`，没有默认公网路由，也没有 `NET_ADMIN`。
 - 目标的系统 DNS 只到受控 DNS；受控 DNS 经父代理使用固定 DoH 端点解析，不使用宿主默认 DNS。
-- 目标普通访问 TCP/80、443 时由 nftables 透明送到网关；写死公网 IP、未登记 SSH、外部 DNS 和 UDP 没有直通路径。登记的 Tailscale SSH 地址/端口由宿主单独转发，不经过网关。
+- 目标普通访问 TCP/80、443 时由 nftables 透明送到网关；写死公网 IP、TCP/22、外部 DNS 和 UDP 没有直通路径。
 - 宿主用目标网络命名空间 PCAP 和目标 cgroup eBPF 同时记录实际包、进程执行、连接参数和返回值。调用在发包前返回 `ENETUNREACH` 时，以系统调用记录作为证据。
 - 目标、DNS 和网关的短期 nftables 放行项只由宿主 watchdog 续期；必要探针退出后自动过期。
 
 产物：隔离目标网络、受控 DNS、目标/DNS/网关 PCAP、cgroup 连接记录和阻断测试。
 
-当前通过条件已经满足：直接公网、未登记 TCP/22、UDP、外部 DNS 和代理绕过不能到达真实目标，并能定位到测试进程。精确登记的 Tailscale SSH 例外已完成代码和宿主配置，尚未在当前运行容器中应用验收。IPv6、DoT、广播/多播和完整私网 canary 矩阵仍需扩展，不写成已经全部验收。
+当前通过条件已经满足：直接公网、TCP/22、UDP、外部 DNS 和代理绕过不能到达真实目标，并能定位到测试进程。IPv6、DoT、广播/多播和完整私网 canary 矩阵仍需扩展，不写成已经全部验收。
 
 ### 阶段 4：接入策略网关和上游适配器
 
-宿主配置接入本机父 HTTP 代理 `127.0.0.1:11450`，并在主机私有配置中登记实际出口范围。目标不加入上游网络；只有受控 DNS 和网关通过内部网桥的宿主地址访问该端口。
+迁移前，宿主配置接入本机父 HTTP 代理 `127.0.0.1:11440`，并在主机私有配置中登记实际出口范围。目标不加入上游网络；只有受控 DNS 和网关通过内部网桥的宿主地址访问该端口。
 
 已完成：
 
@@ -218,7 +217,7 @@ sudo sandboxctl verify-closed
 仍待完成：
 
 - watchdog 当前验证进程身份和存活，不读取 tcpdump 内核丢包计数、eBPF 丢事件数或磁盘剩余空间；这些异常仍依靠启动预检和使用后审查。
-- TUN/L3 或其他父代理实现可以以后替换，但必须保持同一 `11450` 接口和无直连回退，并在每台服务器重跑验收。
+- TUN/L3 或其他父代理实现可以以后替换，但必须保持同一 `26940` 接口和无直连回退，并在每台服务器重跑验收。
 
 产物：mitmproxy fail-closed addon、CA 管理、父代理接口、可回滚策略 generation 和运行健康检查。
 
@@ -228,12 +227,12 @@ sudo sandboxctl verify-closed
 
 工作：
 
-- 使用宿主 `nsenter + tcpdump` 在目标和网关网络命名空间保存独立 PCAP；用目标 cgroup 范围的 bpftrace 记录进程执行、连接参数和返回值。tcpdump 由宿主 root 启动，并按 `pcap_roll_size_mib`、`pcap_roll_files` 写入有界循环文件；目标容器不能改写证据。
+- 使用宿主 `nsenter + tcpdump` 在目标和网关网络命名空间保存独立 PCAP；用目标 cgroup 范围的 bpftrace 记录进程执行、连接参数和返回值。tcpdump 通过宿主 root 预打开的 `0600` 文件描述符写入，目标容器不能改写证据。
 - 对实际发现的 OpenSSL 文件、Go ELF 或其他实现逐个启用并验证 eBPF；不使用无 cgroup 限制的全主机捕获。若工具只支持精确 cgroup ID，就跟踪所有实际子 cgroup，不能把父 cgroup 当作自动覆盖整棵子树。
 - 代理保存普通 TLS 请求明文和响应元数据；响应正文专项捕获、eBPF、会话密钥和应用 hook 只作为交叉验证或特殊路径补充。
 - 在 connect/sendmsg 时记录 socket、五元组和进程，再与实际出站包关联；包事件本身不能可靠提供当前进程时，不用猜测 PID。
 - 为每条连接生成统一编号，关联运行编号、策略版本、进程、可执行文件哈希、DNS、代理 flow ID、目标侧 PCAP、出口侧 PCAP 和明文。
-- PCAP 和明文归档默认保留 72 小时，结构化记录保留 30 天；PCAP 运行期间还受 `pcap_roll_size_mib`、`pcap_roll_files` 的循环文件上限约束。PCAP 的 100 GiB、明文 50 GiB、结构化记录 10 GiB 是启动前预算检查，审计分区默认保留线为 `max(200 GiB, 容量的 10%)`。`storage rotate` 定时删除已结束且过期的本项目对象；达到硬上限时自动停止联网、写盘失败/丢包/丢事件时暂停目标的持续联锁仍需在重启后的真实运行中验证。
+- 完整 PCAP 与明文默认保留 72 小时，结构化记录保留 30 天。PCAP 的 100 GiB 硬上限是所有运行和所有抓包点的合计；明文初始硬上限为 50 GiB，结构化记录初始硬上限为 10 GiB。审计分区默认保留线为 `max(200 GiB, 容量的 10%)`。达到任一硬上限或保留线时停止联网，不能静默提前删除未到期证据。写盘失败、丢包、丢事件或截断时先断网，再暂停目标容器、报警并保留现场。
 - 原始明文目录 root-only；普通报告隐藏令牌、Cookie、OAuth 代码和认证头。
 
 产物：审计目录、统一事件格式、轮转规则、脱敏报告和故障监控。
@@ -251,7 +250,7 @@ sudo sandboxctl verify-closed
 
 产物：可重复的集成测试、每条用例的证据包和失败报告。
 
-当前进度：`verify-closed` 已覆盖无代理环境、经父代理的普通公网 DNS、异常 DNS 查询在 DoH 前阻断、DNS 租约不匹配、直接 IP、未登记 TCP/22、普通 UDP/443、外部 DNS、非 Web 原始 TCP、请求 Upgrade、应用层 `CONNECT` 和上游 `101`，以及 HTTP/HTTPS 逐请求批准、拒绝、客户端断开、策略摘要故障和审核目录不可写。它还从目标容器核对固定公网查询落在本机 `expected_exit_cidr` 内，并保存网关到父代理的非零 PCAP。目标、DNS 和网关 PCAP、目标 cgroup eBPF 及代理请求明文均在运行。另已主动停止目标 PCAP，确认短租约过期后 DNS 和 Web 都关闭。超过 64 KiB、并发、长连接、TLS 版本差异、磁盘写满和完整丢事件统计仍未完成；当前业务运行的 HTTP/2 和停止时 PCAP 零内核报告丢包已有样本证据。SSH 正向/负向验收待用户允许中断并重新初始化容器后执行。
+当前进度：`verify-closed` 已覆盖无代理环境、经父代理的普通公网 DNS、异常 DNS 查询在 DoH 前阻断、DNS 租约不匹配、直接 IP、TCP/22、普通 UDP/443、外部 DNS、非 Web 原始 TCP、请求 Upgrade、应用层 `CONNECT` 和上游 `101`，以及 HTTP/HTTPS 逐请求批准、拒绝、客户端断开、策略摘要故障和审核目录不可写。它还从目标容器核对固定公网查询落在本机 `expected_exit_cidr` 内，并保存网关到父代理的非零 PCAP。目标、DNS 和网关 PCAP、目标 cgroup eBPF 及代理请求明文均在运行。另已主动停止目标 PCAP，确认短租约过期后 DNS 和 Web 都关闭。超过 64 KiB、并发、长连接、TLS 版本差异、磁盘写满和完整丢事件统计仍未完成；当前业务运行的 HTTP/2 和停止时 PCAP 零内核报告丢包已有样本证据。
 
 通过条件：开始 Claude Code 的有监督功能发现前，必须先通过默认全断、逐请求暂停、批准前不上游、策略与审核存储故障关闭这些基本门禁。把受限环境写成完整验收或开始日常观察前，还必须通过指定流量完整捕获矩阵。当前只满足前者。
 
@@ -314,7 +313,7 @@ API-key 基线已完成独立简答、连续会话、自动和人工交互开发
 - 初始化时列出实际挂载内容和风险。敏感子目录按主机配置遮蔽，不自动猜测项目秘密。
 - 文本 profile 在 `init` 时生成只读受控副本并记录摘要；宿主内容变化后必须重新初始化。Skills、agents 和大型本地环境按主机声明同路径挂载，不复制进镜像或发布包。
 - 每台服务器声明自己的默认环境，并检查实际 Python 路径、关键 import、CUDA 和 GPU 张量计算；通用逻辑不写死环境名，也不替服务器决定项目依赖。
-- `config init` 检测常用开发配置：现有 `~/.config/git` 默认同路径读写挂载，现有 `~/.ssh` 和 `~/.local/share/gamma-ssh` 默认只读挂载；启用 SSH 时仅放行 `host.yaml` 中逐项验证的 Tailscale 地址/端口。操作者在初始化前删除不愿交给目标软件的条目。不会挂载整棵宿主 `~/.claude`。
+- `config init` 检测常用开发配置：现有 `~/.config/git` 默认同路径读写挂载，现有 `~/.ssh` 默认只读挂载；操作者在初始化前删除不愿交给目标软件的条目。不会挂载整棵宿主 `~/.claude`。
 - 运行项目提供的 smoke 命令和简单 GPU、CPU、文件系统性能对比。命令和阈值由各服务器配置，不把项目差异当成平台错误。
 
 产物：本机挂载清单、可选环境接入、项目 smoke 结果和容器性能记录。

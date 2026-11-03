@@ -9,6 +9,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from controlled_dev_machine.automation import install_automation
 from controlled_dev_machine.config import (
+    HostConfig,
     create_host_config,
     default_config_path,
     ensure_invoking_target,
@@ -34,6 +35,10 @@ from controlled_dev_machine.session_migration import import_claude_session
 from controlled_dev_machine.storage import build_storage_report, rotate_audit
 from controlled_dev_machine.traffic_analysis import analyze_review_payload
 from controlled_dev_machine.verification import run_closed_gate
+
+
+def _session_destination(config: HostConfig) -> Path:
+    return config.target.home if config.workspace.share_host_home else config.paths.persistent_home
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -268,7 +273,7 @@ def _run(args: argparse.Namespace) -> int:
     if args.command == "session" and args.session_command == "import":
         result = import_claude_session(
             source_home=config.target.home,
-            persistent_home=config.paths.persistent_home,
+            persistent_home=_session_destination(config),
             target_home=config.target.home,
             target_uid=config.target.uid,
             target_gid=config.target.gid,

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from controlled_dev_machine import review
 from controlled_dev_machine.errors import ReviewError
 from controlled_dev_machine.review import RequestStore
 
@@ -23,6 +24,70 @@ def _pending(store: RequestStore, now: datetime):
         body=b'{"message":"hello"}',
         now=now,
     )
+
+
+def test_enqueue_is_not_visible_until_all_request_files_exist(tmp_path: Path, monkeypatch):
+    store = RequestStore(tmp_path / "review")
+    reader = RequestStore(tmp_path / "review")
+    write_bytes = review._write_bytes
+    observations = []
+
+    def observe_during_write(path, payload, *, replace=False):
+        observations.append(reader.list_records())
+        write_bytes(path, payload, replace=replace)
+
+    monkeypatch.setattr(review, "_write_bytes", observe_during_write)
+    pending = _pending(store, datetime(2026, 7, 28, tzinfo=UTC))
+
+    assert observations == [(), (), ()]
+    assert reader.list_records() == (pending,)
+    assert reader.raw(pending.request_id)[1] == b'{"message":"hello"}'
+
+
+@pytest.mark.parametrize("filename", ["body.bin", "headers.json", "record.json"])
+def test_failed_enqueue_does_not_publish_or_leave_partial_request(
+    tmp_path: Path, monkeypatch, filename: str
+):
+    store = RequestStore(tmp_path / "review")
+    write_bytes = review._write_bytes
+
+    def disk_full(path, payload, *, replace=False):
+        if path.name == filename:
+            raise OSError(errno.ENOSPC, "disk full")
+        write_bytes(path, payload, replace=replace)
+
+    monkeypatch.setattr(review, "_write_bytes", disk_full)
+    with pytest.raises(OSError, match="disk full"):
+        _pending(store, datetime(2026, 7, 28, tzinfo=UTC))
+    assert store.list_records() == ()
+    assert list(store.requests_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("operation", ["open", "fsync"])
+def test_failed_publication_does_not_leave_a_pending_request(
+    tmp_path: Path, monkeypatch, operation: str
+):
+    store = RequestStore(tmp_path / "review")
+    store.initialize()
+    parent_inode = store.requests_dir.stat().st_ino
+    original_open = os.open
+    original_fsync = os.fsync
+
+    def failed_open(path, flags, *args, **kwargs):
+        if Path(path) == store.requests_dir:
+            raise OSError(errno.EIO, "publication failed")
+        return original_open(path, flags, *args, **kwargs)
+
+    def failed_fsync(descriptor):
+        if os.fstat(descriptor).st_ino == parent_inode:
+            raise OSError(errno.EIO, "publication failed")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(os, operation, failed_open if operation == "open" else failed_fsync)
+    with pytest.raises(OSError, match="publication failed"):
+        _pending(store, datetime(2026, 7, 28, tzinfo=UTC))
+    assert store.list_records() == ()
+    assert list(store.requests_dir.iterdir()) == []
 
 
 def test_approval_is_bound_to_exact_request_and_policy(tmp_path: Path) -> None:

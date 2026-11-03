@@ -1,120 +1,128 @@
 import subprocess
-from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import pytest
 
+import controlled_dev_machine.verification as verification
 from controlled_dev_machine.errors import DeploymentError
-from controlled_dev_machine.verification import (
-    _finish_gateway_capture,
-    _GatewayCapture,
-)
 
 
-def test_nonzero_capture_waits_for_packet_delivery(tmp_path: Path, monkeypatch) -> None:
-    pcap_path = tmp_path / "capture.pcap"
-    pcap_path.write_bytes(b"0" * 24)
-    log_path = tmp_path / "capture.log"
-    log_path.write_text("", encoding="utf-8")
-    events: list[str] = []
-
-    class Process:
-        pid = 123
-        returncode = None
-
-        def poll(self):
-            return self.returncode
-
-        def wait(self, timeout=None):
-            self.returncode = 0
-            return 0
-
-    process = Process()
-    capture = _GatewayCapture(
-        process=process,  # type: ignore[arg-type]
-        pcap_path=pcap_path,
-        log_path=log_path,
-        metadata_path=tmp_path / "capture.json",
-        started_at="start",
-        ready_at="ready",
-        capture_filter="dst port 11450",
-    )
-
-    def sleep(_seconds):
-        events.append("sleep")
-        with pcap_path.open("ab") as stream:
-            stream.write(b"1")
-
-    monkeypatch.setattr("controlled_dev_machine.verification.time.sleep", sleep)
-    monkeypatch.setattr(
-        "controlled_dev_machine.verification.os.killpg",
-        lambda _pid, _signal: events.append("signal"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.verification.subprocess.run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            [], 0, stdout="packet\n", stderr=""
-        ),
-    )
-
-    evidence = _finish_gateway_capture(
-        capture,
-        packet_error="missing packet",
-        packet_expectation="nonzero",
-        packet_timeout_seconds=5,
-    )
-
-    assert events[:2] == ["sleep", "signal"]
-    assert evidence["packet_count"] == 1
-
-
-def test_nonzero_capture_stops_at_packet_timeout(tmp_path: Path, monkeypatch) -> None:
-    pcap_path = tmp_path / "capture.pcap"
-    pcap_path.write_bytes(b"0" * 24)
-    log_path = tmp_path / "capture.log"
-    log_path.write_text("", encoding="utf-8")
-    events: list[str] = []
-
-    class Process:
-        pid = 123
-        returncode = None
-
-        def poll(self):
-            return self.returncode
-
-        def wait(self, timeout=None):
-            self.returncode = 0
-            return 0
-
-    capture = _GatewayCapture(
-        process=Process(),  # type: ignore[arg-type]
-        pcap_path=pcap_path,
-        log_path=log_path,
-        metadata_path=tmp_path / "capture.json",
-        started_at="start",
-        ready_at="ready",
-        capture_filter="dst port 11450",
-    )
-    times = iter((0.0, 5.0))
-    monkeypatch.setattr(
-        "controlled_dev_machine.verification.time.monotonic", lambda: next(times)
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.verification.os.killpg",
-        lambda _pid, _signal: events.append("signal"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.verification.subprocess.run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            [], 0, stdout="", stderr=""
-        ),
-    )
-
-    with pytest.raises(DeploymentError, match="missing packet"):
-        _finish_gateway_capture(
-            capture,
-            packet_error="missing packet",
-            packet_expectation="nonzero",
-            packet_timeout_seconds=5,
+@pytest.mark.parametrize("environment, passes", [
+    ({"NODE_OPTIONS": "--use-system-ca"}, True),
+    ({"NODE_OPTIONS": "--max-old-space-size=512 --use-system-ca"}, True),
+    ({"NODE_OPTIONS": "--use-system-ca", "NODE_TLS_REJECT_UNAUTHORIZED": "1"}, True),
+    ({"NODE_USE_SYSTEM_CA": "1"}, False),
+    ({"NODE_OPTIONS": "--no-warnings"}, False),
+    ({"NODE_OPTIONS": "--example=--use-system-ca"}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "NODE_TLS_REJECT_UNAUTHORIZED": "0"}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "HTTPS_PROXY": "http://127.0.0.1:9"}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "SSL_CERT_FILE": ""}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "SSL_CERT_FILE": "/tmp/old-ca.pem"}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "REQUESTS_CA_BUNDLE": ""}, False),
+    ({"NODE_OPTIONS": "--use-system-ca", "REQUESTS_CA_BUNDLE": "/tmp/old-ca.pem"}, False),
+    ({"NODE_OPTIONS": '"'}, False),
+])
+def test_native_environment_requires_system_ca_without_disabling_tls(
+    monkeypatch, environment, passes,
+) -> None:
+    environment = {
+        "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
+        "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
+        **environment,
+    }
+    def run_environment_script(_config, arguments, *, timeout, name):
+        assert arguments[:2] == ["python3", "-c"]
+        assert name == "native-network-environment"
+        result = subprocess.run(
+            [sys.executable, "-c", arguments[2]], env=environment,
+            capture_output=True, text=True, timeout=timeout,
         )
+        if result.returncode:
+            raise DeploymentError(result.stderr)
 
-    assert events == ["signal"]
+    monkeypatch.setattr(verification, "_expect_command_success", run_environment_script)
+    if passes:
+        assert verification._run_environment_neutral(SimpleNamespace()) == {
+            "name": "native-network-environment", "ok": True,
+        }
+    else:
+        with pytest.raises(DeploymentError):
+            verification._run_environment_neutral(SimpleNamespace())
+
+
+def test_live_audit_accepts_the_supervised_service_relay() -> None:
+    kinds = (
+        "target-pcap",
+        "gateway-pcap",
+        "dns-pcap",
+        "target-connect-ebpf",
+        "service-relay",
+        "network-watchdog",
+    )
+    audit = {
+        "active": True,
+        "processes": [{"kind": kind, "alive": True} for kind in kinds],
+    }
+
+    verification._require_live_audit(audit)
+
+    audit["processes"].append({"kind": "unexpected-probe", "alive": True})
+    with pytest.raises(DeploymentError, match="全部抓包"):
+        verification._require_live_audit(audit)
+
+
+def test_strict_public_web_probe_approves_its_own_review(monkeypatch) -> None:
+    config = SimpleNamespace(
+        upstream=SimpleNamespace(
+            kind="http",
+            port=26940,
+            expected_exit_cidr="204.1.123.50/32",
+        )
+    )
+    audit = {"observed_upstream_ip": "204.1.123.50"}
+    process = SimpleNamespace(returncode=None, poll=lambda: None)
+    record = SimpleNamespace(request_id="review-id")
+    final = SimpleNamespace(state="completed")
+    approved: list[tuple[str, int, str]] = []
+    capture_options: list[dict[str, object]] = []
+
+    class Store:
+        def approve_once(self, request_id, *, ttl_seconds, reason):
+            approved.append((request_id, ttl_seconds, reason))
+
+        def get(self, request_id):
+            assert request_id == record.request_id
+            return final
+
+    def start_capture(*_args, **kwargs):
+        capture_options.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(verification, "_start_gateway_capture", start_capture)
+    monkeypatch.setattr(verification, "compose_exec_async", lambda *_args, **_kw: process)
+    monkeypatch.setattr(verification, "_wait_pending", lambda _store, _path, _timeout: record)
+    def communicate(_process, _timeout):
+        process.returncode = 0
+        return "204.1.123.50\n", ""
+
+    monkeypatch.setattr(verification, "_communicate", communicate)
+    monkeypatch.setattr(
+        verification,
+        "_finish_gateway_capture",
+        lambda *_args, **_kwargs: {"packets": 1},
+    )
+
+    result = verification._run_public_web_via_parent(
+        config,
+        audit,
+        Store(),
+        timeout_seconds=15,
+        require_review=True,
+    )
+
+    assert result["returned_ip"] == "204.1.123.50"
+    assert approved == [("review-id", 30, "封闭门禁公网出口回归")]
+    assert final.state == "completed"
+    assert capture_options[0].get("direction") is None
+    assert capture_options[0].get("packet_limit") == 1

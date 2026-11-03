@@ -28,38 +28,29 @@ storage:
   pcap_limit_gib: 100
   plaintext_limit_gib: 50
   structured_limit_gib: 10
-  # 自动轮转只删除已结束且超过保留期的本项目审计数据。
-  pcap_retention_hours: 72
-  plaintext_retention_hours: 72
-  structured_retention_days: 30
-  # 每个长期抓包点的有界环形文件预算：4 个文件，tcpdump 每个约 67 MB（配置为 64 MiB）。
-  pcap_roll_size_mib: 64
-  pcap_roll_files: 4
 
 upstream:
   kind: http
   host: 127.0.0.1
-  port: 11450
+  port: 26940
   # 必填：固定出口填写实际公网 IP/32；地址池必须由供应商明确保证。
   expected_exit_cidr:
   # 只用于记录父代理配置来源；控制器不会启动或解析它。
   config_path:
 
-# 可选：把 SSH 限定到精确的 Tailscale IPv4 地址和端口。
-# 这条路径不经过 HTTP 透明代理；未列出的目标仍被阻断。
-ssh:
+# 可选：允许 target 容器通过目标网络网关访问宿主机 SSH；只放行该容器地址。
+host_ssh:
   enabled: false
-  interface: tailscale0
-  allowed_addresses: []
-  ports: [22, 10090]
+  port: 10090
 
-# 可选：Claude 提示词从宿主独立目录直接读写挂载。
-# shell 和 Git 配置仍由 init 生成受控副本，其中的代理会被清除。
+# 可选：仅为缺失的日常配置提供 init 种子，已有文件不覆盖。
+# 用户配置保留为可写普通文件；共享 Home 中的现有配置直接共享。
+# Claude 账号目录独立；首次提示词可追加简短沙盒说明，不复制旧认证。
 # default_conda_env 是本机选择，不应在通用代码中写死。
 profile:
   # IANA 时区；按本机出口环境填写，发布默认不携带地域信息。
   timezone: UTC
-  claude_instructions: ~/claude_code_config/CLAUDE.md
+  claude_instructions:
   bashrc:
   login_profile:
   gitconfig:
@@ -67,23 +58,45 @@ profile:
   conda_root:
   default_conda_env:
 
+# 直接把同名宿主 Home 挂到容器 Home。适合专用开发账号；容器内修改会立即写回宿主。
+workspace:
+  share_host_home: false
+  # 仅适用于 share_host_home=true。来源由控制器放在 paths.persistent_home/.controlled-mounts，
+  # 父 Home 仍然完整共享，但这里列出的子目录会被单独覆盖。
+  controlled_mounts: []
+# 例如：
+# workspace:
+#   share_host_home: true
+#   controlled_mounts:
+#     - path: .claude
+#       access: rw
+#       seed: copy-if-empty
+#     - path: .codex
+#       access: rw
+#       seed: copy-if-empty
+
+# 可选：通过受控同号 relay 发布一个 TCP 端口段。0.0.0.0 会监听宿主所有 IPv4 接口。
+service_ports:
+  bind_address: 127.0.0.1
+  start: 25600
+  end: 25700
+
 mounts: []
 # 按本机实际存在的路径添加项目、配置和环境，容器路径尽量保持一致。例如：
 # mounts:
 #   - host_path: ~/project
 #     container_path: /home/alice/project
 #     access: rw
-#   - host_path: ~/claude_code_config/settings.json
-#     container_path: /home/alice/.claude/settings.json
-#     access: rw
-#   - host_path: ~/claude_code_config/rules
-#     container_path: /home/alice/.claude/rules
-#     access: rw
-#   - host_path: ~/claude_code_config/skills
+#     # /data 等宿主挂载点需要让运行期间新增的子挂载进入容器时使用 rslave。
+#     # propagation: rslave
+#   - host_path: ~/.claude/skills
 #     container_path: /home/alice/.claude/skills
 #     access: rw
-#   - host_path: ~/claude_code_config/agents
+#   - host_path: ~/.claude/agents
 #     container_path: /home/alice/.claude/agents
+#     access: rw
+#   - host_path: ~/.claude/commands
+#     container_path: /home/alice/.claude/commands
 #     access: rw
 #   - host_path: ~/.agents/skills
 #     container_path: /home/alice/.agents/skills
@@ -96,10 +109,7 @@ mounts: []
 #     access: rw
 #   - host_path: ~/.ssh
 #     container_path: /home/alice/.ssh
-#     access: ro
-#   - host_path: ~/.local/share/gamma-ssh
-#     container_path: /home/alice/.local/share/gamma-ssh
-#     access: ro
+#     access: rw
 #   - host_path: ~/.condarc
 #     container_path: /home/alice/.condarc
 #     access: rw

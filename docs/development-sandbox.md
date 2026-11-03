@@ -36,7 +36,7 @@ shell、Git、tmux、SSH 配置及 SSH 凭据属于日常用户状态，允许�
 
 ## 容器身份
 
-`target.hostname` 默认保留通用配置的 `devbox`，部署时可指定独立值。可选的 `target.mac_address` 必须是小写冒号格式、locally-admin、unicast，例如 `02:ab:cd:12:34:56`；它只设置目标网络的 MAC，不影响目标镜像构建摘要。部署时初始化并保存 hostname、machine-id 和 MAC，不能每次启动都更换。
+`target.hostname` 默认保留通用配置的 `devbox`，部署时可指定独立值。可选的 `target.mac_address` 必须是小写冒号格式、locally-admin、unicast，例如 `02:ab:cd:12:34:56`；它只设置目标网络的 MAC，不影响目标镜像构建摘要。部署时初始化并保存 hostname、machine-id 和 MAC，不能每次启动都更换。 本用户的受管多机部署自 2026-10-29 起使用同一身份基准，具体值、GPU处理和持久化方式见 [多机共同身份](fleet-identity.md)；不再逐台随机生成独立身份。
 
 容器仍共享真实内核与 GPU。软件状态独立不等于硬件标识全部变化，也不能承诺外部服务无法关联旧设备。SSH 是用户授权的宿主外访问能力，不应把它与上述应用状态覆盖误述为强制信息隔离。
 

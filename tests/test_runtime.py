@@ -7,11 +7,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from controlled_dev_machine import runtime
 from controlled_dev_machine.config import (
+    ControlledMount,
     HostProfile,
+    HostSshConfig,
     ProjectMount,
-    SshConfig,
+    ServicePorts,
     UpstreamConfig,
+    WorkspaceConfig,
     load_host_config,
 )
 from controlled_dev_machine.errors import DeploymentError
@@ -19,58 +23,107 @@ from controlled_dev_machine.policy import load_policy
 from controlled_dev_machine.runtime import (
     RuntimeManifest,
     _activate_generation,
-    _build_proxy_options,
+    _bpftrace_cgroup_id,
     _check_upstream,
     _configure_host_parent_guard,
+    _configure_host_ssh_guard,
     _configure_infrastructure_network,
     _configure_target_network,
+    _controlled_mount_source,
     _dns_policy_args,
     _enable_target_route,
     _gateway_build_digest,
     _host_parent_guard_runner_script,
     _host_parent_table,
     _host_password_hash,
+    _initialize_user_profile,
     _legacy_compose_path_for_stop,
     _lifecycle_lock,
-    _load_existing_manifest,
-    _pcap_command,
-    _pcap_output_alias,
-    _pcap_roll_size_million_bytes,
     _pin_built_images,
     _prepare_directories,
-    _prepare_pcap_output_alias,
     _profile_bundle,
-    _profile_directory_digest,
-    _profile_integrity_digest,
-    _remove_host_ssh_forward_rules,
-    _remove_pcap_output_alias,
+    _profile_host_location,
     _require_deployable_policy,
     _require_gateway_image,
     _require_instance_stopped,
     _require_pinned_image_id,
     _require_policy_files,
-    _require_profile_sources,
     _require_target_image,
-    _start_audit,
-    _stop_audit,
+    _service_relay_command,
     _stopped_host_parent_guard_script,
+    _stopped_host_ssh_guard_script,
     _target_build_digest,
     _wait_audit_probe_ready,
     _wait_target_ebpf_ready,
     audit_status,
+    compose_build,
     compose_shell,
     compose_start_closed,
-    compose_stop,
-    prepare_parent_guard,
-    recover_runtime,
     render_closed_compose,
-    restart_audit,
 )
 
 
 @pytest.fixture(autouse=True)
 def _use_test_lifecycle_lock(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", tmp_path / "locks")
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", tmp_path / "locks"
+    )
+
+
+def test_unchanged_enabled_systemd_unit_does_not_reload(tmp_path: Path, monkeypatch):
+    unit = tmp_path / "guard.service"
+    unit.write_text("[Service]\nType=oneshot\n")
+    enabled = tmp_path / "multi-user.target.wants"
+    enabled.mkdir()
+    (enabled / unit.name).symlink_to(unit)
+    commands = []
+    monkeypatch.setattr(runtime, "_run", lambda args: commands.append(args))
+    runtime._install_systemd_unit(unit, unit.read_text(), systemctl="systemctl")
+    assert commands == []
+
+
+@pytest.mark.parametrize("existing", [None, "old unit\n"])
+def test_changed_systemd_unit_is_reloaded(tmp_path: Path, monkeypatch, existing):
+    unit = tmp_path / "guard.service"
+    if existing is not None:
+        unit.write_text(existing)
+    commands = []
+    monkeypatch.setattr(runtime, "_run", lambda args: commands.append(args))
+    runtime._install_systemd_unit(unit, "new unit\n", systemctl="systemctl")
+    assert unit.read_text() == "new unit\n"
+    assert commands == [["systemctl", "daemon-reload"],
+                        ["systemctl", "enable", "--no-reload", "guard.service"]]
+
+
+def test_unchanged_disabled_systemd_unit_is_enabled_without_reload(tmp_path: Path, monkeypatch):
+    unit = tmp_path / "guard.service"
+    unit.write_text("unit\n")
+    commands = []
+    monkeypatch.setattr(runtime, "_run", lambda args: commands.append(args))
+    runtime._install_systemd_unit(unit, "unit\n", systemctl="systemctl")
+    assert commands == [["systemctl", "enable", "--no-reload", "guard.service"]]
+
+
+@pytest.mark.parametrize("existing", [None, "old unit\n"])
+def test_failed_systemd_reload_is_retried(tmp_path: Path, monkeypatch, existing):
+    unit = tmp_path / "guard.service"
+    if existing is not None:
+        unit.write_text(existing)
+    commands = []
+
+    def reload_fails(args):
+        commands.append(args)
+        raise DeploymentError("reload failed")
+
+    monkeypatch.setattr(runtime, "_run", reload_fails)
+    for _ in range(2):
+        with pytest.raises(DeploymentError, match="reload failed"):
+            runtime._install_systemd_unit(unit, "new unit\n", systemctl="systemctl")
+        if existing is None:
+            assert not unit.exists()
+        else:
+            assert unit.read_text() == existing
+    assert commands == [["systemctl", "daemon-reload"], ["systemctl", "daemon-reload"]]
 
 
 def _host_config(tmp_path: Path):
@@ -158,6 +211,30 @@ rules: []
     )
 
 
+def test_gpu_fallback_removes_injection_but_preserves_security_and_image(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    fallback = replace(config, gpu=replace(config.gpu, mode="none"))
+    manifest = _manifest(config, tmp_path)
+    original = render_closed_compose(config, manifest)
+    changed = render_closed_compose(fallback, manifest)
+    assert changed["services"]["target"]["devices"] == []
+    assert changed["services"]["target"]["environment"]["NVIDIA_VISIBLE_DEVICES"] == "void"
+    changed["services"]["target"]["devices"] = original["services"]["target"]["devices"]
+    changed["services"]["target"]["environment"]["NVIDIA_VISIBLE_DEVICES"] = "all"
+    assert changed == original
+    assert _target_build_digest(config, Path.cwd()) == _target_build_digest(fallback, Path.cwd())
+
+
+def test_gpu_fallback_does_not_query_or_require_host_driver(tmp_path: Path, monkeypatch) -> None:
+    config = _host_config(tmp_path)
+    fallback = replace(config, gpu=replace(config.gpu, mode="none"))
+    def unexpected(*args, **kwargs):
+        raise AssertionError("CPU fallback must not query the GPU driver")
+    monkeypatch.setattr(runtime.shutil, "which", unexpected)
+    monkeypatch.setattr(runtime, "_run", unexpected)
+    runtime._check_gpu_cdi(fallback)
+
+
 def test_target_has_no_publication_or_audit_mount(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
     compose = render_closed_compose(config, _manifest(config, tmp_path))
@@ -170,24 +247,36 @@ def test_target_has_no_publication_or_audit_mount(tmp_path: Path) -> None:
     assert target["environment"]["NVIDIA_VISIBLE_DEVICES"] == "all"
     assert target["user"] == "1000:1000"
     assert target["group_add"] == ["sudo"]
+    assert target["build"]["provenance"] is False
+    assert target["build"]["sbom"] is False
     assert target["build"]["args"]["TARGET_BUILD_DIGEST"] == "c" * 64
     assert "CDM_TARGET_UID" not in target["environment"]
     assert "CDM_TARGET_GID" not in target["environment"]
-    assert target["environment"]["NODE_USE_SYSTEM_CA"] == "1"
+    assert target["environment"]["NODE_OPTIONS"] == "--use-system-ca"
+    assert "NODE_USE_SYSTEM_CA" not in target["environment"]
     assert not any("PROXY" in name or "proxy" in name for name in target["environment"])
-    assert "SSL_CERT_FILE" not in target["environment"]
+    assert target["environment"]["SSL_CERT_FILE"] == "/etc/ssl/certs/ca-certificates.crt"
+    assert target["environment"]["REQUESTS_CA_BUNDLE"] == "/etc/ssl/certs/ca-certificates.crt"
     sources = {item["source"] for item in target["volumes"]}
     assert str(config.paths.audit) not in sources
     assert str(config.docker.socket) not in sources
     password_hash = next(
-        item for item in target["volumes"] if item["target"] == "/run/cdm/target-password-hash"
+        item
+        for item in target["volumes"]
+        if item["target"] == "/run/cdm/target-password-hash"
     )
     assert password_hash["read_only"] is True
-    assert password_hash["source"].endswith("/generated/current/target-password-hash")
-    resolver = next(item for item in target["volumes"] if item["target"] == "/etc/resolv.conf")
+    assert password_hash["source"].endswith(
+        "/generated/current/target-password-hash"
+    )
+    resolver = next(
+        item for item in target["volumes"] if item["target"] == "/etc/resolv.conf"
+    )
     assert resolver == {
         "type": "bind",
-        "source": str(config.paths.state / "generated/current/target-resolv.conf"),
+        "source": str(
+            config.paths.state / "generated/current/target-resolv.conf"
+        ),
         "target": "/etc/resolv.conf",
         "read_only": True,
         "bind": {"create_host_path": False},
@@ -198,7 +287,9 @@ def test_target_home_uses_fixed_persistent_host_bind(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
     compose = render_closed_compose(config, _manifest(config, tmp_path))
     target = compose["services"]["target"]
-    home = next(item for item in target["volumes"] if item["target"] == str(config.target.home))
+    home = next(
+        item for item in target["volumes"] if item["target"] == str(config.target.home)
+    )
     assert home == {
         "type": "bind",
         "source": str(config.paths.persistent_home),
@@ -212,10 +303,170 @@ def test_target_home_uses_fixed_persistent_host_bind(tmp_path: Path) -> None:
     )
 
 
+def test_target_hostname_uses_config_without_changing_image_inputs(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    changed = replace(config, target=replace(config.target, hostname="workstation-a24f"))
+    compose = render_closed_compose(changed, _manifest(changed, tmp_path))
+    assert compose["services"]["target"]["hostname"] == "workstation-a24f"
+    files, _ = _profile_bundle(changed, Path.cwd())
+    assert "Ubuntu container, workstation-a24f," in files[".bashrc"]
+    assert _target_build_digest(changed, Path.cwd()) == _target_build_digest(config, Path.cwd())
+
+
+def test_target_mac_is_persistent_per_network_and_not_an_image_input(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    original = render_closed_compose(config, manifest)["services"]["target"]
+    assert "mac_address" not in original["networks"]["target_net"]
+    changed = replace(config, target=replace(config.target, mac_address="02:7b:3c:4d:5e:6f"))
+    for _ in range(2):
+        target = render_closed_compose(changed, manifest)["services"]["target"]
+        assert target["networks"]["target_net"] == {
+            "ipv4_address": manifest.target_address,
+            "mac_address": "02:7b:3c:4d:5e:6f",
+        }
+        assert "mac_address" not in target
+    assert _target_build_digest(changed, Path.cwd()) == _target_build_digest(config, Path.cwd())
+
+
+def test_shared_host_home_and_declared_service_ports_are_rendered(tmp_path: Path) -> None:
+    config = replace(
+        _host_config(tmp_path),
+        workspace=WorkspaceConfig(share_host_home=True),
+        service_ports=ServicePorts(bind_address="0.0.0.0", start=25600, end=25700),
+    )
+
+    target = render_closed_compose(config, _manifest(config, tmp_path))["services"]["target"]
+    home = next(
+        item for item in target["volumes"] if item["target"] == str(config.target.home)
+    )
+
+    assert home["source"] == str(config.target.home)
+    assert home["read_only"] is False
+    assert "ports" not in target
+
+    command = _service_relay_command(config, _manifest(config, tmp_path), 4321)
+    assert command is not None
+    assert command[-12:] == [
+        "--bind-address",
+        "0.0.0.0",
+        "--start",
+        "25600",
+        "--end",
+        "25700",
+        "--target-netns",
+        "/proc/4321/ns/net",
+        "--uid",
+        "65534",
+        "--gid",
+        "65534",
+    ]
+
+
+def test_controlled_mounts_override_shared_home_and_preserve_data_propagation(
+    tmp_path: Path,
+) -> None:
+    base_config = _host_config(tmp_path)
+    config = replace(
+        base_config,
+        workspace=WorkspaceConfig(
+            share_host_home=True,
+            controlled_mounts=(
+                ControlledMount(Path(".claude"), read_only=False),
+                ControlledMount(Path(".codex"), read_only=False),
+            ),
+        ),
+        mounts=(
+            ProjectMount(
+                host_path=tmp_path / "data",
+                container_path=Path("/data"),
+                read_only=False,
+                propagation="rslave",
+            ),
+            ProjectMount(
+                host_path=base_config.target.home / ".claude" / "skills",
+                container_path=base_config.target.home / ".claude" / "skills",
+                read_only=False,
+            ),
+        ),
+        paths=replace(
+            base_config.paths,
+            persistent_home=tmp_path / "managed-home",
+            state=tmp_path / "state",
+            audit=tmp_path / "audit",
+        ),
+    )
+    (config.target.home / ".claude").mkdir()
+    (config.target.home / ".claude" / "skills").mkdir()
+    (config.target.home / ".codex").mkdir()
+    manifest = _manifest(config, tmp_path)
+    volumes = render_closed_compose(config, manifest)["services"]["target"]["volumes"]
+
+    home_index = next(
+        index for index, item in enumerate(volumes) if item["target"] == str(config.target.home)
+    )
+    claude_index = next(
+        index
+        for index, item in enumerate(volumes)
+        if item["target"] == str(config.target.home / ".claude")
+    )
+    codex_index = next(
+        index
+        for index, item in enumerate(volumes)
+        if item["target"] == str(config.target.home / ".codex")
+    )
+    data = next(item for item in volumes if item["target"] == "/data")
+    skills_index = next(
+        index
+        for index, item in enumerate(volumes)
+        if item["target"] == str(config.target.home / ".claude" / "skills")
+    )
+
+    assert home_index < claude_index < codex_index < skills_index
+    assert volumes[claude_index]["source"] == str(
+        _controlled_mount_source(config, config.workspace.controlled_mounts[0])
+    )
+    assert volumes[codex_index]["source"] == str(
+        _controlled_mount_source(config, config.workspace.controlled_mounts[1])
+    )
+    assert data["bind"]["propagation"] == "rslave"
+
+
+def test_controlled_mount_seed_copies_host_tree_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _host_config(tmp_path)
+    (config.target.home / ".claude").mkdir()
+    (config.target.home / ".claude" / "settings.json").write_text(
+        "{\"fixture\": true}\n", encoding="utf-8"
+    )
+    config = replace(
+        config,
+        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+        paths=replace(
+            config.paths,
+            persistent_home=tmp_path / "managed-home",
+            state=tmp_path / "state",
+            audit=tmp_path / "audit",
+        ),
+        workspace=WorkspaceConfig(
+            share_host_home=True,
+            controlled_mounts=(ControlledMount(Path(".claude"), read_only=False),),
+        ),
+    )
+    monkeypatch.setattr("controlled_dev_machine.runtime.os.chown", lambda *_args: None)
+
+    _prepare_directories(config)
+
+    seeded = _controlled_mount_source(config, config.workspace.controlled_mounts[0])
+    assert (seeded / "settings.json").read_text(encoding="utf-8") == "{\"fixture\": true}\n"
+
+
 def test_host_password_hash_selects_only_target_user(tmp_path: Path) -> None:
     shadow = tmp_path / "shadow"
     shadow.write_text(
-        "root:$y$root-hash:1:2:3:4:5:6:7\nalice:$y$alice-hash:1:2:3:4:5:6:7\n",
+        "root:$y$root-hash:1:2:3:4:5:6:7\n"
+        "alice:$y$alice-hash:1:2:3:4:5:6:7\n",
         encoding="utf-8",
     )
 
@@ -251,6 +502,42 @@ def test_prepare_directories_accepts_file_mount(
     _prepare_directories(config)
 
 
+def test_prepare_directories_accepts_owned_shared_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _host_config(tmp_path)
+    config.target.home.joinpath(".claude").mkdir()
+    config = replace(
+        config,
+        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+        paths=replace(
+            config.paths,
+            state=tmp_path / "state",
+            audit=tmp_path / "audit",
+        ),
+        workspace=WorkspaceConfig(share_host_home=True),
+    )
+
+    monkeypatch.setattr("controlled_dev_machine.runtime.os.chown", lambda *_args: None)
+    _prepare_directories(config)
+
+
+def test_bpftrace_cgroup_id_falls_back_to_cgroup_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del tmp_path
+    cgroup_path = Path("/sys/fs/cgroup")
+    expected = cgroup_path.stat().st_ino
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["bpftrace"], 255, "", "BEGIN_trigger missing"
+        ),
+    )
+
+    assert _bpftrace_cgroup_id(str(cgroup_path)) == expected
+
+
 def test_strict_runtime_resolves_public_domains(
     tmp_path: Path,
 ) -> None:
@@ -273,7 +560,9 @@ def test_daily_runtime_resolves_public_domains(tmp_path: Path) -> None:
     assert _dns_policy_args(manifest) == ["--allow-public-domains"]
 
 
-def test_dns_public_resolution_is_independent_of_web_rules(tmp_path: Path, monkeypatch) -> None:
+def test_dns_public_resolution_is_independent_of_web_rules(
+    tmp_path: Path, monkeypatch
+) -> None:
     config = _host_config(tmp_path)
     manifest = _manifest(config, tmp_path)
     rules = (
@@ -317,12 +606,13 @@ def test_gateway_is_lazy_and_records_plaintext(tmp_path: Path) -> None:
         "canary": {"condition": "service_healthy"},
         "dns": {"condition": "service_healthy"},
     }
-    assert (
-        gateway["environment"]["CDM_EXPECTED_POLICY_DIGEST"]
-        == _manifest(config, tmp_path).policy_digest
-    )
+    assert gateway["environment"]["CDM_EXPECTED_POLICY_DIGEST"] == _manifest(
+        config, tmp_path
+    ).policy_digest
     assert gateway["environment"]["CDM_GATEWAY_BUILD_DIGEST"] == "b" * 64
     assert gateway["environment"]["CDM_CANARY_ADDRESS"] == "172.28.0.19"
+    assert gateway["build"]["provenance"] is False
+    assert gateway["build"]["sbom"] is False
     assert gateway["build"]["args"]["GATEWAY_BUILD_DIGEST"] == "b" * 64
     assert gateway["healthcheck"]["test"] == [
         "CMD",
@@ -334,103 +624,118 @@ def test_gateway_is_lazy_and_records_plaintext(tmp_path: Path) -> None:
     assert gateway["healthcheck"]["start_period"] == "20s"
 
 
-def test_claude_runtime_instructions_use_direct_writable_mount(tmp_path: Path) -> None:
+def test_user_profile_has_no_automatic_single_file_binds(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
-    instructions = config.target.home / "claude_code_config" / "CLAUDE.md"
-    instructions.parent.mkdir()
-    instructions.write_text("Use Chinese.\n", encoding="utf-8")
     config = replace(
         config,
-        profile=replace(config.profile, claude_instructions=instructions),
+        profile=replace(
+            config.profile,
+            gitconfig=config.target.home / ".gitconfig",
+            tmux_config=config.target.home / ".tmux.conf",
+        ),
     )
     compose = render_closed_compose(config, _manifest(config, tmp_path))
-    target = compose["services"]["target"]
-    instruction = next(
-        item for item in target["volumes"] if item["target"].endswith("/.claude/CLAUDE.md")
-    )
-    assert instruction["source"] == str(instructions)
-    assert instruction["read_only"] is False
+    volumes = compose["services"]["target"]["volumes"]
+    user_files = {
+        config.target.home / name
+        for name in (".claude/CLAUDE.md", ".bashrc", ".profile", ".gitconfig", ".tmux.conf")
+    }
+    assert not any(Path(item["target"]) in user_files for item in volumes)
+    assert not any("generated/current/profile" in item["source"] for item in volumes)
 
 
-def test_claude_edits_do_not_change_generated_profile_digest(tmp_path: Path) -> None:
+def test_python_trust_uses_system_bundle_without_binding_over_package_files(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
-    config = replace(
-        config,
-        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+    conda = config.target.home / "conda"
+    package_files = [
+        base / name
+        for base in (conda, conda / "envs/dev")
+        for name in ("ssl/cacert.pem", "lib/python3.10/site-packages/certifi/cacert.pem")
+    ]
+    for path in package_files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original package data\n")
+    config = replace(config, profile=replace(
+        config.profile, conda_root=conda, default_conda_env="dev",
+    ))
+    target = render_closed_compose(config, _manifest(config, tmp_path))["services"]["target"]
+    targets = {Path(item["target"]) for item in target["volumes"]}
+    assert not targets.intersection(package_files)
+    assert not any(
+        path.is_relative_to(config.target.home) and path.name == "cacert.pem"
+        for path in targets
     )
-    instructions = config.target.home / "claude_code_config" / "CLAUDE.md"
-    instructions.parent.mkdir()
-    instructions.write_text("seed\n", encoding="utf-8")
-    config = replace(
-        config,
-        profile=replace(config.profile, claude_instructions=instructions),
+    system = next(
+        item for item in target["volumes"]
+        if item["target"] == "/etc/ssl/certs/ca-certificates.crt"
     )
-
-    files_before, digest_before = _profile_bundle(config, Path.cwd())
-    instructions.write_text("edited in the container\n", encoding="utf-8")
-    files_after, digest_after = _profile_bundle(config, Path.cwd())
-
-    assert files_before == files_after
-    assert digest_before == digest_after
-
-
-def test_profile_directory_digest_keeps_legacy_mutable_prompt_compatibility(
-    tmp_path: Path,
-) -> None:
-    profile = tmp_path / "profile"
-    profile.mkdir()
-    (profile / ".bashrc").write_text("shell\n", encoding="utf-8")
-    (profile / ".profile").write_text("login\n", encoding="utf-8")
-    prompt = profile / "CLAUDE.md"
-    prompt.write_text("old prompt\n", encoding="utf-8")
-
-    assert _profile_directory_digest(profile) == _profile_integrity_digest(
-        {
-            ".bashrc": "shell\n",
-            ".profile": "login\n",
-            "CLAUDE.md": "old prompt\n",
-        }
-    )
-    first = _profile_directory_digest(profile)
-    prompt.write_text("edited prompt\n", encoding="utf-8")
-    assert _profile_directory_digest(profile) == first
-
-    (profile / ".bashrc").write_text("changed shell\n", encoding="utf-8")
-    assert _profile_directory_digest(profile) != first
+    assert system["read_only"] is True
+    assert system["source"] == str(config.paths.state / "target-trust/ca-certificates.crt")
+    assert target["environment"]["SSL_CERT_FILE"] == system["target"]
+    assert target["environment"]["REQUESTS_CA_BUNDLE"] == system["target"]
+    for path in package_files:
+        assert path.read_text() == "original package data\n"
+        replacement = path.with_name("atomic-package-save.tmp")
+        replacement.write_text("updated package data\n")
+        replacement.replace(path)
+        assert path.read_text() == "updated package data\n"
 
 
-def test_init_can_reuse_allocation_after_profile_digest_change(tmp_path: Path) -> None:
+def test_explicit_user_mount_is_not_duplicated_by_profile_generation(tmp_path: Path) -> None:
     config = _host_config(tmp_path)
-    manifest = replace(_manifest(config, tmp_path), profile_digest="legacy-digest")
-    current = config.paths.state / "generated" / "current"
-    current.mkdir(parents=True)
-    (current / "runtime.json").write_text(
-        json.dumps(asdict(manifest)),
-        encoding="utf-8",
-    )
-
-    allocation = _load_existing_manifest(config)
-
-    assert allocation is not None
-    assert allocation.created_at == manifest.created_at
-    assert allocation.target_subnet == manifest.target_subnet
-    assert allocation.canary_subnet == manifest.canary_subnet
-    assert allocation.upstream_subnet == manifest.upstream_subnet
-
-
-def test_host_profile_uses_direct_claude_mount_and_neutral_shell(
-    tmp_path: Path,
-) -> None:
-    config = _host_config(tmp_path)
-    config = replace(
-        config,
-        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
-    )
     host_prompt = config.target.home / "claude_code_config" / "CLAUDE.md"
+    config = replace(
+        config,
+        mounts=(
+            ProjectMount(
+                host_path=host_prompt,
+                container_path=config.target.home / ".claude" / "CLAUDE.md",
+                read_only=False,
+            ),
+        ),
+    )
+
+    target = render_closed_compose(config, _manifest(config, tmp_path))["services"][
+        "target"
+    ]
+    instructions = [
+        item
+        for item in target["volumes"]
+        if item["target"] == str(config.target.home / ".claude" / "CLAUDE.md")
+    ]
+
+    assert instructions == [
+        {
+            "type": "bind",
+            "source": str(host_prompt),
+            "target": str(config.target.home / ".claude" / "CLAUDE.md"),
+            "read_only": False,
+            "bind": {"create_host_path": False},
+        }
+    ]
+
+
+def test_host_profile_is_merged_without_overriding_sandbox_network(
+    tmp_path: Path,
+) -> None:
+    config = _host_config(tmp_path)
+    config = replace(
+        config,
+        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+    )
+    host_prompt = config.target.home / ".claude" / "CLAUDE.md"
     host_prompt.parent.mkdir()
     host_bashrc = config.target.home / ".bashrc"
+    conda_executable = config.target.home / "conda" / "bin" / "conda"
+    conda_executable.parent.mkdir(parents=True)
+    conda_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    conda_executable.chmod(0o755)
     host_prompt.write_text("# Host instructions\n\nUse Chinese.\n", encoding="utf-8")
-    host_bashrc.write_text("export HTTPS_PROXY=http://127.0.0.1:11430\n", encoding="utf-8")
+    host_bashrc.write_text(
+        "export HTTPS_PROXY=http://127.0.0.1:26930\n"
+        "conda activate host-env\n",
+        encoding="utf-8",
+    )
     config = replace(
         config,
         profile=HostProfile(
@@ -445,13 +750,19 @@ def test_host_profile_uses_direct_claude_mount_and_neutral_shell(
         ),
     )
     files, source_digest = _profile_bundle(config, Path.cwd())
-    assert "CLAUDE.md" not in files
-    assert "127.0.0.1:11430" not in files[".bashrc"]
+    assert "# Host instructions" in files["CLAUDE.md"]
+    assert "# Controlled development environment" in files["CLAUDE.md"]
+    assert "127.0.0.1:26930" not in files[".bashrc"]
+    assert "conda activate host-env" in files[".bashrc"]
     assert "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY" in files[".bashrc"]
-    assert 'conda activate "$CDM_DEFAULT_CONDA_ENV"' in files[".bashrc"]
+    assert "conda activate \"$CDM_DEFAULT_CONDA_ENV\"" in files[".bashrc"]
     assert "$CDM_CONDA_ROOT/etc/profile.d/conda.sh" in files[".bashrc"]
     assert "$HOME/miniconda3" not in files[".bashrc"]
-    assert "unset REQUESTS_CA_BUNDLE SSL_CERT_FILE" in files[".profile"]
+    for name in (".bashrc", ".profile"):
+        assert "unset REQUESTS_CA_BUNDLE SSL_CERT_FILE" not in files[name]
+    assert "Controlled development workstation" in files[".bashrc"]
+    assert "System identity: Ubuntu container, devbox, Etc/UTC, en_US.UTF-8" in files[".bashrc"]
+    assert "CDM_SHELL_NOTICE_SHOWN" not in files[".bashrc"]
     assert len(source_digest) == 64
 
     compose = render_closed_compose(config, _manifest(config, tmp_path))
@@ -459,18 +770,457 @@ def test_host_profile_uses_direct_claude_mount_and_neutral_shell(
     assert target["environment"]["CDM_DEFAULT_CONDA_ENV"] == "sandbox-env"
     assert target["environment"]["TZ"] == "Etc/UTC"
     assert target["build"]["args"]["TARGET_TIMEZONE"] == "Etc/UTC"
-    assert target["environment"]["CDM_CONDA_ROOT"] == str(config.target.home / "conda")
-    profile_targets = {item["target"] for item in target["volumes"]}
-    assert str(config.target.home / ".bashrc") in profile_targets
-    assert str(config.target.home / ".profile") in profile_targets
-    instruction = next(
-        item for item in target["volumes"] if item["target"].endswith("/.claude/CLAUDE.md")
+    assert target["environment"]["CDM_CONDA_ROOT"] == str(
+        config.target.home / "conda"
     )
-    assert instruction["source"] == str(host_prompt)
-    assert instruction["read_only"] is False
+    profile_targets = {item["target"] for item in target["volumes"]}
+    assert str(config.target.home / ".bashrc") not in profile_targets
+    assert str(config.target.home / ".profile") not in profile_targets
 
 
-def test_start_rejects_profile_source_changed_after_init(tmp_path: Path) -> None:
+def _claude_prompt_profile(tmp_path: Path):
+    config = _host_config(tmp_path)
+    source = config.target.home / "claude_code_config" / "CLAUDE.md"
+    source.parent.mkdir()
+    template_root = tmp_path / "template"
+    managed = template_root / "config" / "claude" / "CLAUDE.md"
+    managed.parent.mkdir(parents=True)
+    suffix = "# Managed sandbox instructions\n\nUse Codex for independent review.\n"
+    managed.write_text(suffix, encoding="utf-8")
+    config = replace(
+        config,
+        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+        profile=replace(config.profile, claude_instructions=source),
+    )
+    return config, source, template_root, suffix
+
+
+def test_long_original_claude_prompt_precedes_managed_suffix_without_truncation(
+    tmp_path: Path,
+) -> None:
+    config, source, template_root, suffix = _claude_prompt_profile(tmp_path)
+    original = "# 原提示\n\n" + "保留原始推理与工程约束。\n" * 2400 + "原提示末尾标记\n"
+    assert len(original.encode("utf-8")) > 58000
+    source.write_text(original, encoding="utf-8")
+
+    files, _ = _profile_bundle(config, template_root)
+
+    assert files["CLAUDE.md"] == original.rstrip() + "\n\n" + suffix.rstrip() + "\n"
+    assert source.read_text(encoding="utf-8") == original
+
+
+def test_claude_prompt_rereads_original_source_without_creating_a_second_baseline(
+    tmp_path: Path,
+) -> None:
+    config, source, template_root, suffix = _claude_prompt_profile(tmp_path)
+    source.write_text("# Original prompt\n", encoding="utf-8")
+    existing_paths = set(tmp_path.rglob("*"))
+    first, first_digest = _profile_bundle(config, template_root)
+    revised = "# Revised original prompt\n\nKeep the new requirement.\n"
+    source.write_text(revised, encoding="utf-8")
+
+    second, second_digest = _profile_bundle(config, template_root)
+
+    assert second["CLAUDE.md"] == revised.rstrip() + "\n\n" + suffix.rstrip() + "\n"
+    assert second["CLAUDE.md"] != first["CLAUDE.md"]
+    assert second_digest != first_digest
+    assert config.profile.claude_instructions == source
+    assert source.read_text(encoding="utf-8") == revised
+    assert set(tmp_path.rglob("*")) == existing_paths
+
+
+def _shared_profile(tmp_path: Path):
+    config, source, template_root, suffix = _claude_prompt_profile(tmp_path)
+    source.write_text("# Shared instructions\n", encoding="utf-8")
+    config = replace(
+        config,
+        paths=replace(config.paths, persistent_home=tmp_path / "private-home"),
+        workspace=WorkspaceConfig(
+            share_host_home=True,
+            controlled_mounts=(ControlledMount(Path(".claude"), read_only=False, seed="never"),),
+        ),
+    )
+    private = _controlled_mount_source(config, config.workspace.controlled_mounts[0])
+    private.mkdir(parents=True)
+    return config, source, template_root, suffix, private
+
+
+def test_shared_profile_seeds_regular_import_and_separate_private_rules(tmp_path: Path) -> None:
+    config, source, template_root, suffix, private = _shared_profile(tmp_path)
+    files, _ = _profile_bundle(config, template_root)
+    _initialize_user_profile(config, files)
+
+    loader = private / "CLAUDE.md"
+    rules = private / "rules/controlled-environment.md"
+    assert loader.is_file() and not loader.is_symlink()
+    assert loader.read_text().splitlines()[0] == f"@{source}"
+    assert "append local instructions here" in loader.read_text()
+    assert "# Shared instructions" not in loader.read_text()
+    assert rules.read_text() == suffix
+    assert rules.is_file() and not rules.is_symlink()
+    assert loader.stat().st_uid == config.target.uid
+    assert rules.stat().st_uid == config.target.uid
+    assert loader.stat().st_mode & 0o200
+    assert rules.stat().st_mode & 0o200
+    assert rules.parent.stat().st_uid == config.target.uid
+    assert not (config.target.home / ".claude/CLAUDE.md").exists()
+
+
+def test_nonshared_profile_seeds_full_prompt_in_persistent_home(tmp_path: Path) -> None:
+    config, source, template_root, suffix = _claude_prompt_profile(tmp_path)
+    source.write_text("# Original instructions\n", encoding="utf-8")
+    config.paths.persistent_home.mkdir(parents=True)
+    files, _ = _profile_bundle(config, template_root)
+    _initialize_user_profile(config, files)
+    prompt = config.paths.persistent_home / ".claude/CLAUDE.md"
+    assert prompt.read_text() == "# Original instructions\n\n" + suffix
+    assert not prompt.is_symlink()
+    assert not (config.paths.persistent_home / ".claude/rules/controlled-environment.md").exists()
+
+
+def test_seed_resolves_longest_visible_mount_parent(tmp_path: Path) -> None:
+    config, _, template_root, suffix, private = _shared_profile(tmp_path)
+    shared_rules = config.target.home / "shared-rules"
+    shared_rules.mkdir()
+    config = replace(
+        config,
+        mounts=(*config.mounts, ProjectMount(
+            host_path=shared_rules,
+            container_path=config.target.home / ".claude/rules",
+            read_only=False,
+        )),
+    )
+    expected = runtime._ProfileLocation(private, Path("CLAUDE.md"), False)
+    assert _profile_host_location(config, config.target.home / ".claude/CLAUDE.md") == expected
+    assert _profile_host_location(
+        config, config.target.home / ".claude/rules/controlled-environment.md",
+    ) == runtime._ProfileLocation(shared_rules, Path("controlled-environment.md"), False)
+    files, _ = _profile_bundle(config, template_root)
+    _initialize_user_profile(config, files)
+    assert (shared_rules / "controlled-environment.md").read_text() == suffix
+    assert not (private / "rules").exists()
+
+
+def test_shared_import_rejects_source_hidden_by_private_mount(tmp_path: Path) -> None:
+    config, _, template_root, _, _ = _shared_profile(tmp_path)
+    hidden = config.target.home / ".claude/CLAUDE.md"
+    hidden.parent.mkdir()
+    hidden.write_text("# Host-only prompt\n")
+    config = replace(config, profile=replace(config.profile, claude_instructions=hidden))
+    with pytest.raises(DeploymentError, match="未被私有挂载覆盖"):
+        _profile_bundle(config, template_root)
+
+
+def test_profile_reinitialization_preserves_atomic_user_edits_and_private_auth(
+    tmp_path: Path,
+) -> None:
+    config, source, template_root, _, private = _shared_profile(tmp_path)
+    host_claude = config.target.home / ".claude"
+    host_claude.mkdir()
+    (host_claude / "credentials.json").write_text("host-only fixture")
+    account = private / "credentials.json"
+    account.write_text("private account fixture")
+    history = private / "history.jsonl"
+    history.write_text("private history fixture")
+    files, old_digest = _profile_bundle(config, template_root)
+    _initialize_user_profile(config, files)
+    loader = private / "CLAUDE.md"
+    temporary = private / "editor-save.tmp"
+    temporary.write_text("# User-edited local instructions\n")
+    temporary.replace(loader)
+    rules = private / "rules/controlled-environment.md"
+    rules.write_text("# User-edited environment instructions\n")
+    bashrc = config.target.home / ".bashrc"
+    bashrc.write_text("export EDITOR=vim\n")
+    source.write_text("# New shared instructions\n")
+
+    updated, new_digest = _profile_bundle(config, template_root)
+    _initialize_user_profile(config, updated)
+    _initialize_user_profile(config, updated)
+
+    assert new_digest != old_digest
+    assert loader.read_text() == "# User-edited local instructions\n"
+    assert rules.read_text() == "# User-edited environment instructions\n"
+    assert bashrc.read_text() == "export EDITOR=vim\n"
+    assert account.read_text() == "private account fixture"
+    assert history.read_text() == "private history fixture"
+    assert (host_claude / "credentials.json").read_text() == "host-only fixture"
+
+
+def test_existing_empty_user_files_and_broken_links_are_not_reowned_or_replaced(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config, _, template_root, _, _ = _shared_profile(tmp_path)
+    files, _ = _profile_bundle(config, template_root)
+    targets = {
+        "CLAUDE.md": config.target.home / ".claude/CLAUDE.md",
+        "controlled-environment.md": config.target.home / ".claude/rules/controlled-environment.md",
+    }
+    for name in files:
+        target = targets.get(name, config.target.home / name)
+        location = _profile_host_location(config, target)
+        path = location.root / location.relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+        path.chmod(0o600)
+    profile = config.target.home / ".profile"
+    profile.unlink()
+    profile.symlink_to(config.target.home / "missing-user-profile")
+
+    def must_not_reown(*args):
+        pytest.fail("existing user files and parents must not be reowned")
+
+    monkeypatch.setattr(runtime.os, "fchown", must_not_reown)
+    monkeypatch.setattr(runtime.os, "chown", must_not_reown)
+    _initialize_user_profile(config, files)
+    assert profile.is_symlink()
+    assert (config.target.home / ".bashrc").read_text() == ""
+    location = _profile_host_location(config, config.target.home / ".claude/CLAUDE.md")
+    assert (location.root / location.relative).read_text() == ""
+    assert (location.root / location.relative).stat().st_mode & 0o777 == 0o600
+
+
+def test_seed_does_not_follow_user_parent_symlink(tmp_path: Path) -> None:
+    config, _, template_root, _, private = _shared_profile(tmp_path)
+    outside = tmp_path / "outside-user-view"
+    outside.mkdir()
+    (private / "rules").symlink_to(outside)
+    files, _ = _profile_bundle(config, template_root)
+    with pytest.raises(DeploymentError, match="无法初始化用户 profile"):
+        _initialize_user_profile(config, files)
+    assert not (outside / "controlled-environment.md").exists()
+
+
+def test_seed_rejects_symlink_ancestor_of_its_data_root(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    (outside / "existing/leaf").mkdir(parents=True)
+    alias = tmp_path / "root-alias"
+    alias.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(DeploymentError, match="无法初始化用户 profile"):
+        runtime._seed_profile_file(
+            alias / "existing/leaf", Path("CLAUDE.md"), "must not escape\n",
+            os.getuid(), os.getgid(),
+        )
+    assert list((outside / "existing/leaf").iterdir()) == []
+
+
+def test_seed_temporary_collision_never_deletes_existing_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(runtime.uuid, "uuid4", lambda: SimpleNamespace(hex="collision"))
+    existing = tmp_path / ".cdm-seed-collision"
+    existing.write_text("user-owned existing file")
+    with pytest.raises(DeploymentError, match="无法初始化用户 profile"):
+        runtime._seed_profile_file(
+            tmp_path, Path("test.md"), "must not publish", os.geteuid(), os.getegid(),
+        )
+    assert existing.read_text() == "user-owned existing file"
+    assert not (tmp_path / "test.md").exists()
+
+
+@pytest.mark.parametrize("kind", ["controlled", "project"])
+def test_readonly_profile_mapping_is_never_seeded(tmp_path: Path, kind) -> None:
+    config, _, _, _, private = _shared_profile(tmp_path)
+    if kind == "controlled":
+        config = replace(config, workspace=replace(
+            config.workspace,
+            controlled_mounts=(ControlledMount(Path(".claude"), read_only=True, seed="never"),),
+        ))
+        protected = private / "rules"
+    else:
+        protected = config.target.home / "readonly-rules"
+        protected.mkdir()
+        config = replace(config, mounts=(*config.mounts, ProjectMount(
+            host_path=protected,
+            container_path=config.target.home / ".claude/rules",
+            read_only=True,
+        )))
+    location = _profile_host_location(
+        config, config.target.home / ".claude/rules/controlled-environment.md",
+    )
+    assert location.read_only
+    _initialize_user_profile(config, {"controlled-environment.md": "do not seed\n"})
+    assert not (protected / "controlled-environment.md").exists()
+    assert not (private / "rules/controlled-environment.md").exists()
+    if kind == "controlled":
+        assert not protected.exists()
+
+
+def test_directory_replaced_between_mkdir_and_open_is_not_reowned(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    existing = tmp_path / "existing-directory"
+    existing.mkdir()
+    other_group = next((gid for gid in os.getgroups() if gid != os.getgid()), os.getgid())
+    os.chown(existing, -1, other_group)
+    metadata = existing.stat()
+    original_mkdir = os.mkdir
+    replaced = []
+
+    def replace_after_creation(path, *args, **kwargs):
+        original_mkdir(path, *args, **kwargs)
+        if path == "rules":
+            os.rmdir(path, dir_fd=kwargs["dir_fd"])
+            os.rename(existing, path, dst_dir_fd=kwargs["dir_fd"])
+            replaced.append(path)
+
+    def must_not_chown(*args, **kwargs):
+        pytest.fail("a raced-in existing directory must never be chowned")
+
+    monkeypatch.setattr(runtime.os, "mkdir", replace_after_creation)
+    monkeypatch.setattr(runtime.os, "chown", must_not_chown)
+    monkeypatch.setattr(runtime.os, "fchown", must_not_chown)
+    runtime._seed_profile_file(
+        root, Path("rules/test.md"), "seed\n", os.geteuid(), os.getegid(),
+    )
+    assert replaced == ["rules"]
+    preserved = (root / "rules").stat()
+    assert (preserved.st_ino, preserved.st_uid, preserved.st_gid) == (
+        metadata.st_ino, metadata.st_uid, metadata.st_gid,
+    )
+    assert (root / "rules/test.md").read_text() == "seed\n"
+
+
+def _simulate_profile_root_identity(monkeypatch):
+    state = {"uid": 0, "gid": 41, "groups": [41, 42]}
+    monkeypatch.setattr(runtime.os, "geteuid", lambda: state["uid"])
+    monkeypatch.setattr(runtime.os, "getegid", lambda: state["gid"])
+    monkeypatch.setattr(runtime.os, "getgroups", lambda: list(state["groups"]))
+    monkeypatch.setattr(runtime.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name="target"))
+    monkeypatch.setattr(runtime.os, "getgrouplist", lambda name, gid: [gid, 51])
+    monkeypatch.setattr(runtime.os, "seteuid", lambda uid: state.update(uid=uid))
+    monkeypatch.setattr(runtime.os, "setegid", lambda gid: state.update(gid=gid))
+    monkeypatch.setattr(runtime.os, "setgroups", lambda groups: state.update(groups=list(groups)))
+    return state
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_profile_identity_is_restored_after_success_or_write_failure(monkeypatch, fail) -> None:
+    state = _simulate_profile_root_identity(monkeypatch)
+    try:
+        with runtime._profile_user_identity(1234, 50):
+            assert state == {"uid": 1234, "gid": 50, "groups": [50, 51]}
+            if fail:
+                raise OSError("simulated write failure")
+    except OSError:
+        assert fail
+    assert state == {"uid": 0, "gid": 41, "groups": [41, 42]}
+
+
+@pytest.mark.parametrize("setter", ["setgroups", "setegid", "seteuid"])
+def test_identity_switch_failure_cannot_create_seed_and_restores_identity(
+    tmp_path: Path, monkeypatch, setter,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    state = _simulate_profile_root_identity(monkeypatch)
+    original = getattr(runtime.os, setter)
+    target = {"setgroups": [50, 51], "setegid": 50, "seteuid": 1234}[setter]
+
+    def denied(value):
+        if value == target:
+            raise PermissionError("simulated identity denial")
+        original(value)
+
+    monkeypatch.setattr(runtime.os, setter, denied)
+    with pytest.raises(DeploymentError, match="无法初始化用户 profile"):
+        runtime._seed_profile_file(root, Path("test.md"), "must not publish", 1234, 50)
+    assert list(root.iterdir()) == []
+    assert state == {"uid": 0, "gid": 41, "groups": [41, 42]}
+
+
+def test_unprivileged_cross_uid_seed_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(runtime.os, "geteuid", lambda: 1234)
+    monkeypatch.setattr(runtime.os, "getegid", lambda: 50)
+    with pytest.raises(DeploymentError, match="无权切换"):
+        runtime._seed_profile_file(tmp_path, Path("test.md"), "must not publish", 1235, 50)
+    assert not (tmp_path / "test.md").exists()
+
+
+@pytest.mark.parametrize("relative", [Path("../escape"), Path("/tmp/escape"), Path(".")])
+def test_seed_rejects_paths_outside_opened_data_root(tmp_path: Path, relative) -> None:
+    with pytest.raises(DeploymentError, match="必须位于数据根之下"):
+        runtime._seed_profile_file(
+            tmp_path, relative, "must not publish", os.geteuid(), os.getegid(),
+        )
+
+
+def test_group_writable_atomic_source_edit_is_a_valid_initialization_seed(tmp_path: Path) -> None:
+    config, source, template_root, _ = _claude_prompt_profile(tmp_path)
+    source.write_text("# Original\n")
+    source.chmod(0o664)
+    _profile_bundle(config, template_root)
+    replacement = source.with_name("editor-save.tmp")
+    replacement.write_text("# Edited source\n")
+    replacement.chmod(0o664)
+    replacement.replace(source)
+    files, _ = _profile_bundle(config, template_root)
+    assert "# Edited source" in files["CLAUDE.md"]
+
+
+def test_root_seed_snapshot_is_still_verified_independently_of_user_edits(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    files = {"CLAUDE.md": "# Immutable seed snapshot\n"}
+    manifest = replace(
+        manifest,
+        profile_digest=runtime._profile_digest(files),
+        policy_snapshot_path=str(
+            config.paths.state / "policies" / f"{manifest.policy_digest}.yaml"
+        ),
+    )
+    generation = config.paths.state / "generated/current"
+    snapshot = generation / "profile"
+    snapshot.mkdir(parents=True)
+    (snapshot / "CLAUDE.md").write_text(files["CLAUDE.md"])
+    (generation / "runtime.json").write_text(json.dumps(asdict(manifest)))
+    monkeypatch.setattr(runtime, "_require_current_generation", lambda _: None)
+    assert runtime.load_runtime(config) == manifest
+    (config.target.home / ".bashrc").write_text("# User may edit this\n")
+    assert runtime.load_runtime(config) == manifest
+    (snapshot / "CLAUDE.md").write_text("# Corrupted root snapshot\n")
+    with pytest.raises(DeploymentError, match="运行 profile 与运行清单摘要不一致"):
+        runtime.load_runtime(config)
+
+
+def test_profile_skips_missing_optional_shell_initializers(tmp_path: Path) -> None:
+    config = _host_config(tmp_path)
+    config = replace(
+        config,
+        target=replace(config.target, uid=os.getuid(), gid=os.getgid()),
+    )
+    host_bashrc = config.target.home / ".bashrc"
+    optional_initializer = config.target.home / ".deno" / "env"
+    host_bashrc.write_text(
+        f"""export EDITOR=vim
+# >>> conda initialize >>>
+__conda_setup="$('/home/alice/miniconda3/bin/conda' 'shell.bash' 'hook')"
+# <<< conda initialize <<<
+conda activate pthgnn
+. \"{optional_initializer}\"
+""",
+        encoding="utf-8",
+    )
+    config = replace(config, profile=replace(config.profile, bashrc=host_bashrc))
+
+    files, digest_without_initializer = _profile_bundle(config, Path.cwd())
+
+    assert "export EDITOR=vim" in files[".bashrc"]
+    assert "conda initialize" not in files[".bashrc"]
+    assert "conda activate pthgnn" not in files[".bashrc"]
+    assert ".deno/env" not in files[".bashrc"]
+
+    optional_initializer.parent.mkdir()
+    optional_initializer.write_text("export DENO_INSTALL=ready\n", encoding="utf-8")
+    updated_files, digest_with_initializer = _profile_bundle(config, Path.cwd())
+
+    assert str(optional_initializer) in updated_files[".bashrc"]
+    assert digest_with_initializer != digest_without_initializer
+
+
+def test_start_does_not_recheck_edited_profile_sources(tmp_path: Path, monkeypatch) -> None:
     config = _host_config(tmp_path)
     config = replace(
         config,
@@ -488,10 +1238,28 @@ def test_start_rejects_profile_source_changed_after_init(tmp_path: Path) -> None
         profile_source_digest=source_digest,
     )
 
-    _require_profile_sources(config, manifest)
     host_bashrc.write_text("export EDITOR=nvim\n", encoding="utf-8")
-    with pytest.raises(DeploymentError, match="宿主 profile 已变化"):
-        _require_profile_sources(config, manifest)
+    monkeypatch.setattr(runtime, "load_runtime", lambda _: manifest)
+    monkeypatch.setattr(runtime, "_require_root", lambda: None)
+    monkeypatch.setattr(runtime, "_require_policy_files", lambda _: None)
+    monkeypatch.setattr(runtime, "_require_target_image", lambda *_: None)
+    monkeypatch.setattr(runtime, "_require_gateway_image", lambda *_: None)
+    monkeypatch.setattr(runtime, "_check_gpu_cdi", lambda _: None)
+    monkeypatch.setattr(runtime, "_service_container_id", lambda *_: None)
+
+    def no_profile_reread(*args):
+        pytest.fail("start must not reread mutable profile sources")
+
+    class ReachedHostSetup(Exception):
+        pass
+
+    def reached_host_setup(*args):
+        raise ReachedHostSetup
+
+    monkeypatch.setattr(runtime, "_profile_bundle", no_profile_reread)
+    monkeypatch.setattr(runtime, "_install_host_parent_guard", reached_host_setup)
+    with pytest.raises(ReachedHostSetup):
+        compose_start_closed(config)
 
 
 def test_profile_sources_must_be_owned_regular_files_inside_target_home(
@@ -552,43 +1320,14 @@ def test_target_dns_queries_only_reach_project_dns(tmp_path: Path) -> None:
     compose = render_closed_compose(config, _manifest(config, tmp_path))
     target = compose["services"]["target"]
     assert "dns" not in target
-    resolver = next(item for item in target["volumes"] if item["target"] == "/etc/resolv.conf")
+    resolver = next(
+        item for item in target["volumes"] if item["target"] == "/etc/resolv.conf"
+    )
     assert resolver["source"].endswith("/generated/current/target-resolv.conf")
     assert resolver["read_only"] is True
     dns = compose["services"]["dns"]
     assert set(dns["networks"]) == {"target_net"}
     assert "canary_net" not in dns["networks"]
-
-
-def test_image_builds_use_host_network_without_persisting_proxy_values(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = _host_config(tmp_path)
-    compose = render_closed_compose(config, _manifest(config, tmp_path))
-    assert compose["services"]["target"]["build"]["network"] == "host"
-    assert compose["services"]["gateway"]["build"]["network"] == "host"
-
-    for variable in (
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-    ):
-        monkeypatch.delenv(variable, raising=False)
-    monkeypatch.setenv("HTTP_PROXY", "http://user:secret@127.0.0.1:11430")
-    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
-    options = _build_proxy_options()
-    assert options == (
-        "--build-arg",
-        "HTTP_PROXY",
-        "--build-arg",
-        "NO_PROXY",
-    )
-    assert "secret" not in " ".join(options)
 
 
 def test_project_path_is_identical_inside_and_outside(tmp_path: Path) -> None:
@@ -606,7 +1345,7 @@ def test_http_upstream_is_gateway_only(tmp_path: Path) -> None:
         upstream=UpstreamConfig(
             kind="http",
             host="127.0.0.1",
-            port=11440,
+            port=26940,
             config_path=None,
             expected_exit_cidr="8.0.0.0/8",
         ),
@@ -626,7 +1365,7 @@ def test_http_upstream_is_gateway_only(tmp_path: Path) -> None:
     assert gateway["networks"]["upstream_net"]["ipv4_address"] == "172.28.0.34"
     assert dns["networks"]["upstream_net"]["ipv4_address"] == "172.28.0.35"
     assert gateway["environment"]["CDM_UPSTREAM_HOST"] == "upstream.cdm.test"
-    assert gateway["environment"]["CDM_UPSTREAM_PORT"] == "11440"
+    assert gateway["environment"]["CDM_UPSTREAM_PORT"] == "26940"
     assert "upstream.cdm.test:172.28.0.33" in gateway["extra_hosts"]
     assert "upstream.cdm.test:172.28.0.33" in dns["extra_hosts"]
     assert "--doh-address" in dns["command"]
@@ -640,29 +1379,37 @@ def test_upstream_exit_must_match_host_configured_range(tmp_path: Path, monkeypa
         upstream=UpstreamConfig(
             kind="http",
             host="127.0.0.1",
-            port=11440,
+            port=26940,
             config_path=None,
             expected_exit_cidr="8.0.0.0/8",
         ),
     )
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout="8.8.8.8\n", stderr=""),
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, stdout="8.8.8.8\n", stderr=""
+        ),
     )
     assert _check_upstream(config) == "8.8.8.8"
 
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._run",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout="9.9.9.9\n", stderr=""),
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, stdout="9.9.9.9\n", stderr=""
+        ),
     )
     with pytest.raises(DeploymentError, match="不在声明范围"):
         _check_upstream(config)
 
 
-def test_host_parent_guard_allows_only_project_infrastructure(tmp_path: Path, monkeypatch) -> None:
+def test_host_parent_guard_allows_only_project_infrastructure(
+    tmp_path: Path, monkeypatch
+) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
+        upstream=UpstreamConfig(
+            kind="http", host="127.0.0.1", port=26940, config_path=None
+        ),
     )
     manifest = _manifest(config, tmp_path)
     scripts: list[tuple[str, str]] = []
@@ -678,7 +1425,7 @@ def test_host_parent_guard_allows_only_project_infrastructure(tmp_path: Path, mo
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._run",
         lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            [], 0, stdout="tcp dport 11440 drop\n"
+            [], 0, stdout="tcp dport 26940 drop\n"
         ),
     )
 
@@ -686,70 +1433,45 @@ def test_host_parent_guard_allows_only_project_infrastructure(tmp_path: Path, mo
 
     table, script = scripts[0]
     assert table == _host_parent_table(manifest)
-    assert 'iifname "lo" tcp dport 11440 accept' in script
+    assert 'iifname "lo" tcp dport 26940 accept' in script
     assert (
-        'iifname "br-123456789012" ip saddr { 172.28.0.34, 172.28.0.35 } tcp dport 11440 accept'
+        'iifname "br-123456789012" ip saddr { 172.28.0.34, 172.28.0.35 } '
+        "tcp dport 26940 accept"
     ) in script
     assert 'iifname "br-123456789012" drop' in script
-    assert "tcp dport 11440 drop" in script
+    assert "tcp dport 26940 drop" in script
 
 
 def test_stopped_parent_guard_keeps_the_parent_proxy_loopback_only(tmp_path: Path) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
+        upstream=UpstreamConfig(
+            kind="http", host="127.0.0.1", port=26940, config_path=None
+        ),
     )
     script = _stopped_host_parent_guard_script(config, _manifest(config, tmp_path))
 
-    assert 'iifname "lo" tcp dport 11440 accept' in script
-    assert "tcp dport 11440 drop" in script
+    assert 'iifname "lo" tcp dport 26940 accept' in script
+    assert "tcp dport 26940 drop" in script
     assert "172.28.0.34" not in script
     assert "172.28.0.35" not in script
-
-
-def test_stopped_state_removes_only_this_instance_ssh_forward_rules(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = _host_config(tmp_path)
-    manifest = _manifest(config, tmp_path)
-    commands: list[list[str]] = []
-    rules = "\n".join(
-        (
-            "-N DOCKER-USER",
-            "-A DOCKER-USER -s 172.28.0.3 -m comment "
-            '--comment cdm-u1000-main-ssh -j ACCEPT',
-            "-A DOCKER-USER -s 172.17.0.2 -m comment --comment unrelated -j ACCEPT",
-        )
-    )
-
-    def run(command, **_kwargs):
-        commands.append(command)
-        return subprocess.CompletedProcess(command, 0, stdout=rules)
-
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime.shutil.which", lambda _name: "/sbin/iptables"
-    )
-    monkeypatch.setattr("controlled_dev_machine.runtime._run", run)
-
-    _remove_host_ssh_forward_rules(manifest)
-
-    deletes = [command for command in commands if "-D" in command]
-    assert len(deletes) == 1
-    assert "cdm-u1000-main-ssh" in deletes[0]
-    assert "unrelated" not in deletes[0]
 
 
 def test_parent_guard_service_reloads_in_one_nft_transaction(tmp_path: Path) -> None:
     initial = tmp_path / "guard.nft"
     reload = tmp_path / "guard.reload.nft"
-    script = _host_parent_guard_runner_script("/usr/sbin/nft", "cdm_parent_test", initial, reload)
+    script = _host_parent_guard_runner_script(
+        "/usr/sbin/nft", "cdm_parent_test", initial, reload
+    )
 
     assert "delete table" not in script
     assert f"exec $NFT -f {reload}" in script
     assert f"exec $NFT -f {initial}" in script
 
 
-def test_repeated_start_exits_before_changing_host_state(tmp_path: Path, monkeypatch) -> None:
+def test_repeated_start_exits_before_changing_host_state(
+    tmp_path: Path, monkeypatch
+) -> None:
     config = _host_config(tmp_path)
     manifest = _manifest(config, tmp_path)
     touched: list[str] = []
@@ -764,10 +1486,6 @@ def test_repeated_start_exits_before_changing_host_state(tmp_path: Path, monkeyp
     )
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._require_target_image",
-        lambda _config, _manifest: None,
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._require_profile_sources",
         lambda _config, _manifest: None,
     )
     monkeypatch.setattr("controlled_dev_machine.runtime._check_gpu_cdi", lambda _config: None)
@@ -787,30 +1505,6 @@ def test_repeated_start_exits_before_changing_host_state(tmp_path: Path, monkeyp
     with pytest.raises(DeploymentError, match="环境已经运行"):
         compose_start_closed(config)
     assert touched == []
-
-
-def test_prepare_parent_guard_installs_loopback_only_state(tmp_path: Path, monkeypatch) -> None:
-    config = _host_config(tmp_path)
-    manifest = _manifest(config, tmp_path)
-    touched: list[str] = []
-    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
-    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._require_instance_stopped",
-        lambda _config, *, operation: touched.append(operation),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._install_host_parent_guard",
-        lambda _config, _manifest: touched.append("install"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._configure_stopped_host_parent_guard",
-        lambda _config, _manifest: touched.append("loopback-only"),
-    )
-
-    prepare_parent_guard(config)
-
-    assert touched == ["guard", "install", "loopback-only"]
 
 
 def _audit_state() -> dict[str, object]:
@@ -837,7 +1531,9 @@ def _audit_state() -> dict[str, object]:
     }
 
 
-def test_audit_status_requires_exact_probe_and_namespace_sets(tmp_path: Path, monkeypatch) -> None:
+def test_audit_status_requires_exact_probe_and_namespace_sets(
+    tmp_path: Path, monkeypatch
+) -> None:
     config = _host_config(tmp_path)
     path = config.paths.state / "audit-active.json"
     path.parent.mkdir(parents=True)
@@ -864,6 +1560,29 @@ def test_audit_status_requires_exact_probe_and_namespace_sets(tmp_path: Path, mo
     with pytest.raises(DeploymentError, match="网络命名空间集合不完整"):
         audit_status(config)
 
+    relay_config = replace(
+        config,
+        service_ports=ServicePorts(bind_address="127.0.0.1", start=25600, end=25700),
+    )
+    state = _audit_state()
+    entries = state["entries"]
+    assert isinstance(entries, list)
+    entries.insert(
+        -1,
+        {
+            "kind": "service-relay",
+            "pid": 30,
+            "starttime": 30,
+            "identity": {
+                "executable_path": "/bin/true",
+                "executable_device": 1,
+                "executable_inode": 2,
+            },
+        },
+    )
+    path.write_text(json.dumps(state), encoding="utf-8")
+    assert audit_status(relay_config)["active"] is True
+
 
 def test_audit_probe_requires_an_explicit_ready_marker(tmp_path: Path) -> None:
     class Process:
@@ -880,6 +1599,14 @@ def test_audit_probe_requires_an_explicit_ready_marker(tmp_path: Path) -> None:
         timeout_seconds=0.1,
     )
 
+    error_log.write_text("service relay ready\n", encoding="utf-8")
+    _wait_audit_probe_ready(
+        "service-relay",
+        Process(),  # type: ignore[arg-type]
+        error_log=error_log,
+        timeout_seconds=0.1,
+    )
+
     error_log.write_text("", encoding="utf-8")
     with pytest.raises(DeploymentError, match="未在期限内就绪"):
         _wait_audit_probe_ready(
@@ -890,244 +1617,9 @@ def test_audit_probe_requires_an_explicit_ready_marker(tmp_path: Path) -> None:
         )
 
 
-def test_long_running_pcap_uses_a_bounded_ring(tmp_path: Path) -> None:
-    config = _host_config(tmp_path)
-    command = _pcap_command(config, 123, tmp_path / "target.pcap")
-    assert command[command.index("-C") + 1] == "67"
-    assert command[command.index("-W") + 1] == "4"
-    assert command[command.index("-w") + 1] == str(tmp_path / "target.pcap")
-    assert command[-1] != "-"
-    assert _pcap_roll_size_million_bytes(64) == 67
-
-
-def test_pcap_output_alias_binds_registered_audit_root(tmp_path: Path, monkeypatch) -> None:
-    config = _host_config(tmp_path)
-    source = config.paths.audit / "pcap"
-    source.mkdir(parents=True)
-    alias_root = tmp_path / "run-alias"
-    mounted: set[Path] = set()
-    commands: list[list[str]] = []
-    monkeypatch.setattr("controlled_dev_machine.runtime._PCAP_OUTPUT_ROOT", alias_root)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._path_is_mountpoint",
-        lambda path: path in mounted,
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._same_file",
-        lambda left, right: left in mounted and right == source,
-    )
-
-    def run(command, **_kwargs):
-        commands.append(command)
-        if command[0] == "mount":
-            mounted.add(Path(command[-1]))
-        elif command[0] == "umount":
-            mounted.remove(Path(command[-1]))
-        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-    monkeypatch.setattr("controlled_dev_machine.runtime._run", run)
-
-    alias = _prepare_pcap_output_alias(config)
-    assert alias == _pcap_output_alias(config)
-    assert not alias.is_relative_to(config.target.home)
-    assert commands[0] == ["mount", "--bind", "--", str(source), str(alias)]
-
-    _remove_pcap_output_alias(config)
-    assert commands[-1] == ["umount", "--", str(alias)]
-    assert not alias.exists()
-
-
-def test_audit_start_write_failure_terminates_started_probe(tmp_path: Path, monkeypatch) -> None:
-    config = _host_config(tmp_path)
-    manifest = _manifest(config, tmp_path)
-    alias_root = tmp_path / "run-alias"
-    writes = 0
-    terminated: list[int] = []
-    commands: list[list[str]] = []
-
-    class Process:
-        pid = 321
-
-        def poll(self):
-            return None
-
-    def write_state(_config, _state):
-        nonlocal writes
-        writes += 1
-        if writes == 2:
-            raise OSError("disk full")
-
-    def spawn(command, _error_log, _capture_path):
-        commands.append(command)
-        return Process()
-
-    monkeypatch.setattr("controlled_dev_machine.runtime.shutil.which", lambda _name: "/bin/tool")
-    monkeypatch.setattr("controlled_dev_machine.runtime._service_pid", lambda *_args: 100)
-    monkeypatch.setattr("controlled_dev_machine.runtime._proc_starttime", lambda pid: pid)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime.process_identity", lambda _pid: {"pid": "identity"}
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._target_cgroup_path", lambda _pid: "/target"
-    )
-    monkeypatch.setattr("controlled_dev_machine.runtime._bpftrace_cgroup_id", lambda _path: 1)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._prepare_pcap_output_alias",
-        lambda _config: alias_root,
-    )
-    monkeypatch.setattr("controlled_dev_machine.runtime._mkdir", lambda *_args: None)
-    monkeypatch.setattr("controlled_dev_machine.runtime._secure_empty_file", lambda _path: None)
-    monkeypatch.setattr("controlled_dev_machine.runtime._write_audit_state", write_state)
-    monkeypatch.setattr("controlled_dev_machine.runtime._spawn_audit_process", spawn)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._terminate_spawned_audit_process",
-        lambda process: terminated.append(process.pid),
-    )
-
-    with pytest.raises(OSError, match="disk full"):
-        _start_audit(config, manifest, observed_upstream_ip="204.1.123.50")
-
-    assert writes == 2
-    assert terminated == [321]
-    assert Path(commands[0][commands[0].index("-w") + 1]).is_relative_to(alias_root)
-
-
-def test_audit_stop_keeps_state_when_alias_unmount_fails(tmp_path: Path, monkeypatch) -> None:
-    config = _host_config(tmp_path)
-    path = config.paths.state / "audit-active.json"
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({"entries": []}), encoding="utf-8")
-
-    def fail_unmount(_config):
-        raise DeploymentError("unmount failed")
-
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._remove_pcap_output_alias",
-        fail_unmount,
-    )
-
-    with pytest.raises(DeploymentError, match="unmount failed"):
-        _stop_audit(config)
-
-    assert path.exists()
-
-
-def test_recover_runtime_starts_missing_instance_or_restarts_only_audit(
+def test_ebpf_readiness_requires_observed_syscall_canaries(
     tmp_path: Path, monkeypatch
 ) -> None:
-    config = _host_config(tmp_path)
-    manifest = _manifest(config, tmp_path)
-    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._service_container_id",
-        lambda *_args: "",
-    )
-    started: list[str] = []
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime.compose_start_closed",
-        lambda _config: started.append("start"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime.restart_audit",
-        lambda _config: started.append("audit"),
-    )
-
-    assert recover_runtime(config) == "started"
-    assert started == ["start"]
-
-    active = {"canary", "dns", "gateway", "target"}
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._service_container_id",
-        lambda _config, _manifest, service: service if service in active else "",
-    )
-    assert recover_runtime(config) == "audit_restarted"
-    assert started == ["start", "audit"]
-
-
-def test_restart_audit_reconfigures_network_without_container_restart(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = _host_config(tmp_path)
-    manifest = _manifest(config, tmp_path)
-    events: list[str] = []
-    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
-    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._service_container_id",
-        lambda _config, _manifest, service: service,
-    )
-    monkeypatch.setattr("controlled_dev_machine.runtime._service_healthy", lambda *_args: True)
-    monkeypatch.setattr("controlled_dev_machine.runtime._require_policy_files", lambda *_args: None)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._disable_target_route",
-        lambda *_args: events.append("disable"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._stop_audit", lambda *_args: events.append("stop")
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._check_upstream", lambda *_args: "204.1.123.50"
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._configure_host_parent_guard",
-        lambda *_args: events.append("guard"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._configure_infrastructure_network",
-        lambda *_args: events.append("infra"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._configure_target_network",
-        lambda *_args: events.append("target-net"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._start_audit",
-        lambda *_args, **_kwargs: events.append("start-audit"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._enable_target_route",
-        lambda *_args: events.append("enable"),
-    )
-
-    restart_audit.__wrapped__(config)
-
-    assert events == ["disable", "stop", "guard", "infra", "target-net", "start-audit", "enable"]
-
-
-def test_compose_stop_finishes_container_cleanup_after_audit_error(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = _host_config(tmp_path)
-    manifest = _manifest(config, tmp_path)
-    events: list[str] = []
-    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
-    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
-    monkeypatch.setattr("controlled_dev_machine.runtime._disable_target_route", lambda *_args: None)
-
-    def fail_stop(_config):
-        raise DeploymentError("audit cleanup failed")
-
-    monkeypatch.setattr("controlled_dev_machine.runtime._stop_audit", fail_stop)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._compose_path",
-        lambda *_args, **_kwargs: events.append("compose-down"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._configure_stopped_host_parent_guard",
-        lambda *_args: events.append("stopped-guard"),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._archive_current_flow",
-        lambda _config: events.append("archive"),
-    )
-
-    with pytest.raises(DeploymentError, match="audit cleanup failed"):
-        compose_stop(config)
-
-    assert events == ["compose-down", "stopped-guard"]
-
-
-def test_ebpf_readiness_requires_observed_syscall_canaries(tmp_path: Path, monkeypatch) -> None:
     class Process:
         returncode = 0
 
@@ -1184,10 +1676,15 @@ def test_ebpf_readiness_requires_observed_syscall_canaries(tmp_path: Path, monke
         )
 
 
-def test_transparent_firewalls_allow_only_the_controlled_paths(tmp_path: Path, monkeypatch) -> None:
+def test_transparent_firewalls_allow_only_the_controlled_paths(
+    tmp_path: Path, monkeypatch
+) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
+        upstream=UpstreamConfig(
+            kind="http", host="127.0.0.1", port=26940, config_path=None
+        ),
+        service_ports=ServicePorts(bind_address="0.0.0.0", start=25600, end=25700),
     )
     manifest = _manifest(config, tmp_path)
     pids = {"gateway": 101, "dns": 102, "target": 103}
@@ -1205,7 +1702,9 @@ def test_transparent_firewalls_allow_only_the_controlled_paths(tmp_path: Path, m
         "controlled_dev_machine.runtime._apply_nft",
         lambda pid, script: scripts.__setitem__(pid, script),
     )
-    monkeypatch.setattr("controlled_dev_machine.runtime._verify_nft_table", lambda _pid: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._verify_nft_table", lambda _pid: None
+    )
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._transparent_tcp_ports",
         lambda _manifest: (80, 443, 18680),
@@ -1222,150 +1721,82 @@ def test_transparent_firewalls_allow_only_the_controlled_paths(tmp_path: Path, m
     gateway = scripts[101]
     assert "tcp dport { 80, 443, 18680 } redirect to :8080" in gateway
     assert "chain forward" in gateway and "policy drop" in gateway
-    assert "ip daddr @audit_parent_addresses tcp dport 11440 accept" in gateway
+    assert "ip daddr @audit_parent_addresses tcp dport 26940 accept" in gateway
     assert "ip daddr @audit_canary_addresses tcp dport { 80, 443 } accept" in gateway
     gateway_output = gateway.split("chain output", 1)[1]
     assert "    ct state established,related accept" not in gateway_output
     assert "udp dport 53 accept" not in gateway
 
     dns = scripts[102]
-    assert "ip daddr @audit_parent_addresses tcp dport 11440 accept" in dns
+    assert "ip daddr @audit_parent_addresses tcp dport 26940 accept" in dns
     assert "ip saddr @audit_target_addresses udp dport 53 accept" in dns
     assert "policy drop" in dns
 
     target = scripts[103]
     assert "ip daddr @audit_dns_addresses udp dport 53 accept" in target
     assert "tcp dport @audit_tcp_ports accept" in target
+    assert "tcp dport 25600-25700 accept" not in target
     assert "policy drop" in target
     assert any(command[-3:] == ["default", "via", "172.28.0.2"] for command in commands)
 
 
-def test_ssh_firewalls_use_explicit_tailscale_targets_without_proxy_redirect(
+def test_host_ssh_is_narrowly_allowed_and_target_network_gets_host_gateway(
     tmp_path: Path, monkeypatch
 ) -> None:
     config = replace(
         _host_config(tmp_path),
-        upstream=UpstreamConfig(kind="http", host="127.0.0.1", port=11440, config_path=None),
-        ssh=SshConfig(
-            enabled=True,
-            interface="tailscale0",
-            allowed_addresses=("100.72.7.86", "100.117.92.79"),
-            ports=(22, 10090),
-        ),
+        host_ssh=HostSshConfig(enabled=True, port=10090),
     )
-    manifest = replace(
-        _manifest(config, tmp_path),
-        ssh_enabled=True,
-        ssh_interface="tailscale0",
-        ssh_allowed_addresses=("100.72.7.86", "100.117.92.79"),
-        ssh_ports=(22, 10090),
-    )
-    pids = {"gateway": 101, "dns": 102, "target": 103}
+    manifest = _manifest(config, tmp_path)
     scripts: dict[int, str] = {}
-    commands: list[list[str]] = []
-    host_script: list[str] = []
+    host_scripts: list[tuple[str, str]] = []
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._service_pid",
-        lambda _config, _manifest, service: pids[service],
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._container_host_address",
-        lambda _pid, _host: "172.30.0.1",
+        lambda *_args: 103,
     )
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._apply_nft",
         lambda pid, script: scripts.__setitem__(pid, script),
     )
-    monkeypatch.setattr("controlled_dev_machine.runtime._verify_nft_table", lambda _pid: None)
     monkeypatch.setattr(
-        "controlled_dev_machine.runtime._transparent_tcp_ports",
-        lambda _manifest: (80, 443),
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._run",
-        lambda command, **_kwargs: commands.append(command),
-    )
-
-    _configure_infrastructure_network(config, manifest)
-    _configure_target_network(config, manifest)
-
-    gateway = scripts[101]
-    assert "audit_ssh_addresses" in gateway
-    assert "ip daddr @audit_ssh_addresses" in gateway
-    assert "tcp dport @audit_ssh_ports accept" in gateway
-    assert "redirect to :8080" in gateway
-    assert any(
-        any("net.ipv4.ip_forward=1" in part for part in command) for command in commands
-    )
-    assert sum(any(part == "route" for part in command) for command in commands) == 2
-
-    target = scripts[103]
-    assert "ip daddr @audit_ssh_addresses" in target
-    assert "tcp dport @audit_ssh_ports accept" in target
-
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._upstream_bridge_name",
-        lambda _config, _manifest: "br-test",
-    )
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._network_interface_exists", lambda _interface: True
+        "controlled_dev_machine.runtime._verify_nft_table", lambda _pid: None
     )
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._apply_host_nft",
-        lambda _table, script: host_script.append(script),
+        lambda table, script: host_scripts.append((table, script)),
     )
     monkeypatch.setattr(
         "controlled_dev_machine.runtime._run",
-        lambda command, **_kwargs: (
-            commands.append(command)
-            or SimpleNamespace(returncode=0, stdout="tcp dport 11440 drop\n")
-        ),
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout=""),
     )
-    _configure_host_parent_guard(config, manifest)
-    assert "set ssh_addresses" in host_script[0]
-    assert 'oifname "tailscale0"' in host_script[0]
-    assert "tcp dport @ssh_ports accept" in host_script[0]
-    assert "masquerade" in host_script[0]
-    docker_user_rules = [command for command in commands if "DOCKER-USER" in command]
-    assert any("-S" in command for command in docker_user_rules)
-    assert sum("-I" in command for command in docker_user_rules) == 8
-    assert [
-        "ip",
-        "route",
-        "replace",
-        "172.28.0.3/32",
-        "via",
-        "172.28.0.34",
-        "dev",
-        "br-test",
-    ] in commands
-
-
-def test_existing_runtime_does_not_take_ssh_settings_before_init(
-    tmp_path: Path, monkeypatch
-) -> None:
-    config = replace(
-        _host_config(tmp_path),
-        ssh=SshConfig(
-            enabled=True,
-            interface="tailscale0",
-            allowed_addresses=("100.72.7.86",),
-            ports=(22,),
-        ),
-    )
-    manifest = _manifest(config, tmp_path)
-    scripts: list[str] = []
-    monkeypatch.setattr("controlled_dev_machine.runtime._service_pid", lambda *_args: 103)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._apply_nft",
-        lambda _pid, script: scripts.append(script),
-    )
-    monkeypatch.setattr("controlled_dev_machine.runtime._verify_nft_table", lambda _pid: None)
 
     _configure_target_network(config, manifest)
+    _configure_host_ssh_guard(config, manifest)
 
-    assert manifest.ssh_enabled is False
-    assert "audit_ssh" not in scripts[0]
+    assert "ip daddr 172.28.0.1 tcp dport 10090 accept" in scripts[103]
+    assert "tcp dport 22 accept" not in scripts[103]
+    assert len(host_scripts) == 1
+    assert "ip saddr 172.28.0.3 ip daddr 172.28.0.1 tcp dport 10090 accept" in host_scripts[0][1]
+    assert "ip daddr 172.28.0.1 tcp dport 10090 drop" in host_scripts[0][1]
+    stopped = _stopped_host_ssh_guard_script(config, manifest)
+    assert "172.28.0.3" not in stopped.split("tcp dport", 1)[0]
+
+
+def test_host_access_network_mode_is_nat_only_when_enabled(tmp_path: Path) -> None:
+    disabled_config = _host_config(tmp_path)
+    disabled = render_closed_compose(disabled_config, _manifest(disabled_config, tmp_path))
+    enabled_config = replace(
+        disabled_config, host_ssh=HostSshConfig(enabled=True, port=10090)
+    )
+    enabled = render_closed_compose(enabled_config, _manifest(enabled_config, tmp_path))
+    disabled_mode = disabled["networks"]["target_net"]["driver_opts"][
+        "com.docker.network.bridge.gateway_mode_ipv4"
+    ]
+    enabled_mode = enabled["networks"]["target_net"]["driver_opts"][
+        "com.docker.network.bridge.gateway_mode_ipv4"
+    ]
+    assert disabled_mode == "isolated"
+    assert enabled_mode == "nat"
 
 
 def _gateway_source_tree(root: Path) -> None:
@@ -1396,14 +1827,6 @@ def test_gateway_build_digest_covers_gateway_and_controller_sources(tmp_path: Pa
     audit_source = tmp_path / "src/controlled_dev_machine/connect.bt"
     audit_source.write_text("tracepoint:syscalls:sys_enter_connect {}\n", encoding="utf-8")
     assert _gateway_build_digest(tmp_path) != original
-
-
-def test_gateway_build_digest_ignores_claude_config_seed(tmp_path: Path) -> None:
-    _gateway_source_tree(tmp_path)
-    original = _gateway_build_digest(tmp_path)
-    seed = tmp_path / "config/claude/CLAUDE.md"
-    seed.write_text("Updated config init seed.\n", encoding="utf-8")
-    assert _gateway_build_digest(tmp_path) == original
 
 
 def test_gateway_image_label_must_match_current_sources(tmp_path: Path, monkeypatch) -> None:
@@ -1482,6 +1905,127 @@ def test_target_image_tag_and_label_match_build_inputs(tmp_path: Path, monkeypat
         _require_target_image(config, manifest)
 
 
+@pytest.mark.parametrize("setting", ["_BUILD_PROVENANCE", "_BUILD_SBOM"])
+def test_target_build_digest_covers_attestation_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, setting: str
+) -> None:
+    _gateway_source_tree(tmp_path)
+    config = _host_config(tmp_path)
+    original = _target_build_digest(config, tmp_path)
+
+    monkeypatch.setattr(f"controlled_dev_machine.runtime.{setting}", True)
+
+    assert _target_build_digest(config, tmp_path) != original
+
+
+def test_compose_build_disables_attestations_at_command_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    compose_calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._require_instance_stopped",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("controlled_dev_machine.runtime.sync_base_images", lambda _config: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._compose",
+        lambda _config, _manifest, *args: compose_calls.append(args),
+    )
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._pin_built_images",
+        lambda _config, _manifest: None,
+    )
+
+    compose_build.__wrapped__(config)
+
+    assert compose_calls == [
+        ("build", "--provenance=false", "--sbom=false", "target", "gateway")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("root", "expected_user"),
+    [(False, "1000:1000"), (True, "0:0")],
+)
+def test_compose_shell_forwards_terminal_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root: bool,
+    expected_user: str,
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    compose_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    monkeypatch.setenv("TERM", "screen-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._compose",
+        lambda _config, _manifest, *args, **kwargs: (
+            compose_calls.append((args, kwargs))
+            or subprocess.CompletedProcess(args, 0)
+        ),
+    )
+
+    assert compose_shell(config, root=root) == 0
+    assert compose_calls == [
+        (
+            (
+                "exec",
+                "--env",
+                "TERM=screen-256color",
+                "--env",
+                "COLORTERM=truecolor",
+                "--user",
+                expected_user,
+                "target",
+                "bash",
+            ),
+            {"check": False},
+        )
+    ]
+
+
+@pytest.mark.parametrize("term", [None, "", "dumb", "unknown", "xterm"])
+def test_compose_shell_uses_builtin_256_color_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, term: str | None
+) -> None:
+    config = _host_config(tmp_path)
+    manifest = _manifest(config, tmp_path)
+    compose_calls: list[tuple[str, ...]] = []
+    if term is None:
+        monkeypatch.delenv("TERM", raising=False)
+    else:
+        monkeypatch.setenv("TERM", term)
+    monkeypatch.delenv("COLORTERM", raising=False)
+    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
+    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._compose",
+        lambda _config, _manifest, *args, **_kwargs: (
+            compose_calls.append(args) or subprocess.CompletedProcess(args, 0)
+        ),
+    )
+
+    assert compose_shell(config, root=False) == 0
+    assert compose_calls == [
+        (
+            "exec",
+            "--env",
+            "TERM=xterm-256color",
+            "--user",
+            "1000:1000",
+            "target",
+            "bash",
+        )
+    ]
+
+
 def test_built_image_ids_are_pinned_and_rechecked(tmp_path: Path, monkeypatch) -> None:
     config = _host_config(tmp_path)
     manifest = _manifest(config, tmp_path)
@@ -1512,7 +2056,9 @@ def test_lifecycle_lock_is_global_for_the_user(tmp_path: Path, monkeypatch) -> N
     config = _host_config(tmp_path)
     alternate = replace(config, instance="second")
     lock_root = tmp_path / "locks"
-    monkeypatch.setattr("controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", lock_root)
+    monkeypatch.setattr(
+        "controlled_dev_machine.runtime._LIFECYCLE_LOCK_ROOT", lock_root
+    )
     with (
         _lifecycle_lock(config),
         pytest.raises(DeploymentError, match="生命周期操作"),
@@ -1628,70 +2174,6 @@ rules: []
 def test_daily_policy_is_deployable() -> None:
     policy = load_policy(Path("policies/daily/0001-public-web.yaml"))
     _require_deployable_policy(policy)
-
-
-@pytest.mark.parametrize(
-    ("root", "expected_user"),
-    [(False, "1000:1000"), (True, "0:0")],
-)
-def test_compose_shell_forwards_terminal_capabilities(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    root: bool,
-    expected_user: str,
-) -> None:
-    config = _host_config(tmp_path)
-    manifest = _manifest(config, tmp_path)
-    compose_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
-    monkeypatch.setenv("TERM", "screen-256color")
-    monkeypatch.setenv("COLORTERM", "truecolor")
-    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
-    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._compose",
-        lambda _config, _manifest, *args, **kwargs: (
-            compose_calls.append((args, kwargs)) or subprocess.CompletedProcess(args, 0)
-        ),
-    )
-
-    assert compose_shell(config, root=root) == 0
-    assert compose_calls == [
-        (
-            (
-                "exec",
-                "--env",
-                "TERM=screen-256color",
-                "--env",
-                "COLORTERM=truecolor",
-                "--user",
-                expected_user,
-                "target",
-                "bash",
-            ),
-            {"check": False},
-        )
-    ]
-
-
-def test_compose_shell_omits_unset_terminal_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = _host_config(tmp_path)
-    manifest = _manifest(config, tmp_path)
-    compose_calls: list[tuple[str, ...]] = []
-    monkeypatch.delenv("TERM", raising=False)
-    monkeypatch.delenv("COLORTERM", raising=False)
-    monkeypatch.setattr("controlled_dev_machine.runtime.load_runtime", lambda _config: manifest)
-    monkeypatch.setattr("controlled_dev_machine.runtime._require_root", lambda: None)
-    monkeypatch.setattr(
-        "controlled_dev_machine.runtime._compose",
-        lambda _config, _manifest, *args, **_kwargs: (
-            compose_calls.append(args) or subprocess.CompletedProcess(args, 0)
-        ),
-    )
-
-    assert compose_shell(config, root=False) == 0
-    assert compose_calls == [("exec", "--user", "1000:1000", "target", "bash")]
 
 
 def test_legacy_stop_accepts_only_the_instances_fixed_compose_path(tmp_path: Path) -> None:
