@@ -24,7 +24,6 @@ import yaml
 
 from .degraded_topology import build_compose
 from .exit_monitor import atomic_json, refresh, validate_exit_config
-from .ssh_alias_bridge import target_config
 
 
 def absolute(value: str, name: str) -> Path:
@@ -213,9 +212,8 @@ class DevelopmentSandbox:
             p = self.home / item["path"]
             if item.get("required", True) and not p.exists():
                 raise RuntimeError(f"required data mount is missing: {p}")
-        for name in self.config.get("ssh_files", []):
-            if not (self.home / ".ssh" / relative(name)).is_file():
-                raise RuntimeError(f"required SSH identity/known-host file is missing: {name}")
+        if not (self.home / ".ssh/config").is_file():
+            raise RuntimeError("host SSH configuration is missing")
         for key, name in self.config.get("network_names", {}).items():
             if key not in ("target_net", "upstream_net"):
                 raise RuntimeError("only internal networks can be reused")
@@ -295,17 +293,16 @@ class DevelopmentSandbox:
                    bind(appview / ".claude", self.target_home / ".claude", False),
                    bind(appview / ".claude.json", self.target_home / ".claude.json", False),
                    bind(appview / ".bash_history", self.target_home / ".bash_history", False),
+                   bind(appview / "ssh", self.target_home / ".ssh"),
                    bind(appview / "claude-work", "/var/tmp/claude-work", False)]
         if c.get("tmp_compat_path"):
             volumes.append(bind(appview / "claude-work", absolute(c["tmp_compat_path"], "tmp_compat_path"), False))
         for item in c["mounts"]:
             if (self.home / item["path"]).exists():
                 volumes.append(bind(hostview / item["path"], self.target_home / item["path"], item.get("read_only", False)))
-        for name in c.get("ssh_files", []):
-            volumes.append(bind(hostview / ".ssh" / name, self.target_home / ".ssh" / name))
         config_files = {"passwd": "/etc/passwd", "group": "/etc/group", "bashrc": str(self.target_home / ".bashrc"),
             "profile": str(self.target_home / ".profile"),
-            "bash_profile": str(self.target_home / ".bash_profile"), "ssh_config": str(self.target_home / ".ssh/config"),
+            "bash_profile": str(self.target_home / ".bash_profile"),
             "sandbox.json": "/run/cdm/sandbox.json"}
         volumes += [bind(self.state / "config" / name, dest) for name, dest in config_files.items()]
         volumes += [bind(self.state / "machine-id", "/etc/machine-id"), bind(self.state / "machine-id", "/var/lib/dbus/machine-id"),
@@ -359,8 +356,7 @@ class DevelopmentSandbox:
                     destination.touch(mode=0o600)
         for name in [".claude", ".ssh"]:
             (home / name).mkdir(parents=True, exist_ok=True)
-        for name in [".claude.json", ".bash_history", ".bashrc", ".profile", ".bash_profile", ".ssh/config",
-                     *[".ssh/" + name for name in self.config.get("ssh_files", [])]]:
+        for name in [".claude.json", ".bash_history", ".bashrc", ".profile", ".bash_profile"]:
             destination = home / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             if not destination.exists() and not destination.is_symlink():
@@ -403,8 +399,8 @@ class DevelopmentSandbox:
         write_file(self.state / "config/bashrc", shell, 0o644)
         for name in ("profile", "bash_profile"):
             write_file(self.state / "config" / name, '. "$HOME/.bashrc"\n', 0o644)
-        ssh = target_config(self.home / ".ssh/config", "/run/cdm-ssh/alias.sock", "/run/cdm-ssh/campus-agent.sock")
-        write_file(self.state / "config/ssh_config", ssh, 0o644)
+        from .ssh_client_state import SSHClientState
+        SSHClientState(self.home / ".ssh", self.apps / "ssh", self.target_home).refresh()
         write_file(self.state / "machine-id", p["machine_id"] + "\n", 0o444)
         fleet = self.state / "ssh/fleet-identity"
         for name, value in {"profile.json": json.dumps(p), "hostname": p["hostname"], "boot-id": p["boot_id"],
@@ -438,7 +434,8 @@ class DevelopmentSandbox:
         q = lambda args: shlex.join([str(x) for x in args]).replace("%", "%%")
         ssh = [self.python, "-I", str(self.release / "src/controlled_dev_machine/ssh_alias_bridge.py"), "serve",
                "--socket", str(self.state / "ssh/alias.sock"), "--agent-socket", str(self.state / "ssh/campus-agent.sock"),
-               "--config", str(self.home / ".ssh/config"), "--audit", str(self.state / "audit/ssh/aliases.jsonl")]
+               "--config", str(self.home / ".ssh/config"), "--audit", str(self.state / "audit/ssh/aliases.jsonl"),
+               "--client-directory", str(self.apps / "ssh"), "--client-home", str(self.target_home)]
         units = {
             self.project + ".service": f'[Unit]\nDescription=Versioned development sandbox\nRequires=docker.service\nWants={self.project}-ssh.service\nAfter=docker.service {self.project}-ssh.service\nPartOf=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart={q(self.controller_args("start"))}\nTimeoutStartSec=240\n\n[Install]\nWantedBy=default.target\n',
             self.project + "-ssh.service": f'[Unit]\nDescription=Configured SSH aliases and fixed agent for sandbox\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={q(ssh)}\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n',

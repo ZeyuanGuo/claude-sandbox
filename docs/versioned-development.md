@@ -48,6 +48,30 @@ as a substitute for release management or concurrent database coordination.
 
 Claude's own automatic cleanup setting is unchanged by this release.
 
+## Adding SSH hosts without restarting the sandbox
+
+The host's existing `~/.ssh/config`, included configuration, keys and known-host
+files are the source. The SSH service refreshes a same-host client copy under
+`apps/ssh` after changes (normally within two seconds). That complete directory
+is mounted read-only as the target's `~/.ssh`. New files become visible through
+the existing directory mount, so adding a host or key needs no image build,
+container recreation or per-file mount list. The old `ssh_files` field is accepted
+for configuration compatibility and is no longer a mount allowlist.
+
+Add a normal explicit Host alias to the host configuration, put its key/known-host
+files under `~/.ssh`, and verify the host's SSH login. The same alias then works in
+the sandbox. Existing direct LAN, configured jump and configured VPN routes use
+the same audited bridge. Strict host-key verification remains enabled. Unix
+control sockets are excluded from the copy. Keys remain on the same machine;
+they are not a fleet synchronization artifact. The private copy is included in
+private state checkpoints and must never be published.
+
+Invalid edited SSH configuration leaves the last rendered client configuration
+intact and reports the refresh failure in the SSH service journal. Each new
+connection is still checked against the current host-owned alias and route.
+This dynamic SSH refresh does not change the Web proxy, exit verification or
+network isolation rules.
+
 ## Native Claude and updates
 
 The image-owned `/opt/sbc/bin/claude` validates the sandbox marker and executes the

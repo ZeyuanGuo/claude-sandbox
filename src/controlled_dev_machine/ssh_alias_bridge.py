@@ -22,6 +22,9 @@ import subprocess
 import sys
 import threading
 
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 FIXED_AGENT = Path(f"/run/user/{os.getuid()}/fleet-campus-agent.sock")
 HOSTNAME = re.compile(r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?\Z")
@@ -266,7 +269,7 @@ class Agent(socketserver.BaseRequestHandler):
             self.server.slots.release()
 
 
-def target_config(config: Path, socket_path: str, agent_path: str) -> str:
+def target_config(config: Path, socket_path: str, agent_path: str, *, target_home: Path | None = None) -> str:
     lines = []
     for alias in sorted(aliases_from_config(config)):
         options = effective(alias, config)
@@ -284,7 +287,10 @@ def target_config(config: Path, socket_path: str, agent_path: str) -> str:
                   '    StrictHostKeyChecking yes', '    UpdateHostKeys no',
                   '    BatchMode yes', '    IdentitiesOnly yes', '    ConnectTimeout 20']
         for key, label in [('hostkeyalias','HostKeyAlias'),('identityfile','IdentityFile'),('userknownhostsfile','UserKnownHostsFile'),('globalknownhostsfile','GlobalKnownHostsFile')]:
-            lines += [f'    {label} {value}' for value in options.get(key, [])]
+            for value in options.get(key, []):
+                if target_home is not None and key != 'hostkeyalias':
+                    value = value.replace(str(config.parent), str(target_home / '.ssh'))
+                lines.append(f'    {label} {value}')
         identity_agent = options.get('identityagent', ['none'])[0]
         if identity_agent != 'none':
             if identity_agent != str(FIXED_AGENT):
@@ -307,6 +313,8 @@ def main():
     serve.add_argument('--socket', required=True, type=Path)
     serve.add_argument('--agent-socket', required=True, type=Path)
     serve.add_argument('--audit', required=True, type=Path)
+    serve.add_argument('--client-directory', type=Path)
+    serve.add_argument('--client-home', type=Path)
     generate = sub.add_parser('config')
     generate.add_argument('--config', required=True, type=Path)
     args = parser.parse_args()
@@ -327,16 +335,43 @@ def main():
         print(json.dumps({'aliases':len(aliases_from_config(args.config)),'disabled_aliases':disabled}),file=sys.stderr)
         print(rendered, end='')
         return
+    refresher = None
+    if args.client_directory:
+        if not args.client_home:
+            parser.error('--client-directory requires --client-home')
+        from controlled_dev_machine.ssh_client_state import SSHClientState
+        refresher = SSHClientState(args.config.parent, args.client_directory, args.client_home)
+        refresher.refresh()
+    refresh_stop = threading.Event()
+    def refresh_client():
+        last_error = None
+        while not refresh_stop.wait(2):
+            try:
+                if refresher.refresh():
+                    print('SSH client configuration refreshed', flush=True)
+                last_error = None
+            except Exception as error:
+                message = f'SSH client refresh failed: {type(error).__name__}: {error}'
+                if message != last_error:
+                    print(message, file=sys.stderr, flush=True)
+                last_error = message
     with Server(args.socket, args.config, args.audit, Transport) as transport, Server(args.agent_socket, args.config, args.audit, Agent) as agent:
         def stop(signum,frame):
+            refresh_stop.set()
             threading.Thread(target=transport.shutdown,daemon=True).start()
         signal.signal(signal.SIGTERM,stop)
         signal.signal(signal.SIGINT,stop)
         thread = threading.Thread(target=agent.serve_forever, daemon=True)
         thread.start()
+        watcher = threading.Thread(target=refresh_client, daemon=True) if refresher else None
+        if watcher:
+            watcher.start()
         try:
             transport.serve_forever()
         finally:
+            refresh_stop.set()
+            if watcher:
+                watcher.join(timeout=5)
             agent.shutdown()
             thread.join(timeout=2)
 
