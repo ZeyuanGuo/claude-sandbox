@@ -44,8 +44,9 @@ def build_compose(
     projects: Path | None = None, strict_local: bool = False,
     ssh_bridge: bool = False,
     ssh_socket_dir: Path | None = None,
+    allow_public_dns: bool = False,
 ) -> dict:
-    if upstream_host and not dns_suffixes:
+    if upstream_host and not dns_suffixes and not allow_public_dns:
         raise ValueError(
             "an external parent requires an explicit DNS suffix allowlist"
         )
@@ -65,13 +66,15 @@ def build_compose(
                    "--proxy-port", "8080", "--doh-address", "1.1.1.1",
                    "--doh-server-name", "cloudflare-dns.com", "--lease-socket",
                    "/run/cdm-dns/lease.sock"]
-    if dns_suffixes:
+    if allow_public_dns:
+        dns_command += ["--allow-public-domains"]
+    elif dns_suffixes:
         for suffix in dns_suffixes:
             dns_command += ["--allowed-suffix", suffix]
     else:
         # Offline mode has no egress network; this is only useful for local
         # canaries and cannot send packets outside the internal networks.
-        dns_command += ["--allow-public-domains"]
+        dns_command += ["--allowed-suffix", "canary.test"]
     dns = service(target_image, dns_command)
     dns.update({
         "volumes": [mount(root / "src/controlled_dev_machine/dns_gateway.py", "/opt/cdm/dns_gateway.py"),
@@ -85,7 +88,7 @@ def build_compose(
         "--mode", "regular@8080", "--set", "connection_strategy=lazy", "--set",
         "rawtcp=false", "--set", "upstream_cert=false", "--set", "ssl_insecure=false",
         "--set", "block_global=false",
-        "--set", "confdir=/ca", "-w", "/audit/plaintext/flows.mitm",
+        "--set", "confdir=/ca", "-w", "+/audit/plaintext/flows-%Y%m%d-%H.mitm",
         "-s", "/opt/cdm/gateway/cdm_addon.py",
     ])
     gateway.update({

@@ -17,3 +17,6 @@ state/
 
 # Local MCP process logs are not project artifacts.
 .juno_task/
+*.private.json
+deployments/local/
+state-checkpoints/

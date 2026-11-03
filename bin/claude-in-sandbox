@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+if [ ! -e /.dockerenv ] || [ ! -f /run/cdm/sandbox.json ]; then
+    echo 'Claude must run in the configured development sandbox. Use sbc claude.' >&2
+    exit 2
+fi
+REAL="$HOME/.local/bin/claude"
+if [ ! -x "$REAL" ]; then
+    echo 'The preserved native Claude installation is missing.' >&2
+    exit 127
+fi
+TARGET=$(readlink -f "$REAL")
+SELF=$(readlink -f "$0")
+if [ "$TARGET" = "$SELF" ] || [ "$TARGET" = /opt/sbc/bin/claude ]; then
+    echo 'Claude launcher resolves to itself; refusing recursion.' >&2
+    exit 126
+fi
+exec "$REAL" "$@"

@@ -1,15 +1,35 @@
 from pathlib import Path
+import runpy
+import sys
 
 
-def test_sbc_wrapper_resolves_repository_and_defaults_to_shell() -> None:
-    script = Path("bin/sbc").read_text(encoding="utf-8")
+def test_sbc_help_does_not_require_an_installed_instance(monkeypatch, capsys):
+    module = runpy.run_path(str(Path("bin/sbc")), run_name="sbc_test")
+    monkeypatch.setattr(sys, "argv", ["sbc", "--help"])
+    assert module["main"]() == 0
+    assert "recover" in capsys.readouterr().out
 
-    assert "while [ -L \"$SCRIPT_PATH\" ]" in script
-    assert 'if [ "$#" -eq 0 ]; then' in script
-    assert "set -- shell" in script
-    assert 'if [ "$#" -eq 1 ]' in script
-    assert "sbc doctor" in script
-    assert "sbc recover" in script
-    assert "sbc audit restart" in script
-    assert 'exec sudo "$REPO_ROOT/bin/sandboxctl" "$@"' in script
-    assert 'case "$COMMAND_NAME"' not in script
+
+def test_rootless_entry_uses_the_registered_release_and_configuration(monkeypatch):
+    from types import SimpleNamespace
+    import json
+    import os
+    import pwd
+    import pytest
+    module = runpy.run_path(str(Path("bin/sbc")), run_name="sbc_test")
+    monkeypatch.setattr(sys, "argv", ["sbc", "status"])
+    monkeypatch.setattr(os, "getuid", lambda: 1234)
+    monkeypatch.delenv("SUDO_UID", raising=False)
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name="developer", pw_gid=1234, pw_dir="/home/developer"))
+    monkeypatch.setattr(Path, "is_file", lambda p: True)
+    entry = {"uid": 1234, "gid": 1234, "home": "/home/developer", "backend": "rootless-development",
+             "python": "/private/controller/python", "controller": "/private/releases/abc/bin/development-sandbox", "config": "/private/host.json"}
+    monkeypatch.setattr(Path, "read_text", lambda p: json.dumps(entry))
+    captured = []
+    def execute(executable, args):
+        captured.append(args)
+        raise SystemExit(0)
+    monkeypatch.setattr(os, "execv", execute)
+    with pytest.raises(SystemExit):
+        module["main"]()
+    assert captured == [[entry["python"], "-I", entry["controller"], "--config", entry["config"], "status"]]

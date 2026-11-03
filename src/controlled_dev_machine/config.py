@@ -68,6 +68,11 @@ class StorageConfig:
     pcap_limit_gib: float
     plaintext_limit_gib: float
     structured_limit_gib: float
+    pcap_retention_hours: float = 72
+    plaintext_retention_hours: float = 72
+    structured_retention_days: float = 30
+    pcap_roll_size_mib: int = 64
+    pcap_roll_files: int = 4
 
 
 @dataclass(frozen=True)
@@ -360,6 +365,26 @@ def load_host_config(path: Path) -> HostConfig:
         ),
         structured_limit_gib=_positive_number(
             storage_raw.get("structured_limit_gib"), "storage.structured_limit_gib"
+        ),
+        pcap_retention_hours=_positive_number(
+            storage_raw.get("pcap_retention_hours", 72),
+            "storage.pcap_retention_hours",
+        ),
+        plaintext_retention_hours=_positive_number(
+            storage_raw.get("plaintext_retention_hours", 72),
+            "storage.plaintext_retention_hours",
+        ),
+        structured_retention_days=_positive_number(
+            storage_raw.get("structured_retention_days", 30),
+            "storage.structured_retention_days",
+        ),
+        pcap_roll_size_mib=_positive_int(
+            storage_raw.get("pcap_roll_size_mib", 64),
+            "storage.pcap_roll_size_mib",
+        ),
+        pcap_roll_files=_positive_int(
+            storage_raw.get("pcap_roll_files", 4),
+            "storage.pcap_roll_files",
         ),
     )
 
@@ -725,3 +750,9 @@ def _validate_controlled_mounts(
         }:
             raise ConfigError(f"受控目录不能覆盖生成的 profile 文件: {target}")
         seen.append(target)
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"{name} 必须是正整数")
+    return value

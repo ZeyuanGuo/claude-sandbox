@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+case "${1:-shell}" in
+ shell) [ "$#" -eq 0 ] || shift; exec /bin/bash --login "$@";;
+ claude|codex) TOOL=$1; shift; exec "$TOOL" "$@";;
+ exec) shift; exec "$@";;
+ *) echo 'Lifecycle changes must be invoked using sbc on the host.' >&2; exit 2;;
+esac

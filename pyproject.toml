@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "controlled-dev-machine"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fail-closed network control and audit for a persistent development sandbox"
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6.0"]

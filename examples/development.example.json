@@ -1,0 +1,38 @@
+{
+  "schema_version": 2,
+  "release": "/srv/sbc/alice/releases/REPLACE_WITH_COMMIT",
+  "release_id": "example-release",
+  "private_root": "/srv/sbc/alice",
+  "host_home": "/home/alice",
+  "target_home": "/home/alice",
+  "user": "alice",
+  "uid": 1000,
+  "gid": 1000,
+  "extra_groups": [],
+  "project": "cdm-development",
+  "docker_context": "rootless",
+  "python": "/srv/sbc/alice/controller-env/bin/python",
+  "uid_tools": "/srv/sbc/alice/tools/uid",
+  "target_image": "sha256:REPLACE_WITH_BUILT_TARGET_IMAGE_ID",
+  "gateway_image": "sha256:REPLACE_WITH_BUILT_GATEWAY_IMAGE_ID",
+  "mapper_image": "sha256:REPLACE_WITH_UID_HELPER_IMAGE_ID",
+  "identity_profile": "/srv/sbc/alice/profiles/identity.json",
+  "node_bin": ".nvm/versions/node/REPLACE_WITH_NODE_VERSION/bin",
+  "conda_root": "miniconda3",
+  "conda_env": "base",
+  "gpu": "none",
+  "mounts": [
+    {"path": "project", "required": true, "read_only": false},
+    {"path": "miniconda3", "required": true, "read_only": false}
+  ],
+  "ssh_files": ["known_hosts"],
+  "interactive_exit_probe_url": "https://api.ipify.org",
+  "exit": {
+    "parent_proxy": "http://192.0.2.10:18080",
+    "expected_exit": "198.51.100.20",
+    "probe_urls": ["https://checkip.amazonaws.com", "https://api.ipify.org"],
+    "probe_timeout": 8,
+    "lease_seconds": 15,
+    "interval_seconds": 2
+  }
+}

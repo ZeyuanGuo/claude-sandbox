@@ -381,15 +381,14 @@ class RelayBehaviorTests(unittest.TestCase):
                         connection.sendall(b"stream-continues")
                         self.assertEqual(connection.recv(4096), b"stream-continues")
 
-    def test_mitmproxy_12_2_3_ipv6_connect_frame_is_canonicalized_for_parent(self):
+    def test_ipv6_connect_never_reaches_the_parent(self):
         parent = FakeParent(self.audit)
         self.addCleanup(parent.close)
         with running_relay(self.config(upstream_host=parent.address[0], upstream_port=parent.address[1])) as address:
-            # Captured from mitmproxy 12.2.3 HttpUpstreamProxy.start_handshake().
-            response = connect_request(address, b"CONNECT 2606:4700:4700::1111:443 HTTP/1.1\r\nHost: 2606:4700:4700::1111:443\r\n\r\n")
-            self.assertTrue(response.startswith(b"HTTP/1.1 200 "), response)
-        frame, _ = parent.frames.get(timeout=1)
-        self.assertEqual(frame, b"CONNECT [2606:4700:4700::1111]:443 HTTP/1.1\r\nHost: [2606:4700:4700::1111]:443\r\nConnection: close\r\n\r\n")
+            for authority in (b"2606:4700:4700::1111:443", b"[2606:4700:4700::1111]:443"):
+                response = connect_request(address, b"CONNECT " + authority + b" HTTP/1.1\r\nHost: " + authority + b"\r\n\r\n")
+                self.assertTrue(response.startswith(b"HTTP/1.1 403 "), response)
+        self.assertTrue(parent.frames.empty())
 
     def test_explicit_session_timeout_still_bounds_an_active_stream(self):
         parent = FakeParent(self.audit)

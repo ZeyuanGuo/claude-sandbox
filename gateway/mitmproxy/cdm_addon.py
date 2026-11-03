@@ -157,7 +157,7 @@ class ControlledReviewAddon:
                     )
                 else:
                     flow.response = _blocked(HEALTH_REASON, "gateway addon is ready")
-                flow.response.headers['x-cdm-codex-websocket'] = 'audited-v1'
+                    flow.response.headers['x-cdm-codex-websocket'] = 'audited-v1'
             return
         if self.audit_fault is not None:
             flow.response = _blocked(

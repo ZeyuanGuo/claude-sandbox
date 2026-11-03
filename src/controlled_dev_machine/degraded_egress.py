@@ -22,6 +22,8 @@ _MAX_BUFFER = 65536
 @dataclass(frozen=True)
 class RelayConfig:
     audit_path: Path
+    expected_exit: str | None = None
+    exit_lease: Path | None = None
     upstream_host: str | None = None
     upstream_port: int | None = None
     gateway_source: str = "172.31.1.3"
@@ -36,6 +38,10 @@ class RelayConfig:
     fixture_targets: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self):
+        if bool(self.expected_exit) != bool(self.exit_lease):
+            raise ValueError("exit pin and lease must be configured together")
+        if self.expected_exit:
+            ipaddress.ip_address(self.expected_exit)
         for address in (self.gateway_source, self.dns_source):
             if str(ipaddress.ip_address(address)) != address:
                 raise ValueError("trusted source must be a canonical numeric IP")
@@ -68,7 +74,7 @@ class RelayConfig:
     def from_mapping(cls, mapping: dict, *, audit_path: Path):
         allowed = {"parent_host", "parent_port", "upstream_host", "upstream_port",
                    "trusted_dns_ips", "trusted_gateway_ips", "header_timeout",
-                   "idle_timeout", "session_timeout", "max_sessions", "fixture_targets"}
+                   "idle_timeout", "session_timeout", "max_sessions", "fixture_targets", "expected_exit", "exit_lease"}
         if not isinstance(mapping, dict) or set(mapping) - allowed:
             raise ValueError("unknown or invalid relay configuration")
         values = {key: mapping[key] for key in ("header_timeout", "idle_timeout", "session_timeout", "max_sessions") if key in mapping}
@@ -82,6 +88,10 @@ class RelayConfig:
                 if not isinstance(peers, list) or len(peers) != 1 or not isinstance(peers[0], str):
                     raise ValueError("exactly one trusted numeric peer IP is required")
                 values[field] = peers[0]
+        if "expected_exit" in mapping:
+            values["expected_exit"] = mapping["expected_exit"]
+        if "exit_lease" in mapping:
+            values["exit_lease"] = Path(mapping["exit_lease"])
         fixtures = mapping.get("fixture_targets", [])
         if not isinstance(fixtures, list) or any(not isinstance(item, (list, tuple)) or len(item) != 2 for item in fixtures):
             raise ValueError("fixture_targets must be exact [IP, port] pairs")
@@ -141,14 +151,12 @@ def _target(frame, fixture_targets=()):
     if not separator or not port.isdecimal() or not host:
         raise ValueError("invalid-authority")
     address = ipaddress.ip_address(host.strip("[]"))
+    if address.version != 4:
+        raise ValueError("ipv4-destination-required")
     port = int(port)
-    authority = f"[{address}]:{port}" if address.version == 6 else f"{address}:{port}"
+    authority = f"{address}:{port}"
     fixture = (str(address), port) in fixture_targets
     incoming_authorities = {authority}
-    if address.version == 6:
-        # mitmproxy 12.2.3 emits bare canonical IPv6 in upstream CONNECT.
-        # Canonicalize it before forwarding; never accept a hostname or zone.
-        incoming_authorities.add(f"{address}:{port}")
     if parts[1] not in incoming_authorities or (port not in (80, 443) and not fixture):
         raise ValueError("invalid-authority")
     if not fixture and (not address.is_global or address.is_multicast or address.is_loopback
@@ -185,7 +193,32 @@ def _check_parent_response(frame):
             raise OSError("framed-parent-response")
 
 
-def _relay(client, parent, config, audit):
+def exit_lease_valid(config: RelayConfig, *, newer_than: float = 0.0) -> bool:
+    """A short, same-parent/same-boot lease gates both new and active streams."""
+    if config.exit_lease is None:
+        return True
+    try:
+        raw = config.exit_lease.read_text()
+        if len(raw) > 4096:
+            return False
+        value = json.loads(raw)
+        checked, expires = value["checked_monotonic"], value["expires_monotonic"]
+        now = time.monotonic()
+        return (value["schema_version"] == 1 and value["ok"] is True
+                and value["expected_exit"] == config.expected_exit
+                and value["observed_exit"] == config.expected_exit
+                and value["parent_host"] == config.upstream_host
+                and value["parent_port"] == config.upstream_port
+                and value["boot_id"] == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+                and type(checked) in (float, int) and type(expires) in (float, int)
+                and math.isfinite(checked) and math.isfinite(expires)
+                and newer_than <= checked <= now < expires
+                and 0 < expires - checked <= 15.0)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _relay(client, parent, config, audit, lease_started=0.0):
     client.setblocking(False)
     parent.setblocking(False)
     other = {client: parent, parent: client}
@@ -196,6 +229,8 @@ def _relay(client, parent, config, audit):
     while True:
         if audit.failed:
             return "audit-unavailable"
+        if not exit_lease_valid(config, newer_than=lease_started):
+            return "exit-lease-revoked"
         for source in ended:
             destination = other[source]
             if not buffers[destination] and destination not in closed_writes:
@@ -263,7 +298,10 @@ class _Handler(socketserver.BaseRequestHandler):
                 except (UnicodeError, ValueError, OSError) as exc:
                     status, reason = 403, str(exc)
                 else:
-                    status, reason = 200, "destination-approved"
+                    if exit_lease_valid(config, newer_than=self.server.lease_started):
+                        status, reason = 200, "destination-approved"
+                    else:
+                        status, reason = 503, "exit-lease-invalid"
         try:
             self.server.audit.write(source=source, target=target,
                                     result="allow" if status == 200 else "reject", reason=reason)
@@ -285,7 +323,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 _check_parent_response(response)
                 self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 established = True
-                reason = _relay(self.request, parent, config, self.server.audit)
+                reason = _relay(self.request, parent, config, self.server.audit, self.server.lease_started)
         except (OSError, ValueError) as exc:
             reason = str(exc)
             if not established:
@@ -308,6 +346,7 @@ class RelayServer(socketserver.ThreadingTCPServer):
 
     def __init__(self, config: RelayConfig, address):
         self.config = config
+        self.lease_started = time.monotonic()
         self.audit = _Audit(config.audit_path)
         self._slots = threading.BoundedSemaphore(config.max_sessions)
         super().__init__(address, _Handler)
@@ -364,7 +403,12 @@ def main(argv=None):
                        "parent_port": int(port) if port else None,
                        "trusted_dns_ips": [os.environ.get("CDM_RELAY_DNS_SOURCE", "172.31.1.2")],
                        "trusted_gateway_ips": [os.environ.get("CDM_RELAY_GATEWAY_SOURCE", "172.31.1.3")]}
+        if os.environ.get("CDM_RELAY_EXPECTED_EXIT"):
+            mapping["expected_exit"] = os.environ["CDM_RELAY_EXPECTED_EXIT"]
+            mapping["exit_lease"] = os.environ["CDM_RELAY_EXIT_LEASE"]
         config = RelayConfig.from_mapping(mapping, audit_path=args.audit)
+        if config.upstream_host and not config.test_mode and config.exit_lease is None:
+            raise ValueError("production egress requires an expected exit and a live lease")
     except (OSError, ValueError, TypeError) as exc:
         parser.error(str(exc))
     os.umask(0o077)

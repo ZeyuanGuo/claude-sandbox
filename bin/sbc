@@ -10,14 +10,23 @@ import sys
 
 
 def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("--help", "-h", "help"):
+        print("sbc [shell|claude [args]|codex [args]|exec command|root|status|doctor|recover|start|stop|checkpoint|audit]")
+        return 0
     uid = int(os.environ.get("SUDO_UID", os.getuid()))
     account = pwd.getpwuid(uid)
     path = Path("/etc/controlled-dev-machine") / account.pw_name / "entry.json"
+    if not path.is_file():
+        path = Path(account.pw_dir) / ".config/controlled-dev-machine/entry.json"
     if not path.is_file():
         raise SystemExit("当前主机尚未配置受控开发容器；不会自动回退到旧虚拟机。")
     entry = json.loads(path.read_text())
     if (entry["uid"], entry["gid"], entry["home"]) != (uid, account.pw_gid, account.pw_dir):
         raise SystemExit("沙盒入口与当前宿主账号不匹配。")
+    if entry.get("backend") == "rootless-development":
+        command = [entry["python"], "-I", entry["controller"], "--config", entry["config"], *args]
+        os.execv(command[0], command)
     docker = ["docker", "--context", entry["docker_context"]]
     args = sys.argv[1:]
     root = False

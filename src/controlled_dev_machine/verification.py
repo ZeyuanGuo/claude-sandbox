@@ -142,7 +142,7 @@ def run_closed_gate(config: HostConfig, *, timeout_seconds: float = 15.0) -> dic
     flow_candidates = []
     if plaintext_dir.is_dir():
         flow_candidates = sorted(plaintext_dir.glob("flows-*.mitm"))
-    flow_candidates.append(plaintext_dir / "flows.mitm")
+    flow_candidates.insert(0, plaintext_dir / "flows.mitm")
     flow_path = next(
         (candidate for candidate in reversed(flow_candidates)
          if candidate.is_file() and candidate.stat().st_size > 0),

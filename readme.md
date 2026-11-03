@@ -1,3 +1,7 @@
+# Versioned development release
+
+See [persistent Home and deployment guide](docs/versioned-development.md) and [0.2.0 changes](docs/releases-0.2.0.md). Private host profiles are configuration, not source constants.
+
 # 受控开发机
 
 本文使用迁移后的代理端口示例；历史测量和未重启实例的实际端口以对应原始记录及运行参数为准，不能把端口示例当作新的实测结果。

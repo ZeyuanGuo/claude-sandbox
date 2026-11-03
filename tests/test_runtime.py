@@ -600,7 +600,7 @@ def test_gateway_is_lazy_and_records_plaintext(tmp_path: Path) -> None:
     assert "regular" not in command
     assert "connection_strategy=lazy" in command
     assert "rawtcp=false" in command
-    assert "/audit/plaintext/flows.mitm" in command
+    assert "+/audit/plaintext/flows-%Y%m%d-%H.mitm" in command
     assert gateway["dns"] == ["172.28.0.4"]
     assert gateway["depends_on"] == {
         "canary": {"condition": "service_healthy"},

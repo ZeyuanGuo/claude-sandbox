@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Initialize a dedicated Home without copying or modifying the host's projects.
+
+The config must already list the complete project/environment allowlist. No
+credentials are seeded: the existing private .claude and .claude.json are retained.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from controlled_dev_machine.development import load_config, install_entry
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--config", required=True, type=Path)
+parser.add_argument("--native-claude", required=True, type=Path)
+parser.add_argument("--native-version", required=True)
+parser.add_argument("--native-sha256", required=True)
+args = parser.parse_args()
+c = load_config(args.config)
+source = Path(c["host_home"])
+apps = Path(c["private_root"]) / "apps"
+home = apps / "home"
+if not (apps / ".claude").is_dir() or not (apps / ".claude.json").is_file():
+    raise SystemExit("Existing private Claude state is required; refusing to seed another account")
+if home.is_symlink():
+    raise SystemExit("Dedicated Home must not be a symlink")
+home.mkdir(mode=0o700, parents=True, exist_ok=True)
+if not args.native_version.replace(".", "").replace("-", "").isalnum():
+    raise SystemExit("Invalid native version")
+data = args.native_claude.read_bytes()
+if hashlib.sha256(data).hexdigest() != args.native_sha256:
+    raise SystemExit("Native binary hash differs from the reviewed input")
+if data[:4] != b"\x7fELF":
+    raise SystemExit("Native Claude input must be the real ELF binary, not a wrapper")
+version_file = home / ".local/share/claude/versions" / args.native_version
+version_file.parent.mkdir(parents=True, exist_ok=True)
+if not version_file.exists():
+    version_file.write_bytes(data)
+    version_file.chmod(0o755)
+elif hashlib.sha256(version_file.read_bytes()).hexdigest() != args.native_sha256:
+    raise SystemExit("Refusing to overwrite an existing different native version")
+bin_dir = home / ".local/bin"
+bin_dir.mkdir(parents=True, exist_ok=True)
+entry = bin_dir / "claude"
+if not entry.exists() and not entry.is_symlink():
+    entry.symlink_to("../share/claude/versions/" + args.native_version)
+# Preserve ordinary host launchers (including uv and Python links), except managed entries.
+for path in (source / ".local/bin").iterdir():
+    if path.name in ("claude", "sbc"):
+        continue
+    target = bin_dir / path.name
+    if target.exists() or target.is_symlink():
+        continue
+    if path.is_symlink():
+        target.symlink_to(os.readlink(path))
+    elif path.is_file():
+        shutil.copy2(path, target)
+if not (bin_dir / "sbc").exists() and not (bin_dir / "sbc").is_symlink():
+    (bin_dir / "sbc").symlink_to("/opt/sbc/bin/sbc")
+# Non-secret loose work files and selected user configuration. Existing private files win.
+selected = [".condarc", ".gitconfig", ".tmux.conf", ".python_history", ".juno_task", "SERVER-5090-RESTORE.md",
+            "download_qwen3b_20261022.py", "gpu_memory_stress.py", "byte-pe-bundle.tar.zst"]
+for name in selected:
+    old, new = source / name, home / name
+    if old.is_file() and not new.exists() and not new.is_symlink():
+        shutil.copy2(old, new)
+for name in (".bashrc", ".profile", ".bash_profile"):
+    old, saved = source / name, home / "imported-host-config" / name
+    if old.is_file() and not saved.exists():
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(old, saved)
+(home / ".ssh").mkdir(mode=0o700, exist_ok=True)
+(apps / "claude-work").mkdir(mode=0o700, exist_ok=True)
+print(json.dumps({"home": str(home), "native_version": args.native_version,
+                  "native_sha256": args.native_sha256, "account_state_seeded": False}))

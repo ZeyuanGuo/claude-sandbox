@@ -1011,7 +1011,7 @@ def render_closed_compose(
                 "--set",
                 "termlog_verbosity=info",
                 "-w",
-                "/audit/plaintext/flows-%Y%m%d-%H.mitm",
+                "+/audit/plaintext/flows-%Y%m%d-%H.mitm",
                 "-s",
                 "/opt/cdm/gateway/cdm_addon.py",
             ],

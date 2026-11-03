@@ -1,0 +1,13 @@
+# The preserved base is an explicit host configuration input, never a mutable live container.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+COPY bin/claude-in-sandbox /opt/sbc/bin/claude
+COPY bin/sbc-in-sandbox /opt/sbc/bin/sbc
+RUN chmod 0755 /opt/sbc/bin/claude /opt/sbc/bin/sbc \
+    && rm -f /usr/local/bin/claude \
+    && ln -s /opt/sbc/bin/claude /usr/local/bin/claude
+ARG SOURCE_COMMIT
+LABEL org.controlled-dev-machine.source=${SOURCE_COMMIT}
+ENV PATH=/opt/sbc/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CMD ["sleep", "infinity"]
