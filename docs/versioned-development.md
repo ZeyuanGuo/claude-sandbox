@@ -162,3 +162,9 @@ Docker context before deployment. With a shared NFS Home, identical user entry
 files must refer to identical *host-local* path names, and all candidate hosts
 must be ready before selecting that shared entry. Preserve existing rootful
 workloads; only retire the reviewed old sandbox instance after backups.
+
+Both the current UID's `/tmp/claude-<uid>` and an optional legacy temporary path
+point at persistent work storage. This also preserves output when a native
+component uses its conventional temporary path. Startup failures retry the same
+release/configuration after ten seconds, remaining fail-closed while the parent
+is unavailable; successful running work is not restarted by this startup retry.

@@ -339,8 +339,9 @@ esac
                    bind(appview / ".claude.json", self.target_home / ".claude.json", False),
                    bind(appview / ".bash_history", self.target_home / ".bash_history", False),
                    bind(appview / "ssh", self.target_home / ".ssh"),
-                   bind(appview / "claude-work", "/var/tmp/claude-work", False)]
-        if c.get("tmp_compat_path"):
+                   bind(appview / "claude-work", "/var/tmp/claude-work", False),
+                   bind(appview / "claude-work", f'/tmp/claude-{c["uid"]}', False)]
+        if c.get("tmp_compat_path") and c["tmp_compat_path"] != f'/tmp/claude-{c["uid"]}':
             volumes.append(bind(appview / "claude-work", absolute(c["tmp_compat_path"], "tmp_compat_path"), False))
         for item in c["mounts"]:
             source = Path(item.get("source", self.home / item["path"]))
@@ -492,7 +493,7 @@ esac
                "--config", str(self.home / ".ssh/config"), "--audit", str(self.state / "audit/ssh/aliases.jsonl"),
                "--client-directory", str(self.apps / "ssh"), "--client-home", str(self.target_home)]
         units = {
-            self.project + ".service": f'[Unit]\nDescription=Versioned development sandbox\nRequires=docker.service\nWants={self.project}-ssh.service\nAfter=docker.service {self.project}-ssh.service\nPartOf=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart={q(self.controller_args("start"))}\nTimeoutStartSec=240\n\n[Install]\nWantedBy=default.target\n',
+            self.project + ".service": f'[Unit]\nDescription=Versioned development sandbox\nRequires=docker.service\nWants={self.project}-ssh.service\nAfter=docker.service {self.project}-ssh.service\nPartOf=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart={q(self.controller_args("start"))}\nTimeoutStartSec=240\nRestart=on-failure\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n',
             self.project + "-ssh.service": f'[Unit]\nDescription=Configured SSH aliases and fixed agent for sandbox\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={q(ssh)}\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n',
             self.project + "-exit-monitor.service": f'[Unit]\nDescription=Strict configured-exit lease monitor\nAfter=docker.service\n\n[Service]\nType=simple\nExecStart={q(self.controller_args("exit-monitor"))}\nRestart=on-failure\nRestartSec=1\n\n[Install]\nWantedBy=default.target\n',
             self.project + "-health.service": f'[Unit]\nDescription=Verify sandbox mounts and identity without rewriting user state\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={q(self.controller_args("health"))}\nTimeoutStartSec=60\n',

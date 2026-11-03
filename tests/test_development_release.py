@@ -263,3 +263,14 @@ def test_shared_root_permission_is_explicit_and_not_a_general_owner_bypass(tmp_p
     owner['uid']=12345
     with pytest.raises(RuntimeError,match='not owned'):
         module._paths(source,view,state)
+
+
+def test_current_and_legacy_claude_temp_paths_share_persistent_storage(tmp_path):
+    path,value=profile(tmp_path)
+    value['tmp_compat_path']='/tmp/claude-999'
+    path.write_text(json.dumps(value))
+    mounts={m['target']:m for m in DevelopmentSandbox(path).render()['services']['target']['volumes']}
+    assert mounts['/tmp/claude-1234']['source']==mounts['/tmp/claude-999']['source']==mounts['/var/tmp/claude-work']['source']
+    value['tmp_compat_path']='/tmp/claude-1234'
+    path.write_text(json.dumps(value))
+    DevelopmentSandbox(path).render()  # No duplicate bind when old and current IDs match.
