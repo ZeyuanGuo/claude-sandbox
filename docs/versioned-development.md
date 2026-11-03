@@ -147,3 +147,18 @@ cutover, and keep the original image as a recovery input.
 The audited SSH bridge also supports the established remote SOCKS gateway route
 through an owned `~/.ssh/a100-gateway.conf`, using argument vectors and strict
 host-key checking. Unconfigured request-supplied routes remain rejected.
+
+External data such as `/data` or `/local/<user>` can remain at its original path
+using explicit `external_mounts`. Each gets a separate UID view. Home and control
+roots are rejected. An accessible root-owned shared directory uses an explicit
+shared-root mapper check; the underlying host-user permissions still apply, and
+foreign files are not recursively chowned. The target receives neither a host
+root filesystem nor Docker control access.
+
+For a new rootless host, install the distribution's `uidmap` package and use the
+account's existing subordinate UID/GID range. Keep Docker data on a local disk,
+enable the existing per-user Docker service and linger, and verify the selected
+Docker context before deployment. With a shared NFS Home, identical user entry
+files must refer to identical *host-local* path names, and all candidate hosts
+must be ready before selecting that shared entry. Preserve existing rootful
+workloads; only retire the reviewed old sandbox instance after backups.

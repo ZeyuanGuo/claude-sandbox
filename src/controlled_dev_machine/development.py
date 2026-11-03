@@ -49,7 +49,7 @@ def load_config(path: Path) -> dict:
                 "user", "uid", "gid", "project", "docker_context", "python", "uid_tools",
                 "target_image", "gateway_image", "mapper_image", "identity_profile", "mounts", "exit"}
     optional = {"node_bin", "conda_root", "conda_env", "gpu", "extra_gpu_libraries", "trust_overlays",
-                "ssh_files", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases"}
+                "ssh_files", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases", "external_mounts"}
     if not isinstance(raw, dict) or set(raw) - required - optional or required - set(raw):
         raise ValueError("deployment configuration fields are missing or unknown")
     if raw["schema_version"] != 2:
@@ -91,6 +91,16 @@ def load_config(path: Path) -> dict:
         alias = absolute(name, "home alias")
         if alias.parent != Path('/home') or alias == Path(raw['target_home']):
             raise ValueError("legacy Home aliases must be distinct direct children of /home")
+    for item in raw.get("external_mounts", []):
+        if set(item) - {"source", "target", "read_only", "required"} or not {"source", "target"} <= set(item):
+            raise ValueError("invalid external data mount")
+        source, target = absolute(item["source"], "external source"), absolute(item["target"], "external target")
+        roots = [Path(x) for x in ("/data", "/local", "/mnt", "/srv", "/home/shared")]
+        if source != target or not any(target == root or target.is_relative_to(root) for root in roots):
+            raise ValueError("external mounts must preserve an explicit data path")
+        protected = [Path(raw[x]) for x in ("private_root", "host_home", "target_home")]
+        if any(source == p or source.is_relative_to(p) or p.is_relative_to(source) for p in protected):
+            raise ValueError("external data must not expose a Home or control directory")
     for name in ("node_bin", "conda_root"):
         if name in raw:
             relative(raw[name])
@@ -220,6 +230,12 @@ class DevelopmentSandbox:
             p = Path(item.get("source", self.home / item["path"]))
             if item.get("required", True) and not p.exists():
                 raise RuntimeError(f"required data mount is missing: {p}")
+        for item in self.config.get("external_mounts", []):
+            p = Path(item["source"])
+            if not p.exists() and not item.get("required", True):
+                continue
+            if p.is_symlink() or not p.is_dir() or p.stat().st_uid not in (0, os.getuid()) or not os.access(p, os.R_OK | os.X_OK):
+                raise RuntimeError(f"external data root is not an accessible owned/shared directory: {p}")
         if not (self.home / ".ssh/config").is_file():
             raise RuntimeError("host SSH configuration is missing")
         for key, name in self.config.get("network_names", {}).items():
@@ -362,6 +378,9 @@ esac
                 destination = Path(volume["target"])
                 if destination == self.target_home or destination.is_relative_to(self.target_home):
                     volumes.append(dict(volume, target=str(Path(alias) / destination.relative_to(self.target_home))))
+        for index, item in enumerate(c.get("external_mounts", [])):
+            if Path(item["source"]).exists():
+                volumes.append(bind(self.private / f"uid-extra-{index}/view", item["target"], item.get("read_only", False)))
         for hidden in ("/root", "/home/gzy"):
             if hidden != str(self.target_home) and hidden not in c.get("home_aliases", []):
                 volumes.append(bind(self.state / "empty", hidden))
@@ -493,6 +512,9 @@ esac
         command = [self.python, "-I", str(self.release / "src/controlled_dev_machine/rootless_uid_mount.py")]
         options = ["--source", str(source), "--view", str(directory / "view"), "--state", str(directory),
                    "--tools", c["uid_tools"], "--image", c["mapper_image"], "--name", name, "--uid", str(c["uid"]), "--gid", str(c["gid"])]
+        shared_root = source.stat().st_uid != os.getuid()
+        if shared_root:
+            options.append("--allow-shared-root")
         if self.run(command + ["status"] + options, check=False).returncode == 0:
             return False
         current = self.run(self.docker + ["inspect", name], check=False)
@@ -502,7 +524,7 @@ esac
             if info["Image"] != expected_image:
                 raise RuntimeError("refusing to replace an unrelated UID mapper")
             self.run(self.docker + ["stop", "--time=10", name])
-        uid_module.UID, uid_module.GID = c["uid"], c["gid"]
+        uid_module.UID, uid_module.GID, uid_module.ALLOW_SHARED_ROOT = c["uid"], c["gid"], shared_root
         pids = self.run(["pgrep", "-u", str(os.getuid()), "-x", "dockerd"]).stdout.split()
         if len(pids) != 1:
             raise RuntimeError("exactly one rootless dockerd is required")
@@ -520,6 +542,9 @@ esac
         result = [(self.home, "uid-home"), (self.apps, "uid-app")]
         if any("source" in item for item in self.config["mounts"]):
             result.append((self.private / "data", "uid-data"))
+        for index, item in enumerate(self.config.get("external_mounts", [])):
+            if Path(item["source"]).exists():
+                result.append((Path(item["source"]), f"uid-extra-{index}"))
         return result
 
     def apply_identity(self):
@@ -576,6 +601,8 @@ esac
                     "--source", str(source), "--view", str(self.private / part / "view"),
                     "--state", str(self.private / part), "--tools", self.config["uid_tools"], "--image", self.config["mapper_image"], "--name", self.project + "-" + part,
                     "--uid", str(self.config["uid"]), "--gid", str(self.config["gid"])]
+            if source.stat().st_uid != os.getuid():
+                args.append("--allow-shared-root")
             if self.run(args, check=False).returncode:
                 atomic_json(self.state / "readiness.json", {"ok": False, "config_sha256": self.config_sha, "reason": "UID mapper not ready"})
                 (self.state / "exit-control/lease.json").unlink(missing_ok=True)

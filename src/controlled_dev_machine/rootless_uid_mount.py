@@ -18,6 +18,7 @@ import uuid
 
 
 UID = GID = 1010
+ALLOW_SHARED_ROOT = False
 NAME = "cdm-degraded-uid-view"
 
 
@@ -72,7 +73,8 @@ def _paths(source: Path, view: Path, state: Path) -> None:
     if not view.is_relative_to(state) or view == source:
         raise RuntimeError("view must be inside separate control state, outside source")
     metadata = source.stat()
-    if (metadata.st_uid, metadata.st_gid) != (0, 0):
+    if (metadata.st_uid, metadata.st_gid) != (0, 0) and not (
+            ALLOW_SHARED_ROOT and metadata.st_uid == 65534 and os.access(source, os.R_OK | os.X_OK)):
         raise RuntimeError("source is not owned by the rootless Docker host user")
 
 
@@ -81,8 +83,10 @@ def _probe_mapping(source: Path, view: Path, state: Path, token: str) -> None:
     if mounted != {"fstype": "fuse.cdm_uid_view", "source": str(source)}:
         raise RuntimeError("UID view is not the expected active FUSE mount")
     original, translated = source.stat(), view.stat()
-    if ((original.st_uid, original.st_gid) != (0, 0)
-            or (translated.st_uid, translated.st_gid) != (UID, GID)
+    expected_owner = (UID if original.st_uid == 0 else original.st_uid,
+                      GID if original.st_gid == 0 else original.st_gid)
+    if ((original.st_uid, original.st_gid) != (0, 0) and not ALLOW_SHARED_ROOT
+            or (translated.st_uid, translated.st_gid) != expected_owner
             or stat.S_IMODE(original.st_mode) != stat.S_IMODE(translated.st_mode)):
         raise RuntimeError("source root does not prove the live translated UID/GID view")
 
@@ -143,6 +147,8 @@ def ready_record(source: Path, view: Path, state: Path, daemon_pid: int,
                 "user_namespace": _namespace("user")}
     if any(ready.get(key) != value for key, value in expected.items()):
         raise RuntimeError("UID view readiness configuration or namespace drift")
+    if ready.get("allow_shared_root", False) != ALLOW_SHARED_ROOT:
+        raise RuntimeError("UID view shared-root configuration drift")
     _probe_mapping(source, view, state, ready["token"])
     if bool(ssh_source) != bool(ssh_shadow) or bool(ready.get("ssh")) != bool(ssh_source):
         raise RuntimeError("SSH shadow readiness configuration drift")
@@ -208,6 +214,7 @@ def mapper(source: Path, view: Path, state: Path, tools: Path, daemon_pid: int,
             record = {"source": str(source), "view": str(view), "uid": UID, "gid": GID,
                       "daemon_pid": daemon_pid, "mapper_pid": os.getpid(), "token": token,
                       "mount_namespace": _namespace("mnt"), "user_namespace": _namespace("user")}
+            record["allow_shared_root"] = ALLOW_SHARED_ROOT
             if ssh_source and ssh_shadow:
                 from controlled_dev_machine.rootless_uid_ssh import SSHShadow
                 bridge = SSHShadow(ssh_source, ssh_shadow, uid=UID, gid=GID)
@@ -276,11 +283,13 @@ def helper_command(action: str, *, source: Path, view: Path, state: Path, tools:
                     "--uid", str(UID), "--gid", str(GID)])
     if ssh_source and ssh_shadow:
         command.extend(["--ssh-source", str(ssh_source), "--ssh-shadow", str(ssh_shadow)])
+    if ALLOW_SHARED_ROOT:
+        command.append("--allow-shared-root")
     return command
 
 
 def main(argv: list[str] | None = None) -> int:
-    global UID, GID
+    global UID, GID, ALLOW_SHARED_ROOT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("start", "status", "stop", "mapper", "check", "cleanup"))
     parser.add_argument("--source", required=True, type=Path)
@@ -294,10 +303,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ssh-shadow", type=Path)
     parser.add_argument("--uid", type=int, default=1010)
     parser.add_argument("--gid", type=int, default=1010)
+    parser.add_argument("--allow-shared-root", action="store_true")
     args = parser.parse_args(argv)
     if args.uid <= 0 or args.gid <= 0:
         parser.error("target UID/GID must be positive")
     UID, GID = args.uid, args.gid
+    ALLOW_SHARED_ROOT = args.allow_shared_root
     try:
         pid = args.daemon_pid
         if pid is None:

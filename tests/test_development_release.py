@@ -228,3 +228,38 @@ def test_interactive_shell_has_common_aliases_and_user_extension(tmp_path):
     assert "alias ll='ls -alF'" in p.stdout
     assert 'histappend' in p.stdout and 'checkwinsize' in p.stdout
     assert '"$HOME/.bash_aliases"' in shell
+
+
+def test_external_data_keeps_original_path_without_exposing_control(tmp_path, monkeypatch):
+    path,value=profile(tmp_path)
+    value['external_mounts']=[{'source':'/data/project','target':'/data/project'}]
+    path.write_text(json.dumps(value))
+    original=Path.exists
+    monkeypatch.setattr(Path,'exists',lambda p: True if str(p)=='/data/project' else original(p))
+    app=DevelopmentSandbox(path)
+    mounts={m['target']:m for m in app.render()['services']['target']['volumes']}
+    assert mounts['/data/project']['source']==str(tmp_path/'private/uid-extra-0/view')
+    assert (Path('/data/project'),'uid-extra-0') in app.mapper_sources()
+    value['private_root']='/data/private'
+    value['external_mounts']=[{'source':'/data','target':'/data'}]
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError,match='expose a Home or control'):
+        load_config(path)
+
+
+def test_shared_root_permission_is_explicit_and_not_a_general_owner_bypass(tmp_path, monkeypatch):
+    import stat
+    from types import SimpleNamespace
+    import controlled_dev_machine.rootless_uid_mount as module
+    source=tmp_path/'shared';source.mkdir();state=tmp_path/'state';state.mkdir();view=state/'view';view.mkdir()
+    original=Path.stat
+    owner={'uid':65534}
+    monkeypatch.setattr(Path,'stat',lambda p,**kw: SimpleNamespace(st_uid=owner['uid'],st_gid=65534,st_mode=stat.S_IFDIR|0o755) if p==source else original(p,**kw))
+    monkeypatch.setattr(module,'ALLOW_SHARED_ROOT',False)
+    with pytest.raises(RuntimeError,match='not owned'):
+        module._paths(source,view,state)
+    monkeypatch.setattr(module,'ALLOW_SHARED_ROOT',True)
+    module._paths(source,view,state)
+    owner['uid']=12345
+    with pytest.raises(RuntimeError,match='not owned'):
+        module._paths(source,view,state)
