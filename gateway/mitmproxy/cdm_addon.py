@@ -132,7 +132,8 @@ class ControlledReviewAddon:
         if policy is None:
             return
         request = flow.request
-        if _requests_protocol_upgrade(request):
+        codex_ws_candidate = _codex_ws_request(request)
+        if _requests_protocol_upgrade(request) and not codex_ws_candidate:
             flow.response = _blocked(
                 "unsupported-upgrade",
                 "protocol upgrades require a separately verified plaintext path",
@@ -156,6 +157,7 @@ class ControlledReviewAddon:
                     )
                 else:
                     flow.response = _blocked(HEALTH_REASON, "gateway addon is ready")
+                flow.response.headers['x-cdm-codex-websocket'] = 'audited-v1'
             return
         if self.audit_fault is not None:
             flow.response = _blocked(
@@ -211,6 +213,9 @@ class ControlledReviewAddon:
         flow.metadata["cdm_policy_action"] = decision.action
         flow.metadata["cdm_policy_rule"] = decision.rule_id
         if decision.action == "allow":
+            if codex_ws_candidate:
+                _codex_ws_audit(flow, 'authorized')
+                flow.metadata['cdm_codex_ws_allowed'] = True
             if self.degraded:
                 self._pin_degraded_dispatch(flow)
             return
@@ -502,6 +507,15 @@ class ControlledReviewAddon:
         if flow.response.status_code != 101:
             flow.response.stream = True
             return
+        if flow.metadata.get('cdm_codex_ws_allowed') and _codex_ws_response(flow):
+            try:
+                _codex_ws_audit(flow, 'opened')
+                flow.metadata['cdm_codex_ws_verified'] = True
+                return
+            except Exception as exc:
+                self._latch_audit_fault(f'WebSocket handshake audit failed: {exc}')
+                flow.response = _blocked('websocket-audit-unavailable', 'WebSocket audit storage failed')
+                return
         request_id = flow.metadata.get("cdm_review_request_id")
         if request_id:
             try:
@@ -518,6 +532,56 @@ class ControlledReviewAddon:
         flow.response = _blocked_without_body(
             "unsupported-upgrade",
         )
+
+    def websocket_message(self, flow: http.HTTPFlow) -> None:
+        message = flow.websocket.messages[-1]
+        reason = None
+        content = message.content
+        size = len(content)
+        count = int(flow.metadata.get('cdm_codex_ws_count', 0)) + 1
+        total = int(flow.metadata.get('cdm_codex_ws_bytes', 0)) + size
+        if not flow.metadata.get('cdm_codex_ws_verified'):
+            reason = 'unverified-websocket'
+        elif message.type != 1:
+            reason = 'binary-websocket-message'
+        elif size > CODEX_WS_MAX_MESSAGE or total > CODEX_WS_MAX_SESSION or count > CODEX_WS_MAX_MESSAGES:
+            reason = 'websocket-quota-exceeded'
+        else:
+            try:
+                text = content.decode('utf-8', errors='strict')
+                parsed = json.loads(text)
+                if not isinstance(parsed, dict) or not isinstance(parsed.get('type'), str):
+                    reason = 'non-json-websocket-message'
+            except (UnicodeError, ValueError):
+                reason = 'non-json-websocket-message'
+        if reason:
+            message.drop()
+            flow.kill()
+            try:
+                _codex_ws_audit(flow, 'blocked', reason=reason, bytes=size)
+            except Exception as exc:
+                self._latch_audit_fault(f'WebSocket rejection audit failed: {exc}')
+            return
+        try:
+            _codex_ws_audit(flow, 'message', sequence=count,
+                direction='client' if message.from_client else 'server',
+                bytes=size, sha256=hashlib.sha256(content).hexdigest(), content_utf8=text)
+            flow.metadata['cdm_codex_ws_count'] = count
+            flow.metadata['cdm_codex_ws_bytes'] = total
+        except Exception as exc:
+            message.drop()
+            flow.kill()
+            self._latch_audit_fault(f'WebSocket message audit failed: {exc}')
+
+    def websocket_end(self, flow: http.HTTPFlow) -> None:
+        if not flow.metadata.get('cdm_codex_ws_verified'):
+            return
+        try:
+            _codex_ws_audit(flow, 'closed', messages=flow.metadata.get('cdm_codex_ws_count', 0),
+                bytes=flow.metadata.get('cdm_codex_ws_bytes', 0))
+        except Exception as exc:
+            self._latch_audit_fault(f'WebSocket close audit failed: {exc}')
+
 
     def response(self, flow: http.HTTPFlow) -> None:
         request_id = flow.metadata.get("cdm_review_request_id")
@@ -548,11 +612,13 @@ class ControlledReviewAddon:
 
 
 def _blocked(code: str, message: str) -> http.Response:
-    return http.Response.make(
-        403,
-        f"controlled gateway blocked request: {code}: {message}\n",
-        {"content-type": "text/plain; charset=utf-8", "x-cdm-block-reason": code},
-    )
+    # A failed local authorization service is retryable; security denials stay 403.
+    status = 503 if code == 'lease-service-unavailable' else 403
+    headers = {'content-type': 'text/plain; charset=utf-8', 'x-cdm-block-reason': code}
+    if status == 503:
+        headers['retry-after'] = '1'
+    return http.Response.make(status,
+        f'controlled gateway blocked request: {code}: {message}\n', headers)
 
 
 def _blocked_without_body(code: str) -> http.Response:
@@ -623,6 +689,79 @@ def _is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -
         and not address.is_reserved
         and not address.is_unspecified
     )
+
+
+# Narrow Codex WebSocket plaintext path; every other Upgrade stays blocked.
+import hashlib
+CODEX_WS_HOST = 'chatgpt.com'
+CODEX_WS_PATH = '/backend-api/codex/responses'
+CODEX_WS_MAX_MESSAGE = 16 * 1024 * 1024
+CODEX_WS_MAX_SESSION = 256 * 1024 * 1024
+CODEX_WS_MAX_MESSAGES = 100000
+CODEX_WS_AUDIT_ROOT = Path('/audit/plaintext/codex-websocket')
+
+
+def _codex_ws_request(request):
+    import base64
+    if (request.scheme != 'https' or request.pretty_host.lower().rstrip('.') != CODEX_WS_HOST
+            or request.port != 443 or request.method.upper() != 'GET'
+            or request.path != CODEX_WS_PATH):
+        return False
+    for key in ('upgrade', 'connection', 'sec-websocket-key', 'sec-websocket-version'):
+        if len(request.headers.get_all(key)) != 1:
+            return False
+    if (request.headers.get('upgrade', '').lower().strip() != 'websocket'
+            or 'upgrade' not in {v.strip().lower() for v in request.headers.get('connection', '').split(',')}
+            or request.headers.get('sec-websocket-version') != '13'):
+        return False
+    try:
+        return len(base64.b64decode(request.headers['sec-websocket-key'], validate=True)) == 16
+    except (ValueError, TypeError):
+        return False
+
+
+def _codex_ws_response(flow):
+    import base64
+    if not _codex_ws_request(flow.request) or flow.response.status_code != 101:
+        return False
+    expected = base64.b64encode(hashlib.sha1((flow.request.headers['sec-websocket-key']
+        + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')).digest()).decode('ascii')
+    return (flow.response.headers.get('upgrade', '').strip().lower() == 'websocket'
+        and 'upgrade' in {v.strip().lower() for v in flow.response.headers.get('connection', '').split(',')}
+        and flow.response.headers.get('sec-websocket-accept') == expected)
+
+
+def _codex_ws_audit(flow, event, **details):
+    import stat
+    session = str(flow.id)
+    if not session or any(c not in '0123456789abcdef-' for c in session):
+        raise ValueError('invalid WebSocket audit identifier')
+    CODEX_WS_AUDIT_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = CODEX_WS_AUDIT_ROOT / (session + '.jsonl')
+    record = {'schema_version': 1, 'event': event, 'flow_id': session,
+        'host': CODEX_WS_HOST, 'path': CODEX_WS_PATH,
+        'time_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), **details}
+    data = (json.dumps(record, ensure_ascii=True, separators=(',', ':')) + '\n').encode('utf-8')
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError('WebSocket audit is not a regular file')
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            count = os.write(fd, view)
+            if count <= 0:
+                raise OSError('short WebSocket audit write')
+            view = view[count:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    # Persist a newly-created file's directory entry before forwarding its frame.
+    parent_fd = os.open(CODEX_WS_AUDIT_ROOT, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 addons = [ControlledReviewAddon()]
