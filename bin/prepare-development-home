@@ -64,7 +64,7 @@ if not (bin_dir / "sbc").exists() and not (bin_dir / "sbc").is_symlink():
     (bin_dir / "sbc").symlink_to("/opt/sbc/bin/sbc")
 # Non-secret loose work files and selected user configuration. Existing private files win.
 selected = [".condarc", ".gitconfig", ".tmux.conf", ".python_history", ".juno_task", "SERVER-5090-RESTORE.md",
-            "download_qwen3b_20261022.py", "gpu_memory_stress.py", "byte-pe-bundle.tar.zst"]
+            "download_qwen3b_20261022.py", "gpu_memory_stress.py"]
 for name in selected:
     old, new = source / name, home / name
     if old.is_file() and not new.exists() and not new.is_symlink():

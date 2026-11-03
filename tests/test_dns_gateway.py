@@ -162,13 +162,13 @@ def test_lease_server_handles_a_normal_parallel_request_burst(tmp_path) -> None:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(2)
-                barrier.wait(timeout=2)
+                barrier.wait(timeout=10)
                 connection.connect(str(socket_path))
                 connection.sendall(request)
                 response = json.loads(connection.recv(4096))
-                return response.get("lease_id") if response.get("allowed") else None
-        except (OSError, ValueError, json.JSONDecodeError, threading.BrokenBarrierError):
-            return None
+                return response.get("lease_id") if response.get("allowed") else f"denied: {response}"
+        except (OSError, ValueError, json.JSONDecodeError, threading.BrokenBarrierError) as error:
+            return f"{type(error).__name__}: {error}"
 
     try:
         with ThreadPoolExecutor(max_workers=clients) as executor:
@@ -201,7 +201,7 @@ def test_public_doh_queries_are_not_serialized(monkeypatch) -> None:
     barrier = threading.Barrier(clients)
 
     def query_once(packet: bytes):
-        barrier.wait(timeout=2)
+        barrier.wait(timeout=10)
         return packet, {}
 
     monkeypatch.setattr(client, "_query_once", query_once)
@@ -782,3 +782,33 @@ def test_fresh_cache_still_checks_current_domain_policy(tmp_path):
     denied = gateway.resolve(query, '192.0.2.10')
     assert struct.unpack('!H', denied[2:4])[0] & 0x000F == 2
     assert client.calls == 1
+
+
+def test_idle_lease_clients_release_the_bounded_worker_slots(tmp_path, monkeypatch):
+    monkeypatch.setattr("controlled_dev_machine.dns_gateway._TCP_CLIENT_TIMEOUT_SECONDS", 0.2)
+    class SmallServer(_LeaseServer):
+        max_workers = 2
+    registry = LeaseRegistry()
+    expected = registry.grant("api.example.com", ("93.184.216.34",), 60)
+    _LeaseHandler.registry = registry
+    path = str(tmp_path / "idle.sock")
+    server = SmallServer(path, _LeaseHandler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    idle = [socket.socket(socket.AF_UNIX) for _ in range(2)]
+    try:
+        for connection in idle:
+            connection.connect(path)
+        import time
+        time.sleep(0.3)
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(2)
+            client.connect(path)
+            client.sendall(b'{"hostname":"api.example.com","address":"93.184.216.34"}\n')
+            assert json.loads(client.recv(4096))["lease_id"] == expected
+    finally:
+        for connection in idle:
+            connection.close()
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)

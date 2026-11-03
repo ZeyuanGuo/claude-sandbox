@@ -573,6 +573,9 @@ class DevelopmentSandbox:
         os.execvp(cmd[0], cmd)
 
     def install_entries(self):
+        status = self.status()
+        if not status.get("running") or status.get("actual_release") != self.config["release_id"] or not status.get("exit_verified"):
+            raise RuntimeError("refusing to select an unverified or mismatched running release")
         command = shlex.join(self.controller_args("")[:-1])
         script = '#!/bin/sh\nexec ' + command + ' "$@"\n'
         entry = {"backend": "rootless-development", "uid": os.getuid(), "gid": os.getgid(), "home": str(self.home),

@@ -829,7 +829,11 @@ class _LeaseHandler(socketserver.StreamRequestHandler):
     registry: LeaseRegistry
 
     def handle(self) -> None:
-        raw = self.rfile.readline(4097)
+        self.request.settimeout(_TCP_CLIENT_TIMEOUT_SECONDS)
+        try:
+            raw = self.rfile.readline(4097)
+        except OSError:
+            return
         lease_id: str | None = None
         if raw and len(raw) <= 4096:
             try:
@@ -852,6 +856,18 @@ class _LeaseHandler(socketserver.StreamRequestHandler):
 class _LeaseServer(_BoundedThreadingMixIn, socketserver.UnixStreamServer):
     max_workers = 16
     request_queue_size = 128
+
+    def process_request(self, request: object, client_address: object) -> None:
+        # Keep the worker limit, but let the bounded kernel backlog absorb a normal
+        # simultaneous lease burst instead of dropping every request above 16.
+        if not self._worker_slots.acquire(timeout=_TCP_CLIENT_TIMEOUT_SECONDS):
+            self.shutdown_request(request)
+            return
+        try:
+            socketserver.ThreadingMixIn.process_request(self, request, client_address)
+        except Exception:
+            self._worker_slots.release()
+            raise
 
 
 def _static_response(query: bytes, address: str) -> bytes:
