@@ -1,5 +1,12 @@
 #!/bin/sh
 set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Registered rootless deployments use the same entry even under the legacy name.
+if [ "${1:-}" != "--config" ] && [ -f "$HOME/.config/controlled-dev-machine/entry.json" ]; then
+    if /usr/bin/python3 -c 'import json,sys; raise SystemExit(json.load(open(sys.argv[1])).get("backend") != "rootless-development")' "$HOME/.config/controlled-dev-machine/entry.json"; then
+        exec "$SCRIPT_DIR/sbc" "$@"
+    fi
+fi
 RELEASE=/opt/controlled-dev-machine/release
 if [ ! -d "$RELEASE/src/controlled_dev_machine" ]; then
     SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
