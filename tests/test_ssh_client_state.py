@@ -59,3 +59,20 @@ def test_invalid_configuration_preserves_last_usable_client_files(tmp_path, monk
     with pytest.raises(Exception):
         sync.refresh()
     assert (dest / 'config').read_bytes() == before
+
+
+def test_existing_remote_socks_gateway_stays_an_argument_vector(tmp_path, monkeypatch):
+    import controlled_dev_machine.ssh_alias_bridge as bridge
+    calls=[]
+    def effective(alias, config):
+        calls.append((alias,config))
+        if alias=='a100-gateway':return {'hostname':['192.0.2.2'],'port':['22']}
+        return {'hostname':['10.0.0.10'],'port':['22'],'proxycommand':['/usr/bin/ssh -T -F ~/.ssh/a100-gateway.conf a100-gateway /usr/bin/nc -X 5 -x 127.0.0.1:11080 %h %p']}
+    monkeypatch.setattr(bridge,'effective',effective)
+    kind,args=bridge.route_plan('a100a',tmp_path/'config','10.0.0.10',22)
+    assert kind=='process' and args[0]=='/usr/bin/ssh'
+    assert args[-2:]==['10.0.0.10','22']
+    assert '-oStrictHostKeyChecking=yes' in args
+    assert calls[-1][0]=='a100-gateway'
+    with pytest.raises(ValueError,match='destination differs'):
+        bridge.route_plan('a100a',tmp_path/'config','10.0.0.11',22)

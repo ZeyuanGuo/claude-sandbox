@@ -1,0 +1,30 @@
+# Keep the verified OS/toolchain, excluding user data and historical temporary files.
+# BASE_IMAGE is a recorded image ID/tag, never a running-container commit.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS preserved
+USER root
+RUN set -eu; \
+    mkdir -p /cdm-base; \
+    cp -a /usr /etc /opt /cdm-base/; \
+    for name in bin sbin lib lib64 lib32 libx32; do \
+      if [ -e "/$name" ] || [ -L "/$name" ]; then cp -a "/$name" /cdm-base/; fi; \
+    done; \
+    mkdir -p /cdm-base/var/lib /cdm-base/var/cache /cdm-base/var/log \
+      /cdm-base/var/tmp /cdm-base/var/lib/dbus /cdm-base/tmp /cdm-base/home \
+      /cdm-base/root /cdm-base/run /cdm-base/proc /cdm-base/sys /cdm-base/dev \
+      /cdm-base/mnt /cdm-base/media /cdm-base/srv; \
+    for name in dpkg apt alternatives; do \
+      if [ -d "/var/lib/$name" ]; then cp -a "/var/lib/$name" /cdm-base/var/lib/; fi; \
+    done; \
+    chmod 1777 /cdm-base/tmp /cdm-base/var/tmp; chmod 0700 /cdm-base/root; \
+    rm -f /cdm-base/etc/ssh/ssh_host_* /cdm-base/etc/ssl/private/*; \
+    if [ -f /cdm-base/etc/shadow ]; then \
+      awk 'BEGIN{FS=OFS=":"} {$2="!"; print}' /cdm-base/etc/shadow > /cdm-base/etc/shadow.new; \
+      chmod 0640 /cdm-base/etc/shadow.new; mv /cdm-base/etc/shadow.new /cdm-base/etc/shadow; \
+    fi; \
+    touch /cdm-base/etc/locale.conf /cdm-base/etc/timezone /cdm-base/etc/hostid \
+      /cdm-base/etc/machine-id /cdm-base/var/lib/dbus/machine-id
+FROM scratch
+COPY --from=preserved /cdm-base/ /
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CMD ["sleep", "infinity"]

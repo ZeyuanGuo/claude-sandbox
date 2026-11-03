@@ -102,10 +102,18 @@ def route_plan(alias: str, config: Path, host: str, port: int):
         return ('process', argv)
     if command != 'none':
         fields = shlex.split(command)
-        if fields != ['/usr/bin/nc', '-X', '5', '-x', '127.0.0.1:11080', '%h', '%p']:
-            raise ValueError('Unsupported host ProxyCommand; refusing fallback')
-        argv = ['/usr/bin/nc', '-X', '5', '-x', '127.0.0.1:11080', host, str(port)]
-        return ('process', argv)
+        direct_socks = ['/usr/bin/nc', '-X', '5', '-x', '127.0.0.1:11080', '%h', '%p']
+        if fields == direct_socks:
+            return ('process', direct_socks[:-2] + [host, str(port)])
+        remote_socks = ['/usr/bin/ssh', '-T', '-F', '~/.ssh/a100-gateway.conf',
+                        'a100-gateway', *direct_socks]
+        if fields == remote_socks:
+            gateway_config = Path.home() / '.ssh/a100-gateway.conf'
+            effective('a100-gateway', gateway_config)
+            return ('process', ['/usr/bin/ssh', '-T', '-F', str(gateway_config),
+                '-oBatchMode=yes', '-oStrictHostKeyChecking=yes', '-oUpdateHostKeys=no',
+                '-oConnectTimeout=15', 'a100-gateway', *direct_socks[:-2], host, str(port)])
+        raise ValueError('Unsupported host ProxyCommand; refusing fallback')
     return ('direct', (host, port))
 
 

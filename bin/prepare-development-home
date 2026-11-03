@@ -63,7 +63,7 @@ for path in (source / ".local/bin").iterdir():
 if not (bin_dir / "sbc").exists() and not (bin_dir / "sbc").is_symlink():
     (bin_dir / "sbc").symlink_to("/opt/sbc/bin/sbc")
 # Non-secret loose work files and selected user configuration. Existing private files win.
-selected = [".condarc", ".gitconfig", ".tmux.conf", ".python_history", ".juno_task", "SERVER-5090-RESTORE.md",
+selected = [".bash_aliases", ".inputrc", ".dircolors", ".condarc", ".gitconfig", ".tmux.conf", ".python_history", ".juno_task", "SERVER-5090-RESTORE.md",
             "download_qwen3b_20261022.py", "gpu_memory_stress.py"]
 for name in selected:
     old, new = source / name, home / name

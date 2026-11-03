@@ -188,3 +188,43 @@ def test_failed_admitted_start_revokes_readiness_and_old_lease(tmp_path, monkeyp
         module.main(["--config", "/unused", "start"])
     assert not lease.exists()
     assert json.loads((tmp_path / "readiness.json").read_text())["ok"] is False
+
+
+def test_legacy_home_keeps_project_and_application_paths_with_same_identity(tmp_path):
+    path, value = profile(tmp_path)
+    value['home_aliases'] = ['/home/legacy']
+    path.write_text(json.dumps(value))
+    app = DevelopmentSandbox(path)
+    mounts = {m['target']: m for m in app.render()['services']['target']['volumes']}
+    for name in ['', '/project-a', '/.claude', '/.ssh', '/.bashrc']:
+        assert mounts['/home/legacy'+name]['source'] == mounts['/home/developer'+name]['source']
+    assert app.render()['services']['target']['environment']['HOME'] == '/home/developer'
+
+
+def test_local_environment_override_uses_separate_uid_view(tmp_path):
+    path, value = profile(tmp_path)
+    source = tmp_path/'private/data/miniconda3'
+    source.mkdir(parents=True)
+    value['mounts'].append({'path':'miniconda3','source':str(source)})
+    path.write_text(json.dumps(value))
+    app = DevelopmentSandbox(path)
+    mounts = {m['target']:m for m in app.render()['services']['target']['volumes']}
+    assert mounts['/home/developer/miniconda3']['source']==str(tmp_path/'private/uid-data/view/miniconda3')
+    assert (tmp_path/'private/data','uid-data') in app.mapper_sources()
+    value['mounts'][-1]['source']='/unrelated/place'
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError,match='local data overrides'):
+        load_config(path)
+
+
+def test_interactive_shell_has_common_aliases_and_user_extension(tmp_path):
+    import subprocess
+    import os
+    path, _ = profile(tmp_path)
+    shell, _ = DevelopmentSandbox(path).shell_content()
+    rc=tmp_path/'bashrc';rc.write_text(shell)
+    p=subprocess.run(['/bin/bash','--noprofile','--rcfile',str(rc),'-ic','alias ll la l lh ca cab; shopt histappend checkwinsize'],text=True,capture_output=True,env=dict(os.environ,HOME=str(tmp_path)))
+    assert p.returncode==0
+    assert "alias ll='ls -alF'" in p.stdout
+    assert 'histappend' in p.stdout and 'checkwinsize' in p.stdout
+    assert '"$HOME/.bash_aliases"' in shell

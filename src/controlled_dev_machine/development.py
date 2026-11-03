@@ -49,7 +49,7 @@ def load_config(path: Path) -> dict:
                 "user", "uid", "gid", "project", "docker_context", "python", "uid_tools",
                 "target_image", "gateway_image", "mapper_image", "identity_profile", "mounts", "exit"}
     optional = {"node_bin", "conda_root", "conda_env", "gpu", "extra_gpu_libraries", "trust_overlays",
-                "ssh_files", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url"}
+                "ssh_files", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases"}
     if not isinstance(raw, dict) or set(raw) - required - optional or required - set(raw):
         raise ValueError("deployment configuration fields are missing or unknown")
     if raw["schema_version"] != 2:
@@ -75,7 +75,7 @@ def load_config(path: Path) -> dict:
     protected = {".claude", ".claude.json", ".ssh", ".docker", ".git", ".local/share/docker",
                  ".config/systemd", ".config/controlled-dev-machine"}
     for item in raw["mounts"]:
-        if not isinstance(item, dict) or set(item) - {"path", "read_only", "required"} or "path" not in item:
+        if not isinstance(item, dict) or set(item) - {"path", "source", "read_only", "required"} or "path" not in item:
             raise ValueError("invalid mount entry")
         name = str(relative(item["path"]))
         if name in seen or name in protected or any(name.startswith(p + "/") for p in protected):
@@ -83,6 +83,14 @@ def load_config(path: Path) -> dict:
         if any(name.startswith(p + "/") or p.startswith(name + "/") for p in seen):
             raise ValueError("overlapping data mounts require one explicit parent entry")
         seen.add(name)
+        if "source" in item:
+            source = absolute(item["source"], "mount source")
+            if source != Path(raw["private_root"]) / "data" / name:
+                raise ValueError("local data overrides must use private_root/data at the same relative path")
+    for name in raw.get("home_aliases", []):
+        alias = absolute(name, "home alias")
+        if alias.parent != Path('/home') or alias == Path(raw['target_home']):
+            raise ValueError("legacy Home aliases must be distinct direct children of /home")
     for name in ("node_bin", "conda_root"):
         if name in raw:
             relative(raw[name])
@@ -209,7 +217,7 @@ class DevelopmentSandbox:
             if not p.exists():
                 raise RuntimeError(f"required preserved application/tool state is missing: {p}")
         for item in self.config["mounts"]:
-            p = self.home / item["path"]
+            p = Path(item.get("source", self.home / item["path"]))
             if item.get("required", True) and not p.exists():
                 raise RuntimeError(f"required data mount is missing: {p}")
         if not (self.home / ".ssh/config").is_file():
@@ -245,6 +253,27 @@ class DevelopmentSandbox:
         text += "\n".join(f"export {k}={shlex.quote(v)}" for k, v in exports.items()) + "\n"
         text += f'if [ -f {shlex.quote(conda + "/etc/profile.d/conda.sh")} ]; then . {shlex.quote(conda + "/etc/profile.d/conda.sh")}; fi\n'
         text += 'export HISTFILE="$HOME/.bash_history"\ncase $- in *i*) PS1="\\u@\\h:\\w\\$ ";; esac\n'
+        text += '''case $- in
+*i*)
+    HISTCONTROL=ignoreboth
+    shopt -s histappend checkwinsize
+    if command -v dircolors >/dev/null 2>&1; then
+        if [ -r "$HOME/.dircolors" ]; then eval "$(dircolors -b "$HOME/.dircolors")"; else eval "$(dircolors -b)"; fi
+    fi
+    alias ls='ls --color=auto' dir='dir --color=auto' vdir='vdir --color=auto'
+    alias grep='grep --color=auto' fgrep='fgrep --color=auto' egrep='egrep --color=auto'
+    alias ll='ls -alF' la='ls -A' l='ls -CF' lh='ls -lFh'
+    alias ca='conda activate'
+    alias cab="conda activate $CDM_DEFAULT_CONDA_ENV"
+    if [ -r /usr/share/bash-completion/bash_completion ]; then
+        . /usr/share/bash-completion/bash_completion
+    elif [ -r /etc/bash_completion ]; then
+        . /etc/bash_completion
+    fi
+    if [ -r "$HOME/.bash_aliases" ]; then . "$HOME/.bash_aliases"; fi
+    ;;
+esac
+'''
         if c.get("interactive_exit_probe_url"):
             proxy = "http://" + self.network_addresses()["gateway_target"] + ":8080"
             command = shlex.join(["curl", "-4", "--fail", "--silent", "--show-error", "--proxy", proxy,
@@ -298,8 +327,10 @@ class DevelopmentSandbox:
         if c.get("tmp_compat_path"):
             volumes.append(bind(appview / "claude-work", absolute(c["tmp_compat_path"], "tmp_compat_path"), False))
         for item in c["mounts"]:
-            if (self.home / item["path"]).exists():
-                volumes.append(bind(hostview / item["path"], self.target_home / item["path"], item.get("read_only", False)))
+            source = Path(item.get("source", self.home / item["path"]))
+            if source.exists():
+                mapped = hostview / item["path"] if "source" not in item else self.private / "uid-data/view" / item["path"]
+                volumes.append(bind(mapped, self.target_home / item["path"], item.get("read_only", False)))
         config_files = {"passwd": "/etc/passwd", "group": "/etc/group", "bashrc": str(self.target_home / ".bashrc"),
             "profile": str(self.target_home / ".profile"),
             "bash_profile": str(self.target_home / ".bash_profile"),
@@ -326,8 +357,13 @@ class DevelopmentSandbox:
                 volumes.append(bind(self.state / "trust/ca-certificates.crt", self.target_home / name))
         # NVM remains the user's environment, but its Claude entry goes through the image-owned launcher.
         volumes.append(bind(self.release / "bin/claude-in-sandbox", self.target_home / c.get("node_bin", ".nvm/versions/node/v22.18.0/bin") / "claude"))
+        for alias in c.get("home_aliases", []):
+            for volume in list(volumes):
+                destination = Path(volume["target"])
+                if destination == self.target_home or destination.is_relative_to(self.target_home):
+                    volumes.append(dict(volume, target=str(Path(alias) / destination.relative_to(self.target_home))))
         for hidden in ("/root", "/home/gzy"):
-            if hidden != str(self.target_home):
+            if hidden != str(self.target_home) and hidden not in c.get("home_aliases", []):
                 volumes.append(bind(self.state / "empty", hidden))
         targets = [v["target"] for v in volumes]
         if len(targets) != len(set(targets)):
@@ -341,7 +377,7 @@ class DevelopmentSandbox:
         """Create empty destinations without hiding pre-existing private Home data."""
         home = self.apps / "home"
         for item in self.config["mounts"]:
-            source, destination = self.home / item["path"], home / item["path"]
+            source, destination = Path(item.get("source", self.home / item["path"])), home / item["path"]
             if not source.exists():
                 continue
             if destination.is_symlink():
@@ -480,6 +516,12 @@ class DevelopmentSandbox:
             time.sleep(0.5)
         raise RuntimeError("UID mapper did not become ready")
 
+    def mapper_sources(self):
+        result = [(self.home, "uid-home"), (self.apps, "uid-app")]
+        if any("source" in item for item in self.config["mounts"]):
+            result.append((self.private / "data", "uid-data"))
+        return result
+
     def apply_identity(self):
         info = json.loads(self.run(self.docker + ["inspect", self.target]).stdout)[0]
         expected = {"container_id": info["Id"], "started_at": info["State"]["StartedAt"],
@@ -501,7 +543,9 @@ class DevelopmentSandbox:
         (self.state / "exit-control/lease.json").unlink(missing_ok=True)
         self.run(["systemctl", "--user", "enable", self.project + "-ssh.service"])
         self.run(["systemctl", "--user", "restart", self.project + "-ssh.service"])
-        changed = self.mapper(self.home, "uid-home") | self.mapper(self.apps, "uid-app")
+        changed = False
+        for source, part in self.mapper_sources():
+            changed = self.mapper(source, part) or changed
         self.compose("up", "-d", "egress", "dns", "gateway")
         atomic_json(self.state / "readiness.json", {"ok": True, "config_sha256": self.config_sha, "phase": "network-ready"})
         lease = self.state / "exit-control/lease.json"
@@ -527,9 +571,9 @@ class DevelopmentSandbox:
         current = self.run(self.docker + ["inspect", self.target], check=False)
         if current.returncode or not json.loads(current.stdout)[0]["State"]["Running"]:
             return False
-        for part in ("uid-home", "uid-app"):
+        for source, part in self.mapper_sources():
             args = [self.python, "-I", str(self.release / "src/controlled_dev_machine/rootless_uid_mount.py"), "status",
-                    "--source", str(self.home if part == "uid-home" else self.apps), "--view", str(self.private / part / "view"),
+                    "--source", str(source), "--view", str(self.private / part / "view"),
                     "--state", str(self.private / part), "--tools", self.config["uid_tools"], "--image", self.config["mapper_image"], "--name", self.project + "-" + part,
                     "--uid", str(self.config["uid"]), "--gid", str(self.config["gid"])]
             if self.run(args, check=False).returncode:

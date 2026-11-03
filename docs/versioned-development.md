@@ -118,3 +118,32 @@ and restore only this instance's previous code/configuration. Application state 
 not automatically rolled back over newer files. Preserve new work and reconcile
 it explicitly. Never restore a global firewall snapshot or a different/unverified
 exit to make recovery appear successful.
+
+## Fleet profiles and interactive shells
+
+Interactive Bash keeps common listing/color/Conda aliases, history append, window
+size updates and available shell completion. A private `.bash_aliases`, `.inputrc`
+or `.dircolors` can extend this without importing host-specific proxy/admin shell
+startup code. Existing history files are preserved.
+
+A common container user, UID and Home can coexist with legacy project paths.
+`home_aliases` duplicates the reviewed Home/application/data mounts at the old
+Home path; it does not expose the host Home wholesale. This preserves old Python
+interpreter paths and Claude project working directories while keeping the
+configured container identity stable.
+
+On NFS hosts, copy hot environments to the private local `data/<relative-path>`
+first and set that exact path as the mount's `source`. The controller uses a
+separate UID view for local data. Keep deliberate shared project/data mounts on
+NFS. The private root, controller, active application state and Docker data root
+must be genuinely local, even where user Homes and startup files are shared.
+
+`images/target/Dockerfile.portable-base` creates a smaller image from an explicitly
+recorded existing image, retaining its OS/toolchain and package database while
+excluding Home data, historical temporary files and generated private host keys.
+It never commits a live container. Back up actual temporary work before any
+cutover, and keep the original image as a recovery input.
+
+The audited SSH bridge also supports the established remote SOCKS gateway route
+through an owned `~/.ssh/a100-gateway.conf`, using argument vectors and strict
+host-key checking. Unconfigured request-supplied routes remain rejected.
