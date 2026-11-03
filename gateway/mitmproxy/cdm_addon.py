@@ -612,8 +612,10 @@ class ControlledReviewAddon:
 
 
 def _blocked(code: str, message: str) -> http.Response:
-    # A failed local authorization service is retryable; security denials stay 403.
-    status = 503 if code == 'lease-service-unavailable' else 403
+    # Transient failures (lease service down, DNS resolution timeout) are retryable;
+    # security and policy denials stay 403 so the client does not retry forever.
+    retryable = code == 'lease-service-unavailable' or message == 'controlled DNS resolution failed'
+    status = 503 if retryable else 403
     headers = {'content-type': 'text/plain; charset=utf-8', 'x-cdm-block-reason': code}
     if status == 503:
         headers['retry-after'] = '1'
