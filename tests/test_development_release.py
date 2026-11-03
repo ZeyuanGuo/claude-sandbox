@@ -274,3 +274,13 @@ def test_current_and_legacy_claude_temp_paths_share_persistent_storage(tmp_path)
     value['tmp_compat_path']='/tmp/claude-1234'
     path.write_text(json.dumps(value))
     DevelopmentSandbox(path).render()  # No duplicate bind when old and current IDs match.
+
+
+def test_nvm_is_available_without_changing_the_configured_node_selection(tmp_path):
+    import os,subprocess
+    path,_=profile(tmp_path)
+    nvm=tmp_path/'.nvm';nvm.mkdir()
+    (nvm/'nvm.sh').write_text('NVM_TEST_OPTIONS="$*"\nnvm(){ :; }\n')
+    text,_=DevelopmentSandbox(path).shell_content();rc=tmp_path/'bashrc';rc.write_text(text)
+    r=subprocess.run(['/bin/bash','--noprofile','--rcfile',str(rc),'-ic','type -t nvm; printf "%s %s %s\\n" "$NVM_TEST_OPTIONS" "$HISTSIZE" "$HISTFILESIZE"'],env=dict(os.environ,HOME=str(tmp_path)),text=True,capture_output=True)
+    assert r.returncode==0 and 'function' in r.stdout and '--no-use 1000 2000' in r.stdout

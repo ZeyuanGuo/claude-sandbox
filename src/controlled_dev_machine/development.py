@@ -272,6 +272,8 @@ class DevelopmentSandbox:
         text += '''case $- in
 *i*)
     HISTCONTROL=ignoreboth
+    HISTSIZE=1000
+    HISTFILESIZE=2000
     shopt -s histappend checkwinsize
     if command -v dircolors >/dev/null 2>&1; then
         if [ -r "$HOME/.dircolors" ]; then eval "$(dircolors -b "$HOME/.dircolors")"; else eval "$(dircolors -b)"; fi
@@ -286,6 +288,9 @@ class DevelopmentSandbox:
     elif [ -r /etc/bash_completion ]; then
         . /etc/bash_completion
     fi
+    export NVM_DIR="$HOME/.nvm"
+    if [ -s "$NVM_DIR/nvm.sh" ]; then . "$NVM_DIR/nvm.sh" --no-use; fi
+    if [ -s "$NVM_DIR/bash_completion" ]; then . "$NVM_DIR/bash_completion"; fi
     if [ -r "$HOME/.bash_aliases" ]; then . "$HOME/.bash_aliases"; fi
     ;;
 esac
