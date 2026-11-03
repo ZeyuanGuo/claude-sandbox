@@ -6,6 +6,7 @@ Preparing a release never seeds credentials or rewrites existing user settings.
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -49,7 +50,7 @@ def load_config(path: Path) -> dict:
                 "user", "uid", "gid", "project", "docker_context", "python", "uid_tools",
                 "target_image", "gateway_image", "mapper_image", "identity_profile", "mounts", "exit"}
     optional = {"node_bin", "conda_root", "conda_env", "gpu", "extra_gpu_libraries", "trust_overlays",
-                "ssh_files", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases", "external_mounts"}
+                "ssh_files", "ssh_extra_roots", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases", "external_mounts", "web_sessions", "dns_sessions"}
     if not isinstance(raw, dict) or set(raw) - required - optional or required - set(raw):
         raise ValueError("deployment configuration fields are missing or unknown")
     if raw["schema_version"] != 2:
@@ -104,6 +105,19 @@ def load_config(path: Path) -> dict:
     for name in ("node_bin", "conda_root"):
         if name in raw:
             relative(raw[name])
+    for key, default in (("web_sessions", 256), ("dns_sessions", 16)):
+        value = raw.get(key, default)
+        if type(value) is not int or not 1 <= value <= 256:
+            raise ValueError(f"{key} must be between 1 and 256")
+    writable = [Path(item.get("source", Path(raw["host_home"]) / item["path"]))
+                for item in raw["mounts"] if not item.get("read_only", False)]
+    writable += [Path(item["source"]) for item in raw.get("external_mounts", []) if not item.get("read_only", False)]
+    for value in raw.get("ssh_extra_roots", []):
+        root = absolute(value, "host-local SSH root")
+        if any(root == p or root.is_relative_to(p) or p.is_relative_to(root) for p in writable):
+            raise ValueError("host-local SSH control must be outside writable target data")
+        if any(Path(raw[k]) == root or Path(raw[k]).is_relative_to(root) for k in ("private_root", "host_home")):
+            raise ValueError("host-local SSH roots must not include a Home or control tree")
     for group in raw.get("extra_groups", []):
         if type(group) is not int or group < 0:
             raise ValueError("extra_groups must contain numeric GIDs")
@@ -238,6 +252,13 @@ class DevelopmentSandbox:
                 raise RuntimeError(f"external data root is not an accessible owned/shared directory: {p}")
         if not (self.home / ".ssh/config").is_file():
             raise RuntimeError("host SSH configuration is missing")
+        for name in self.config.get("ssh_extra_roots", []):
+            p = Path(name)
+            if p.is_symlink() or not p.is_dir() or p.stat().st_uid not in (0, os.getuid()) or p.stat().st_mode & 0o022:
+                raise RuntimeError("host-local SSH root ownership or permissions are unsafe")
+        for record in (self.private / "configs").glob("egress-capacity-hotfix-*.json"):
+            if json.loads(record.read_text()).get("applied"):
+                raise RuntimeError("a live capacity hotfix is active; retire it only during the approved work-preserving cutover")
         for key, name in self.config.get("network_names", {}).items():
             if key not in ("target_net", "upstream_net"):
                 raise RuntimeError("only internal networks can be reused")
@@ -329,6 +350,19 @@ esac
         egress = services["egress"]
         egress["environment"].update(CDM_RELAY_EXPECTED_EXIT=c["exit"]["expected_exit"], CDM_RELAY_EXIT_LEASE="/run/cdm-exit/lease.json")
         egress["volumes"].append(bind(self.state / "exit-control", "/run/cdm-exit"))
+        dns_egress = copy.deepcopy(egress)
+        dns_address = str(ipaddress.IPv4Address(a["egress"]) + 1)
+        dns_egress["networks"]["upstream_net"]["ipv4_address"] = dns_address
+        for role, service in (("web", egress), ("dns", dns_egress)):
+            service["command"] = ["python3", "-m", "controlled_dev_machine.degraded_egress", "--config", "/run/cdm-relay.json"]
+            service["volumes"].append(bind(self.state / "config" / ("relay-" + role + ".json"), "/run/cdm-relay.json"))
+            for name in ("CDM_RELAY_UPSTREAM_HOST", "CDM_RELAY_UPSTREAM_PORT", "CDM_RELAY_DNS_SOURCE", "CDM_RELAY_GATEWAY_SOURCE"):
+                service["environment"].pop(name, None)
+        dns_egress["environment"]["CDM_RELAY_AUDIT"] = "/audit/egress/events-dns.jsonl"
+        services["egress-dns"] = dns_egress
+        dns_command = services["dns"]["command"]
+        dns_command[dns_command.index("--proxy-host") + 1] = dns_address
+        services["dns"]["depends_on"] = ["egress-dns"]
         target = services["target"]
         target.update(hostname=p["hostname"], user=f'{c["uid"]}:{c["gid"]}', working_dir=str(self.target_home))
         target["networks"]["target_net"]["mac_address"] = p["mac_address"]
@@ -461,7 +495,8 @@ esac
         for name in ("profile", "bash_profile"):
             write_file(self.state / "config" / name, '. "$HOME/.bashrc"\n', 0o644)
         from .ssh_client_state import SSHClientState
-        SSHClientState(self.home / ".ssh", self.apps / "ssh", self.target_home).refresh()
+        SSHClientState(self.home / ".ssh", self.apps / "ssh", self.target_home,
+                       tuple(Path(x) for x in c.get("ssh_extra_roots", []))).refresh()
         write_file(self.state / "machine-id", p["machine_id"] + "\n", 0o444)
         fleet = self.state / "ssh/fleet-identity"
         for name, value in {"profile.json": json.dumps(p), "hostname": p["hostname"], "boot-id": p["boot_id"],
@@ -479,6 +514,14 @@ esac
         exit_config = dict(c["exit"], exit_lease=str(self.state / "exit-control/lease.json"),
             readiness_path=str(self.state / "readiness.json"), required_config_sha256=self.config_sha)
         atomic_json(self.state / "config/exit-monitor.json", exit_config)
+        a = self.network_addresses()
+        for role in ("web", "dns"):
+            relay = {"parent_host": c["exit"]["parent_host"], "parent_port": c["exit"]["parent_port"],
+                "expected_exit": c["exit"]["expected_exit"], "exit_lease": "/run/cdm-exit/lease.json",
+                "trusted_gateway_ips": [a["gateway_upstream"]] if role == "web" else [],
+                "trusted_dns_ips": [a["dns_upstream"]] if role == "dns" else [],
+                "max_sessions": c.get("web_sessions", 256) if role == "web" else c.get("dns_sessions", 16)}
+            atomic_json(self.state / "config" / ("relay-" + role + ".json"), relay)
         document = self.render()
         write_file(self.compose_path, yaml.safe_dump(document, sort_keys=False))
         atomic_json(self.state / "deployment.json", {"schema_version": 2, "release_id": c["release_id"],
@@ -497,6 +540,8 @@ esac
                "--socket", str(self.state / "ssh/alias.sock"), "--agent-socket", str(self.state / "ssh/campus-agent.sock"),
                "--config", str(self.home / ".ssh/config"), "--audit", str(self.state / "audit/ssh/aliases.jsonl"),
                "--client-directory", str(self.apps / "ssh"), "--client-home", str(self.target_home)]
+        for root in self.config.get("ssh_extra_roots", []):
+            ssh += ["--extra-root", root]
         units = {
             self.project + ".service": f'[Unit]\nDescription=Versioned development sandbox\nRequires=docker.service\nWants={self.project}-ssh.service\nAfter=docker.service {self.project}-ssh.service\nPartOf=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart={q(self.controller_args("start"))}\nTimeoutStartSec=240\nRestart=on-failure\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n',
             self.project + "-ssh.service": f'[Unit]\nDescription=Configured SSH aliases and fixed agent for sandbox\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={q(ssh)}\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n',

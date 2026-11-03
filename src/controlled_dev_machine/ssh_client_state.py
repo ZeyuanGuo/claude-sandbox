@@ -34,8 +34,9 @@ def atomic_file(path: Path, data: bytes, mode=0o600):
 
 
 class SSHClientState:
-    def __init__(self, source: Path, destination: Path, target_home: Path):
+    def __init__(self, source: Path, destination: Path, target_home: Path, extra_roots: tuple[Path, ...] = ()):
         self.source, self.destination, self.target_home = source, destination, target_home
+        self.extra_roots = extra_roots
         self.previous = None
 
     def refresh(self):
@@ -46,28 +47,33 @@ class SSHClientState:
         with (self.destination / '.cdm-sync.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             files, signature = {}, []
-            for directory, dirs, names in os.walk(self.source, followlinks=False):
-                dirs[:] = [name for name in dirs if not (Path(directory) / name).is_symlink()]
-                for name in sorted(names):
-                    path = Path(directory) / name
-                    try:
-                        info = path.stat()
-                    except FileNotFoundError:
-                        continue
-                    if not stat.S_ISREG(info.st_mode):
-                        continue
-                    relative = str(path.relative_to(self.source))
-                    if relative.startswith('.cdm-'):
-                        continue
-                    files[relative] = path
-                    signature.append((relative, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+            roots = [(self.source, Path('.'))] + [(root, Path(f'.cdm-host-{i}')) for i, root in enumerate(self.extra_roots)]
+            for root, prefix in roots:
+                if root.is_symlink() or root.stat().st_uid not in (0, os.getuid()) or root.stat().st_mode & 0o022:
+                    raise ValueError('SSH source root ownership or permissions are unsafe')
+                for directory, dirs, names in os.walk(root, followlinks=False):
+                    dirs[:] = [name for name in dirs if not (Path(directory) / name).is_symlink()]
+                    for name in sorted(names):
+                        path = Path(directory) / name
+                        try:
+                            info = path.stat()
+                        except FileNotFoundError:
+                            continue
+                        if not stat.S_ISREG(info.st_mode) or not os.access(path, os.R_OK):
+                            continue
+                        leaf = path.relative_to(root)
+                        if str(leaf).startswith('.cdm-'):
+                            continue
+                        relative = str(prefix / leaf)
+                        files[relative] = path
+                        signature.append((relative, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
             signature.sort()
             if signature == self.previous:
                 return False
             # Render before touching the last usable snapshot. Invalid source
             # configuration leaves existing connections/configuration intact.
             rendered = target_config(self.source / 'config', '/run/cdm-ssh/alias.sock',
-                                     '/run/cdm-ssh/campus-agent.sock', target_home=self.target_home)
+                                     '/run/cdm-ssh/campus-agent.sock', target_home=self.target_home, extra_roots=self.extra_roots)
             manifest = self.destination / '.cdm-managed.json'
             previous = json.loads(manifest.read_text()) if manifest.exists() else []
             current = sorted(set(files) | {'config'})

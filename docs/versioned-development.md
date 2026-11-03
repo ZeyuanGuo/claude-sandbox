@@ -168,3 +168,17 @@ point at persistent work storage. This also preserves output when a native
 component uses its conventional temporary path. Startup failures retry the same
 release/configuration after ten seconds, remaining fail-closed while the parent
 is unavailable; successful running work is not restarted by this startup retry.
+
+`ssh_extra_roots` can declare host-local SSH configuration/key directories used
+by shared-Home hosts. They must be operator/root-owned, not writable by others,
+and outside writable target data. Includes and identity/known-host paths from
+those roots are rendered into the same read-only client snapshot; key rotation
+and newly added files still need no target remount. Keys remain local to each host.
+
+Web egress and DNS egress have independent worker pools (defaults 256 and 16).
+Each trusts only its configured role; DNS still reaches only the fixed DoH
+endpoint, and both require the same fresh exact-exit lease. Web connection pools
+cannot exhaust DNS's reserved workers. `web_sessions` and `dns_sessions` are
+bounded configuration values. A registered live capacity hotfix blocks lifecycle
+admission until it is retired during an explicitly approved cutover; do not stop
+its forwarders while translated sessions are still active.

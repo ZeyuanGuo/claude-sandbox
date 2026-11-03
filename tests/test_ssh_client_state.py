@@ -64,7 +64,7 @@ def test_invalid_configuration_preserves_last_usable_client_files(tmp_path, monk
 def test_existing_remote_socks_gateway_stays_an_argument_vector(tmp_path, monkeypatch):
     import controlled_dev_machine.ssh_alias_bridge as bridge
     calls=[]
-    def effective(alias, config):
+    def effective(alias, config, extra_roots=()):
         calls.append((alias,config))
         if alias=='a100-gateway':return {'hostname':['192.0.2.2'],'port':['22']}
         return {'hostname':['10.0.0.10'],'port':['22'],'proxycommand':['/usr/bin/ssh -T -F ~/.ssh/a100-gateway.conf a100-gateway /usr/bin/nc -X 5 -x 127.0.0.1:11080 %h %p']}
@@ -76,3 +76,23 @@ def test_existing_remote_socks_gateway_stays_an_argument_vector(tmp_path, monkey
     assert calls[-1][0]=='a100-gateway'
     with pytest.raises(ValueError,match='destination differs'):
         bridge.route_plan('a100a',tmp_path/'config','10.0.0.11',22)
+
+
+def test_explicit_host_local_include_and_key_refresh_without_remount(tmp_path, monkeypatch):
+    source,dest,_=fixture(tmp_path,monkeypatch)
+    extra=tmp_path/'host-local';extra.mkdir(mode=0o700)
+    (extra/'identity').write_text('host-local-private-test-key')
+    (extra/'config').write_text(f'Host local-peer\n HostName 192.0.2.99\n IdentityFile {extra}/identity\n UserKnownHostsFile {extra}/known_hosts\n')
+    (extra/'known_hosts').write_text('trusted-test-host')
+    with (source/'config').open('a') as file:file.write(f'Host *\n Include {extra}/config\n')
+    with pytest.raises(ValueError,match='escapes'):
+        SSHClientState(source,dest,Path('/home/sandbox')).refresh()
+    sync=SSHClientState(source,dest,Path('/home/sandbox'),(extra,));sync.refresh()
+    text=(dest/'config').read_text()
+    assert 'Host local-peer' in text
+    assert 'IdentityFile /home/sandbox/.ssh/.cdm-host-0/identity' in text
+    assert (dest/'.cdm-host-0/identity').read_text()=='host-local-private-test-key'
+    inode=dest.stat().st_ino
+    (extra/'identity').write_text('rotated-host-local-test-key')
+    assert sync.refresh() and dest.stat().st_ino==inode
+    assert (dest/'.cdm-host-0/identity').read_text()=='rotated-host-local-test-key'

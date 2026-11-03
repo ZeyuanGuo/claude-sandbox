@@ -26,8 +26,8 @@ class RelayConfig:
     exit_lease: Path | None = None
     upstream_host: str | None = None
     upstream_port: int | None = None
-    gateway_source: str = "172.31.1.3"
-    dns_source: str = "172.31.1.2"
+    gateway_source: str | None = "172.31.1.3"
+    dns_source: str | None = "172.31.1.2"
     header_timeout: float = 5.0
     idle_timeout: float = 1800.0
     # Active Claude/SSE streams and pooled HTTP connections can last hours.
@@ -43,7 +43,7 @@ class RelayConfig:
         if self.expected_exit:
             ipaddress.ip_address(self.expected_exit)
         for address in (self.gateway_source, self.dns_source):
-            if str(ipaddress.ip_address(address)) != address:
+            if address is not None and str(ipaddress.ip_address(address)) != address:
                 raise ValueError("trusted source must be a canonical numeric IP")
         if self.gateway_source == self.dns_source:
             raise ValueError("DNS and gateway must have distinct source IPs")
@@ -85,9 +85,9 @@ class RelayConfig:
         for key, field in (("trusted_dns_ips", "dns_source"), ("trusted_gateway_ips", "gateway_source")):
             if key in mapping:
                 peers = mapping[key]
-                if not isinstance(peers, list) or len(peers) != 1 or not isinstance(peers[0], str):
-                    raise ValueError("exactly one trusted numeric peer IP is required")
-                values[field] = peers[0]
+                if not isinstance(peers, list) or len(peers) > 1 or (peers and not isinstance(peers[0], str)):
+                    raise ValueError("at most one trusted numeric peer IP is allowed per role")
+                values[field] = peers[0] if peers else None
         if "expected_exit" in mapping:
             values["expected_exit"] = mapping["expected_exit"]
         if "exit_lease" in mapping:

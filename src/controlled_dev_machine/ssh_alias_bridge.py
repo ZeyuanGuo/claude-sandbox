@@ -30,9 +30,10 @@ FIXED_AGENT = Path(f"/run/user/{os.getuid()}/fleet-campus-agent.sock")
 HOSTNAME = re.compile(r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?\Z")
 
 
-def aliases_from_config(config: Path) -> set[str]:
+def aliases_from_config(config: Path, extra_roots: tuple[Path, ...] = ()) -> set[str]:
     """Read explicit aliases, including bounded Include files, from this Home."""
     root = Path.home()/'.ssh'
+    roots = [root.resolve(), *[p.resolve() for p in extra_roots]]
     seen: set[Path] = set()
     names: set[str] = set()
 
@@ -40,10 +41,10 @@ def aliases_from_config(config: Path) -> set[str]:
         path = path.expanduser().resolve()
         if path in seen:
             return
-        if len(seen) >= 32 or not path.is_relative_to(root.resolve()):
+        if len(seen) >= 32 or not any(path.is_relative_to(p) for p in roots):
             raise ValueError('SSH Include escapes the approved config directory')
         info = path.stat()
-        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+        if info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
             raise ValueError('SSH config must be owned and not group/world writable')
         seen.add(path)
         for line in path.read_text().splitlines():
@@ -64,8 +65,8 @@ def aliases_from_config(config: Path) -> set[str]:
     return names
 
 
-def effective(alias: str, config: Path) -> dict[str, list[str]]:
-    if not isinstance(alias, str) or not ALIAS.fullmatch(alias) or alias not in aliases_from_config(config):
+def effective(alias: str, config: Path, extra_roots: tuple[Path, ...] = ()) -> dict[str, list[str]]:
+    if not isinstance(alias, str) or not ALIAS.fullmatch(alias) or alias not in aliases_from_config(config, extra_roots):
         raise ValueError('SSH alias is not explicitly configured')
     result = subprocess.run(['/usr/bin/ssh', '-G', '-F', str(config), alias],
                             capture_output=True, text=True, timeout=12, check=True)
@@ -84,9 +85,9 @@ def effective(alias: str, config: Path) -> dict[str, list[str]]:
     return options
 
 
-def route_plan(alias: str, config: Path, host: str, port: int):
+def route_plan(alias: str, config: Path, host: str, port: int, extra_roots: tuple[Path, ...] = ()):
     """Only three route forms exist; request data never becomes shell code."""
-    options = effective(alias, config)
+    options = effective(alias, config, extra_roots)
     if (host, port) != (options['hostname'][0], int(options['port'][0])):
         raise ValueError('SSH alias changed or requested destination differs')
     if host.rstrip('.').lower().endswith('.invalid'):
@@ -94,7 +95,7 @@ def route_plan(alias: str, config: Path, host: str, port: int):
     jump = options.get('proxyjump', ['none'])[0]
     command = options.get('proxycommand', ['none'])[0]
     if jump != 'none':
-        if not ALIAS.fullmatch(jump) or jump not in aliases_from_config(config):
+        if not ALIAS.fullmatch(jump) or jump not in aliases_from_config(config, extra_roots):
             raise ValueError('Only one explicitly configured jump alias is supported')
         argv = ['/usr/bin/ssh', '-F', str(config), '-T', '-oBatchMode=yes',
                 '-oStrictHostKeyChecking=yes', '-oUpdateHostKeys=no',
@@ -109,7 +110,7 @@ def route_plan(alias: str, config: Path, host: str, port: int):
                         'a100-gateway', *direct_socks]
         if fields == remote_socks:
             gateway_config = Path.home() / '.ssh/a100-gateway.conf'
-            effective('a100-gateway', gateway_config)
+            effective('a100-gateway', gateway_config, extra_roots)
             return ('process', ['/usr/bin/ssh', '-T', '-F', str(gateway_config),
                 '-oBatchMode=yes', '-oStrictHostKeyChecking=yes', '-oUpdateHostKeys=no',
                 '-oConnectTimeout=15', 'a100-gateway', *direct_socks[:-2], host, str(port)])
@@ -171,8 +172,9 @@ def header(connection: socket.socket) -> dict:
 class Server(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
 
-    def __init__(self, path: Path, config: Path, audit: Path, handler):
+    def __init__(self, path: Path, config: Path, audit: Path, handler, extra_roots: tuple[Path, ...] = ()):
         self.config, self.audit = config, audit
+        self.extra_roots = extra_roots
         self.path = path
         self.socket_identity = None
         self.lock = threading.Lock()
@@ -231,7 +233,7 @@ class Transport(socketserver.BaseRequestHandler):
             if set(value) != {'alias', 'host', 'port'} or type(value['port']) is not int:
                 raise ValueError('Invalid transport request fields')
             item.update({k: value[k] for k in ('alias', 'host', 'port')})
-            plan = route_plan(value['alias'], self.server.config, value['host'], value['port'])
+            plan = route_plan(value['alias'], self.server.config, value['host'], value['port'], self.server.extra_roots)
             item['result'] = 'approved'
             self.server.log(item)
             reader, writer, process = open_route(plan)
@@ -277,10 +279,10 @@ class Agent(socketserver.BaseRequestHandler):
             self.server.slots.release()
 
 
-def target_config(config: Path, socket_path: str, agent_path: str, *, target_home: Path | None = None) -> str:
+def target_config(config: Path, socket_path: str, agent_path: str, *, target_home: Path | None = None, extra_roots: tuple[Path, ...] = ()) -> str:
     lines = []
-    for alias in sorted(aliases_from_config(config)):
-        options = effective(alias, config)
+    for alias in sorted(aliases_from_config(config, extra_roots)):
+        options = effective(alias, config, extra_roots)
         host, port = options['hostname'][0], options['port'][0]
         if host.rstrip('.').lower().endswith('.invalid'):
             lines += [f'Host {alias}', f'    HostName {host}',
@@ -294,10 +296,12 @@ def target_config(config: Path, socket_path: str, agent_path: str, *, target_hom
                   f'    User {options["user"][0]}', '    ProxyCommand '+shlex.join(args),
                   '    StrictHostKeyChecking yes', '    UpdateHostKeys no',
                   '    BatchMode yes', '    IdentitiesOnly yes', '    ConnectTimeout 20']
-        for key, label in [('hostkeyalias','HostKeyAlias'),('identityfile','IdentityFile'),('userknownhostsfile','UserKnownHostsFile'),('globalknownhostsfile','GlobalKnownHostsFile')]:
+        for key, label in [('hostkeyalias','HostKeyAlias'),('identityfile','IdentityFile'),('certificatefile','CertificateFile'),('userknownhostsfile','UserKnownHostsFile'),('globalknownhostsfile','GlobalKnownHostsFile')]:
             for value in options.get(key, []):
                 if target_home is not None and key != 'hostkeyalias':
-                    value = value.replace(str(config.parent), str(target_home / '.ssh'))
+                    value = re.sub(re.escape(str(config.parent)) + r'(?=/|$|\s)', str(target_home / '.ssh'), value)
+                    for index, root in enumerate(extra_roots):
+                        value = re.sub(re.escape(str(root)) + r'(?=/|$|\s)', str(target_home / '.ssh' / f'.cdm-host-{index}'), value)
                 lines.append(f'    {label} {value}')
         identity_agent = options.get('identityagent', ['none'])[0]
         if identity_agent != 'none':
@@ -323,6 +327,7 @@ def main():
     serve.add_argument('--audit', required=True, type=Path)
     serve.add_argument('--client-directory', type=Path)
     serve.add_argument('--client-home', type=Path)
+    serve.add_argument('--extra-root', action='append', type=Path, default=[])
     generate = sub.add_parser('config')
     generate.add_argument('--config', required=True, type=Path)
     args = parser.parse_args()
@@ -348,7 +353,7 @@ def main():
         if not args.client_home:
             parser.error('--client-directory requires --client-home')
         from controlled_dev_machine.ssh_client_state import SSHClientState
-        refresher = SSHClientState(args.config.parent, args.client_directory, args.client_home)
+        refresher = SSHClientState(args.config.parent, args.client_directory, args.client_home, tuple(args.extra_root))
         refresher.refresh()
     refresh_stop = threading.Event()
     def refresh_client():
@@ -363,7 +368,7 @@ def main():
                 if message != last_error:
                     print(message, file=sys.stderr, flush=True)
                 last_error = message
-    with Server(args.socket, args.config, args.audit, Transport) as transport, Server(args.agent_socket, args.config, args.audit, Agent) as agent:
+    with Server(args.socket, args.config, args.audit, Transport, tuple(args.extra_root)) as transport, Server(args.agent_socket, args.config, args.audit, Agent, tuple(args.extra_root)) as agent:
         def stop(signum,frame):
             refresh_stop.set()
             threading.Thread(target=transport.shutdown,daemon=True).start()

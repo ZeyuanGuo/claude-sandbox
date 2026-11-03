@@ -284,3 +284,26 @@ def test_nvm_is_available_without_changing_the_configured_node_selection(tmp_pat
     text,_=DevelopmentSandbox(path).shell_content();rc=tmp_path/'bashrc';rc.write_text(text)
     r=subprocess.run(['/bin/bash','--noprofile','--rcfile',str(rc),'-ic','type -t nvm; printf "%s %s %s\\n" "$NVM_TEST_OPTIONS" "$HISTSIZE" "$HISTFILESIZE"'],env=dict(os.environ,HOME=str(tmp_path)),text=True,capture_output=True)
     assert r.returncode==0 and 'function' in r.stdout and '--no-use 1000 2000' in r.stdout
+
+
+def test_dns_has_reserved_egress_capacity_and_writable_data_cannot_be_ssh_control(tmp_path):
+    path,value=profile(tmp_path)
+    app=DevelopmentSandbox(path);services=app.render()['services']
+    assert services['dns']['depends_on']==['egress-dns']
+    dns_host=services['dns']['command'][services['dns']['command'].index('--proxy-host')+1]
+    assert dns_host==services['egress-dns']['networks']['upstream_net']['ipv4_address']
+    assert dns_host!=services['egress']['networks']['upstream_net']['ipv4_address']
+    assert services['egress']['environment']['CDM_RELAY_EXPECTED_EXIT']==services['egress-dns']['environment']['CDM_RELAY_EXPECTED_EXIT']
+    value['ssh_extra_roots']=[str(tmp_path/'host/project-a/ssh')]
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError,match='outside writable'):
+        load_config(path)
+
+
+def test_single_role_relays_have_no_implicit_other_peer(tmp_path):
+    from controlled_dev_machine.degraded_egress import RelayConfig
+    web=RelayConfig.from_mapping({'trusted_gateway_ips':['192.0.2.2'],'trusted_dns_ips':[],'max_sessions':256},audit_path=tmp_path/'web')
+    dns=RelayConfig.from_mapping({'trusted_gateway_ips':[],'trusted_dns_ips':['192.0.2.3'],'max_sessions':16},audit_path=tmp_path/'dns')
+    assert web.dns_source is None and web.gateway_source=='192.0.2.2'
+    assert dns.gateway_source is None and dns.dns_source=='192.0.2.3'
+    with pytest.raises(ValueError):RelayConfig.from_mapping({'trusted_gateway_ips':[],'trusted_dns_ips':[]},audit_path=tmp_path/'closed')
