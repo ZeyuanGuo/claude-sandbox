@@ -160,3 +160,31 @@ def test_private_checkpoint_preserves_transcripts_and_skips_sockets(tmp_path):
     assert result["skipped_runtime_objects"] == ["runtime.sock"]
     with tarfile.open(Path(result["path"]) / "apps.tar.gz") as archive:
         assert archive.extractfile(".claude/projects/project/session.jsonl").read() == b'{"message":"keep"}\n'
+
+
+def test_failed_admission_does_not_revoke_an_existing_instance(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import controlled_dev_machine.development as module
+    writes = []
+    app = SimpleNamespace(admitted=False, lock=lambda: nullcontext(), start=lambda: (_ for _ in ()).throw(RuntimeError("preflight rejected")), state=tmp_path, config_sha="new")
+    monkeypatch.setattr(module, "DevelopmentSandbox", lambda path: app)
+    monkeypatch.setattr(module, "atomic_json", lambda *args: writes.append(args))
+    with pytest.raises(RuntimeError, match="preflight rejected"):
+        module.main(["--config", "/unused", "start"])
+    assert writes == []
+
+
+def test_failed_admitted_start_revokes_readiness_and_old_lease(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import controlled_dev_machine.development as module
+    lease = tmp_path / "exit-control/lease.json"
+    lease.parent.mkdir()
+    lease.write_text("old lease")
+    app = SimpleNamespace(admitted=True, lock=lambda: nullcontext(), start=lambda: (_ for _ in ()).throw(RuntimeError("identity failed")), state=tmp_path, config_sha="new")
+    monkeypatch.setattr(module, "DevelopmentSandbox", lambda path: app)
+    with pytest.raises(RuntimeError, match="identity failed"):
+        module.main(["--config", "/unused", "start"])
+    assert not lease.exists()
+    assert json.loads((tmp_path / "readiness.json").read_text())["ok"] is False

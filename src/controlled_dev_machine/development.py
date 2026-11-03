@@ -153,6 +153,7 @@ class DevelopmentSandbox:
         self.docker = ["docker", "--context", c["docker_context"]]
         self.python = c["python"]
         self.config_sha = hashlib.sha256(self.config_path.read_bytes()).hexdigest()
+        self.admitted = False
         for key in ("hostname", "machine_id", "mac_address", "timezone", "lang", "lc_all", "boot_id", "hostid"):
             if not self.identity.get(key):
                 raise ValueError(f"missing identity field: {key}")
@@ -430,7 +431,7 @@ class DevelopmentSandbox:
                "--socket", str(self.state / "ssh/alias.sock"), "--agent-socket", str(self.state / "ssh/campus-agent.sock"),
                "--config", str(self.home / ".ssh/config"), "--audit", str(self.state / "audit/ssh/aliases.jsonl")]
         units = {
-            self.project + ".service": f'[Unit]\nDescription=Versioned development sandbox\nRequires=docker.service {self.project}-ssh.service\nAfter=docker.service {self.project}-ssh.service\nPartOf=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart={q(self.controller_args("start"))}\nTimeoutStartSec=240\n\n[Install]\nWantedBy=default.target\n',
+            self.project + ".service": f'[Unit]\nDescription=Versioned development sandbox\nRequires=docker.service\nWants={self.project}-ssh.service\nAfter=docker.service {self.project}-ssh.service\nPartOf=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart={q(self.controller_args("start"))}\nTimeoutStartSec=240\n\n[Install]\nWantedBy=default.target\n',
             self.project + "-ssh.service": f'[Unit]\nDescription=Configured SSH aliases and fixed agent for sandbox\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={q(ssh)}\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n',
             self.project + "-exit-monitor.service": f'[Unit]\nDescription=Strict configured-exit lease monitor\nAfter=docker.service\n\n[Service]\nType=simple\nExecStart={q(self.controller_args("exit-monitor"))}\nRestart=on-failure\nRestartSec=1\n\n[Install]\nWantedBy=default.target\n',
             self.project + "-health.service": f'[Unit]\nDescription=Verify sandbox mounts and identity without rewriting user state\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={q(self.controller_args("health"))}\nTimeoutStartSec=60\n',
@@ -486,6 +487,7 @@ class DevelopmentSandbox:
 
     def start(self):
         self.prepare()
+        self.admitted = True
         self.install_units()
         # Preparation/admission failures above do not stop or close an existing instance.
         self.run(["systemctl", "--user", "stop", self.project + "-exit-monitor.service"], check=False)
@@ -595,7 +597,13 @@ def main(argv=None):
             if args.command == "prepare":
                 app.prepare()
             elif args.command in ("start", "recover"):
-                app.start()
+                try:
+                    app.start()
+                except Exception:
+                    if app.admitted:
+                        atomic_json(app.state / "readiness.json", {"ok": False, "config_sha256": app.config_sha, "reason": "startup failed"})
+                        (app.state / "exit-control/lease.json").unlink(missing_ok=True)
+                    raise
             elif args.command == "install-entries":
                 app.install_entries()
             elif args.command == "install-units":
@@ -612,7 +620,18 @@ def main(argv=None):
     elif args.command in ("status", "doctor"):
         print(json.dumps(app.status(), indent=2))
     elif args.command in ("health", "monitor"):
-        return 0 if app.health() else 1
+        try:
+            with app.lock():
+                try:
+                    return 0 if app.health() else 1
+                except Exception:
+                    atomic_json(app.state / "readiness.json", {"ok": False, "config_sha256": app.config_sha, "reason": "health check failed"})
+                    (app.state / "exit-control/lease.json").unlink(missing_ok=True)
+                    raise
+        except RuntimeError as error:
+            if str(error) == "another sandbox lifecycle operation is already running":
+                return 0
+            raise
     elif args.command in ("shell", "root", "root-shell"):
         app.execute(["/bin/bash", "--login", *args.args], args.command != "shell")
     elif args.command == "exec":
