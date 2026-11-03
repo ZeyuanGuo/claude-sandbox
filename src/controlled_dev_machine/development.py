@@ -389,6 +389,15 @@ class DevelopmentSandbox:
             number = c["uid"] if kind == "passwd" else c["gid"]
             lines = [l for l in lines if l.split(":")[0] not in (c["user"], "gzy") and l.split(":")[2] != str(number)]
             lines.append(f'{c["user"]}:x:{c["uid"]}:{c["gid"]}:Development user:{self.target_home}:/bin/bash' if kind == "passwd" else f'{c["user"]}:x:{c["gid"]}:')
+            if kind == "group":
+                group_ids = {int(line.split(":")[2]) for line in lines}
+                for group_id in c.get("extra_groups", []):
+                    if group_id not in group_ids:
+                        name = f"cdm{group_id}"
+                        if any(line.split(":")[0] == name for line in lines):
+                            raise ValueError("supplementary group name conflicts with preserved baseline")
+                        lines.append(f"{name}:x:{group_id}:")
+                        group_ids.add(group_id)
             write_file(self.state / "config" / kind, "\n".join(lines) + "\n", 0o644)
         shell, _ = self.shell_content()
         write_file(self.state / "config/bashrc", shell, 0o644)
