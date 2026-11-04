@@ -81,6 +81,26 @@ def test_exit_is_an_exact_configured_address_not_a_hardcoded_provider():
         validate_exit_config(dict(exit_config(), expected_exit="198.51.100.0/24"))
 
 
+def test_shared_credentials_keep_history_local_and_both_locks_shared(tmp_path):
+    path, value = profile(tmp_path)
+    value["mounts"].append({"path": ".local/share/sandbox-auth"})
+    value["claude_credentials_path"] = ".local/share/sandbox-auth/account"
+    path.write_text(json.dumps(value))
+    target = DevelopmentSandbox(path).render()["services"]["target"]
+    assert target["environment"]["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == "/home/developer/.local/share/sandbox-auth/account"
+    mounts = {m["target"]: m for m in target["volumes"]}
+    assert mounts["/home/developer/.claude"]["source"].endswith("uid-app/view/.claude")
+    assert mounts["/home/developer/.local/share/sandbox-auth"]["read_only"] is False
+    value["mounts"][-1]["read_only"] = True
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="sibling lock"):
+        load_config(path)
+    value["mounts"][-1] = {"path": value["claude_credentials_path"]}
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="sibling lock"):
+        load_config(path)
+
+
 def test_first_failed_probe_revokes_before_other_probe_finishes():
     revoked = threading.Event()
     def probe(config, endpoint):

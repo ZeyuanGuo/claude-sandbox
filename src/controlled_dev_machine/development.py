@@ -50,7 +50,7 @@ def load_config(path: Path) -> dict:
                 "user", "uid", "gid", "project", "docker_context", "python", "uid_tools",
                 "target_image", "gateway_image", "mapper_image", "identity_profile", "mounts", "exit"}
     optional = {"node_bin", "conda_root", "conda_env", "gpu", "extra_gpu_libraries", "trust_overlays",
-                "ssh_files", "ssh_extra_roots", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases", "external_mounts", "web_sessions", "dns_sessions"}
+                "ssh_files", "ssh_extra_roots", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases", "external_mounts", "web_sessions", "dns_sessions", "claude_credentials_path"}
     if not isinstance(raw, dict) or set(raw) - required - optional or required - set(raw):
         raise ValueError("deployment configuration fields are missing or unknown")
     if raw["schema_version"] != 2:
@@ -105,6 +105,15 @@ def load_config(path: Path) -> dict:
     for name in ("node_bin", "conda_root"):
         if name in raw:
             relative(raw[name])
+    if "claude_credentials_path" in raw:
+        credentials = relative(raw["claude_credentials_path"])
+        # Claude atomically replaces credentials and locks both the storage
+        # directory and a sibling path. Share a parent directory, not one file.
+        if not any(credentials != relative(item["path"])
+                   and credentials.is_relative_to(relative(item["path"]))
+                   and not item.get("read_only", False) and "source" not in item
+                   for item in raw["mounts"]):
+            raise ValueError("Claude credentials require a writable host mount containing their parent and sibling lock")
     for key, default in (("web_sessions", 256), ("dns_sessions", 16)):
         value = raw.get(key, default)
         if type(value) is not int or not 1 <= value <= 256:
@@ -286,6 +295,8 @@ class DevelopmentSandbox:
                    "CDM_CONDA_ROOT": conda, "CDM_DEFAULT_CONDA_ENV": env,
                    "NODE_EXTRA_CA_CERTS": "/etc/ssl/certs/ca-certificates.crt",
                    "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt", "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt"}
+        if c.get("claude_credentials_path"):
+            exports["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(self.target_home / c["claude_credentials_path"])
         text = "# Generated configuration; the optional exit display runs only in interactive shells.\n"
         text += "\n".join(f"export {k}={shlex.quote(v)}" for k, v in exports.items()) + "\n"
         text += f'if [ -f {shlex.quote(conda + "/etc/profile.d/conda.sh")} ]; then . {shlex.quote(conda + "/etc/profile.d/conda.sh")}; fi\n'
