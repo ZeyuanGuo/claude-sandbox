@@ -85,6 +85,7 @@ def test_shared_credentials_keep_history_local_and_both_locks_shared(tmp_path):
     path, value = profile(tmp_path)
     value["mounts"].append({"path": ".local/share/sandbox-auth"})
     value["claude_credentials_path"] = ".local/share/sandbox-auth/account"
+    (Path(value["host_home"]) / value["claude_credentials_path"]).mkdir(parents=True)
     path.write_text(json.dumps(value))
     target = DevelopmentSandbox(path).render()["services"]["target"]
     assert target["environment"]["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == "/home/developer/.local/share/sandbox-auth/account"
