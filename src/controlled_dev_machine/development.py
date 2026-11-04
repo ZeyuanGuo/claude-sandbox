@@ -159,6 +159,7 @@ def write_file(path: Path, content: str, mode=0o600) -> None:
         tmp.unlink()
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
     with os.fdopen(fd, "w") as stream:
+        os.fchmod(stream.fileno(), mode)
         stream.write(content)
         stream.flush()
         os.fsync(stream.fileno())

@@ -4,8 +4,8 @@ import threading
 
 import pytest
 
-from controlled_dev_machine.development import DevelopmentSandbox, install_entry, load_config
-from controlled_dev_machine.exit_monitor import refresh, validate_exit_config
+from controlled_dev_machine.development import DevelopmentSandbox, install_entry, load_config, write_file
+from controlled_dev_machine.exit_monitor import atomic_json, refresh, validate_exit_config
 
 
 def exit_config():
@@ -43,6 +43,23 @@ def test_native_launcher_install_does_not_overwrite_symlink_target(tmp_path):
     assert real.read_bytes() == b"native vendor program"
     install_entry(entry, "#!/bin/sh\nexit 3\n")
     assert real.read_bytes() == b"native vendor program"
+
+
+def test_generated_public_mounts_remain_readable_with_private_deploy_umask(tmp_path):
+    import os
+    old = os.umask(0o077)
+    try:
+        p = tmp_path / "public-profile"
+        write_file(p, "first", 0o644)
+        assert p.stat().st_mode & 0o777 == 0o644
+        write_file(p, "updated", 0o644)
+        assert p.stat().st_mode & 0o777 == 0o644
+        write_file(tmp_path / "private-config", "secret")
+        assert (tmp_path / "private-config").stat().st_mode & 0o777 == 0o600
+        atomic_json(tmp_path / "public-identity", {"ready": True}, 0o444)
+        assert (tmp_path / "public-identity").stat().st_mode & 0o777 == 0o444
+    finally:
+        os.umask(old)
 
 
 def test_render_mounts_private_home_and_only_explicit_host_paths(tmp_path):
