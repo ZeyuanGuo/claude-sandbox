@@ -34,9 +34,10 @@ def atomic_file(path: Path, data: bytes, mode=0o600):
 
 
 class SSHClientState:
-    def __init__(self, source: Path, destination: Path, target_home: Path, extra_roots: tuple[Path, ...] = ()):
+    def __init__(self, source: Path, destination: Path, target_home: Path, extra_roots: tuple[Path, ...] = (), *, host_alias=None):
         self.source, self.destination, self.target_home = source, destination, target_home
         self.extra_roots = extra_roots
+        self.host_alias = host_alias
         self.previous = None
 
     def refresh(self):
@@ -68,12 +69,17 @@ class SSHClientState:
                         files[relative] = path
                         signature.append((relative, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
             signature.sort()
-            if signature == self.previous:
+            if signature == self.previous and not self.host_alias:
                 return False
             # Render before touching the last usable snapshot. Invalid source
             # configuration leaves existing connections/configuration intact.
             rendered = target_config(self.source / 'config', '/run/cdm-ssh/alias.sock',
-                                     '/run/cdm-ssh/campus-agent.sock', target_home=self.target_home, extra_roots=self.extra_roots)
+                                     '/run/cdm-ssh/campus-agent.sock', target_home=self.target_home, extra_roots=self.extra_roots,
+                                     host_alias=self.host_alias)
+            if self.host_alias:
+                signature.append(('native-bootstrap-config', rendered))
+            if signature == self.previous:
+                return False
             manifest = self.destination / '.cdm-managed.json'
             previous = json.loads(manifest.read_text()) if manifest.exists() else []
             current = sorted(set(files) | {'config'})

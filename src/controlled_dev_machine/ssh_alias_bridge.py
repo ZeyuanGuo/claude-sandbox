@@ -65,8 +65,8 @@ def aliases_from_config(config: Path, extra_roots: tuple[Path, ...] = ()) -> set
     return names
 
 
-def effective(alias: str, config: Path, extra_roots: tuple[Path, ...] = ()) -> dict[str, list[str]]:
-    if not isinstance(alias, str) or not ALIAS.fullmatch(alias) or alias not in aliases_from_config(config, extra_roots):
+def effective(alias: str, config: Path, extra_roots: tuple[Path, ...] = (), *, native_config=False) -> dict[str, list[str]]:
+    if not isinstance(alias, str) or not ALIAS.fullmatch(alias) or (not native_config and alias not in aliases_from_config(config, extra_roots)):
         raise ValueError('SSH alias is not explicitly configured')
     result = subprocess.run(['/usr/bin/ssh', '-G', '-F', str(config), alias],
                             capture_output=True, text=True, timeout=12, check=True)
@@ -85,9 +85,11 @@ def effective(alias: str, config: Path, extra_roots: tuple[Path, ...] = ()) -> d
     return options
 
 
-def route_plan(alias: str, config: Path, host: str, port: int, extra_roots: tuple[Path, ...] = ()):
+def route_plan(alias: str, config: Path, host: str, port: int, extra_roots: tuple[Path, ...] = (), *, host_alias=None):
     """Only three route forms exist; request data never becomes shell code."""
-    options = effective(alias, config, extra_roots)
+    if host_alias and alias != host_alias:
+        raise ValueError('Use the native host SSH entry for destination connections')
+    options = effective(alias, config, extra_roots, native_config=True) if host_alias else effective(alias, config, extra_roots)
     if (host, port) != (options['hostname'][0], int(options['port'][0])):
         raise ValueError('SSH alias changed or requested destination differs')
     if host.rstrip('.').lower().endswith('.invalid'):
@@ -172,9 +174,10 @@ def header(connection: socket.socket) -> dict:
 class Server(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
 
-    def __init__(self, path: Path, config: Path, audit: Path, handler, extra_roots: tuple[Path, ...] = ()):
+    def __init__(self, path: Path, config: Path, audit: Path, handler, extra_roots: tuple[Path, ...] = (), host_alias=None):
         self.config, self.audit = config, audit
         self.extra_roots = extra_roots
+        self.host_alias = host_alias
         self.path = path
         self.socket_identity = None
         self.lock = threading.Lock()
@@ -224,8 +227,13 @@ class Server(socketserver.ThreadingUnixStreamServer):
 class Transport(socketserver.BaseRequestHandler):
     def handle(self):
         peer = process = None
+        acknowledged = False
         item = {'kind': 'transport', 'result': 'rejected'}
         if not self.server.slots.acquire(blocking=False):
+            try:
+                self.request.sendall(b'{"ok":false,"error":"SSH host bridge is busy"}\n')
+            except OSError:
+                pass
             return
         try:
             self.request.settimeout(15)
@@ -233,16 +241,26 @@ class Transport(socketserver.BaseRequestHandler):
             if set(value) != {'alias', 'host', 'port'} or type(value['port']) is not int:
                 raise ValueError('Invalid transport request fields')
             item.update({k: value[k] for k in ('alias', 'host', 'port')})
-            plan = route_plan(value['alias'], self.server.config, value['host'], value['port'], self.server.extra_roots)
+            plan = route_plan(value['alias'], self.server.config, value['host'], value['port'], self.server.extra_roots,
+                              host_alias=self.server.host_alias)
             item['result'] = 'approved'
             self.server.log(item)
             reader, writer, process = open_route(plan)
             peer = reader
             self.request.sendall(b'{"ok":true}\n')
+            acknowledged = True
             self.request.settimeout(None)
             relay(self.request, self.request, reader, writer)
-        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-            item['result'] = 'rejected-or-unreachable'
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            item['result'] = 'closed' if acknowledged else 'rejected-or-unreachable'
+            item['error_type'] = type(error).__name__
+            try:
+                # Do not include command text or subprocess output in the reply.
+                message = str(error) if isinstance(error, ValueError) else type(error).__name__
+                if not acknowledged:
+                    self.request.sendall(json.dumps({'ok': False, 'error': message[:300]}).encode() + b'\n')
+            except OSError:
+                pass
             try:
                 self.server.log(item)
             except OSError:
@@ -279,10 +297,10 @@ class Agent(socketserver.BaseRequestHandler):
             self.server.slots.release()
 
 
-def target_config(config: Path, socket_path: str, agent_path: str, *, target_home: Path | None = None, extra_roots: tuple[Path, ...] = ()) -> str:
+def target_config(config: Path, socket_path: str, agent_path: str, *, target_home: Path | None = None, extra_roots: tuple[Path, ...] = (), host_alias=None) -> str:
     lines = []
-    for alias in sorted(aliases_from_config(config, extra_roots)):
-        options = effective(alias, config, extra_roots)
+    for alias in [host_alias] if host_alias else sorted(aliases_from_config(config, extra_roots)):
+        options = effective(alias, config, extra_roots, native_config=True) if host_alias else effective(alias, config, extra_roots)
         host, port = options['hostname'][0], options['port'][0]
         if host.rstrip('.').lower().endswith('.invalid'):
             lines += [f'Host {alias}', f'    HostName {host}',
@@ -321,22 +339,44 @@ def main():
     client.add_argument('--socket', required=True, type=Path)
     client.add_argument('alias');client.add_argument('host');client.add_argument('port', type=int)
     serve = sub.add_parser('serve')
-    serve.add_argument('--config', required=True, type=Path)
-    serve.add_argument('--socket', required=True, type=Path)
-    serve.add_argument('--agent-socket', required=True, type=Path)
-    serve.add_argument('--audit', required=True, type=Path)
+    serve.add_argument('--config', type=Path)
+    serve.add_argument('--socket', type=Path)
+    serve.add_argument('--agent-socket', type=Path)
+    serve.add_argument('--audit', type=Path)
+    serve.add_argument('--deployment-config', type=Path)
     serve.add_argument('--client-directory', type=Path)
     serve.add_argument('--client-home', type=Path)
     serve.add_argument('--extra-root', action='append', type=Path, default=[])
+    serve.add_argument('--host-alias')
     generate = sub.add_parser('config')
     generate.add_argument('--config', required=True, type=Path)
     args = parser.parse_args()
+    if args.mode == 'serve':
+        if args.deployment_config:
+            c = json.loads(args.deployment_config.read_text())
+            if Path(c['host_home']) != Path.home():
+                parser.error('deployment profile belongs to another host user')
+            private = Path(c['private_root'])
+            args.config = Path(c['host_home']) / '.ssh/config'
+            args.socket = private / 'control/ssh/alias.sock'
+            args.agent_socket = private / 'control/ssh/campus-agent.sock'
+            args.audit = private / 'control/audit/ssh/aliases.jsonl'
+            args.client_directory = private / 'apps/ssh'
+            args.client_home = Path(c['target_home'])
+            args.extra_root = [Path(x) for x in c.get('ssh_extra_roots', [])]
+            args.host_alias = c.get('ssh_host_alias')
+        if not all([args.config, args.socket, args.agent_socket, args.audit]):
+            parser.error('serve requires a deployment profile or explicit config/socket/agent-socket/audit')
     if args.mode == 'client':
         with socket.socket(socket.AF_UNIX) as peer:
             peer.connect(str(args.socket))
             peer.sendall(json.dumps({'alias': args.alias, 'host': args.host, 'port': args.port}).encode()+b'\n')
-            if header(peer) != {'ok': True}:
-                raise SystemExit('SSH route rejected')
+            try:
+                reply = header(peer)
+            except (ValueError, OSError) as error:
+                raise SystemExit('ssh: host bridge closed before route acknowledgement: ' + str(error)) from None
+            if reply != {'ok': True}:
+                raise SystemExit('ssh: host bridge rejected route: ' + str(reply.get('error', 'unknown reason')))
             reader = sys.stdin.buffer
             writer = sys.stdout.buffer
             relay(reader, writer, peer, peer)
@@ -353,7 +393,7 @@ def main():
         if not args.client_home:
             parser.error('--client-directory requires --client-home')
         from controlled_dev_machine.ssh_client_state import SSHClientState
-        refresher = SSHClientState(args.config.parent, args.client_directory, args.client_home, tuple(args.extra_root))
+        refresher = SSHClientState(args.config.parent, args.client_directory, args.client_home, tuple(args.extra_root), host_alias=args.host_alias)
         refresher.refresh()
     refresh_stop = threading.Event()
     def refresh_client():
@@ -368,7 +408,7 @@ def main():
                 if message != last_error:
                     print(message, file=sys.stderr, flush=True)
                 last_error = message
-    with Server(args.socket, args.config, args.audit, Transport, tuple(args.extra_root)) as transport, Server(args.agent_socket, args.config, args.audit, Agent, tuple(args.extra_root)) as agent:
+    with Server(args.socket, args.config, args.audit, Transport, tuple(args.extra_root), args.host_alias) as transport, Server(args.agent_socket, args.config, args.audit, Agent, tuple(args.extra_root)) as agent:
         def stop(signum,frame):
             refresh_stop.set()
             threading.Thread(target=transport.shutdown,daemon=True).start()

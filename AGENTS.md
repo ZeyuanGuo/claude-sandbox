@@ -9,4 +9,5 @@
 - Back up before changing deployment or state. Preserve other users' services and jobs. Do not change GPU drivers, reset GPUs or restart the host Docker daemon to repair one sandbox.
 - Use an isolated checkout for integration. Never force-push shared history. Keep local commits and remote publication evidence distinct.
 - Public examples contain placeholders/documentation addresses, not personal IPs, Home paths, account state or tokens. Keep private host profiles outside Git.
+- Native SSH profiles delegate destination routing/authentication to host OpenSSH through one configured host bootstrap alias. Do not add per-ProxyCommand helper exceptions or reimplement destination SSH configuration. This is an audited host-user SSH capability, independent of the strict HTTP egress boundary.
 - Claude's own automatic cleanup behavior is outside the current change; do not modify it without a new user request.

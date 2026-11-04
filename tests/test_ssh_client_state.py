@@ -83,6 +83,7 @@ def test_explicit_host_local_include_and_key_refresh_without_remount(tmp_path, m
     extra=tmp_path/'host-local';extra.mkdir(mode=0o700)
     (extra/'identity').write_text('host-local-private-test-key')
     (extra/'config').write_text(f'Host local-peer\n HostName 192.0.2.99\n IdentityFile {extra}/identity\n UserKnownHostsFile {extra}/known_hosts\n')
+    (extra/'config').chmod(0o600)
     (extra/'known_hosts').write_text('trusted-test-host')
     with (source/'config').open('a') as file:file.write(f'Host *\n Include {extra}/config\n')
     with pytest.raises(ValueError,match='escapes'):

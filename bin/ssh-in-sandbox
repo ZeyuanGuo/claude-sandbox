@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/python3 -I /opt/cdm-ssh/controlled_dev_machine/ssh_native_client.py "$@"

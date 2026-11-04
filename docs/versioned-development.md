@@ -50,27 +50,28 @@ Claude's own automatic cleanup setting is unchanged by this release.
 
 ## Adding SSH hosts without restarting the sandbox
 
-The host's existing `~/.ssh/config`, included configuration, keys and known-host
-files are the source. The SSH service refreshes a same-host client copy under
-`apps/ssh` after changes (normally within two seconds). That complete directory
-is mounted read-only as the target's `~/.ssh`. New files become visible through
-the existing directory mount, so adding a host or key needs no image build,
-container recreation or per-file mount list. The old `ssh_files` field is accepted
-for configuration compatibility and is no longer a mount allowlist.
+Native SSH profiles set `ssh_host_alias` to this host's existing reachable SSH
+alias. The target uses one bootstrap connection back to the host, then the host's
+native OpenSSH handles the destination using its current configuration. Scripts,
+ProxyCommand, multi-hop ProxyJump, Match, wildcard aliases and Includes are not a
+sandbox-specific route language. Add or change normal host SSH configuration and
+keys; the next destination connection reads them, with no per-helper exception,
+image build or container restart. Bootstrap client material remains a same-host
+read-only snapshot; control sockets are not copied and private state is never a
+fleet synchronization artifact.
 
-Add a normal explicit Host alias to the host configuration, put its key/known-host
-files under `~/.ssh`, and verify the host's SSH login. The same alias then works in
-the sandbox. Existing direct LAN, configured jump and configured VPN routes use
-the same audited bridge. Strict host-key verification remains enabled. Unix
-control sockets are excluded from the copy. Keys remain on the same machine;
-they are not a fleet synchronization artifact. The private copy is included in
-private state checkpoints and must never be published.
+This is an audited host-user SSH capability. Destination-side identity paths,
+local forwarding listeners, ControlMaster sockets and local hooks use the host
+context. OpenSSH handles binary stdio, terminal modes and window resizing across
+the bootstrap connection. The host launcher records a session ID, destination
+when identifiable, argument count and digest, not credentials or command bodies.
+Native SSH diagnostics reach the caller. The legacy bridge remains available to
+older profiles, while native profiles render only their bootstrap alias.
 
-Invalid edited SSH configuration leaves the last rendered client configuration
-intact and reports the refresh failure in the SSH service journal. Each new
-connection is still checked against the current host-owned alias and route.
-This dynamic SSH refresh does not change the Web proxy, exit verification or
-network isolation rules.
+The same-host snapshot refresh also regenerates the bootstrap configuration from
+OpenSSH so edits to included configuration are observed. The separate HTTP/DNS
+proxy and exact-exit verification remain unchanged. SSH must not be used to run
+Claude tests outside an approved target or bypass the required model exit.
 
 ## Native Claude and updates
 
@@ -182,3 +183,34 @@ cannot exhaust DNS's reserved workers. `web_sessions` and `dns_sessions` are
 bounded configuration values. A registered live capacity hotfix blocks lifecycle
 admission until it is retired during an explicitly approved cutover; do not stop
 its forwarders while translated sessions are still active.
+
+## Staging the next restart without interrupting current work
+
+`bin/development-next-start stage --current-config OLD --candidate-config NEW`
+requires an installed immutable release and locally available digest-pinned
+images. It writes a private `configs/next-start.json`, a host-local runtime-profile
+selector and a future main-service ExecStart drop-in, then reloads unit metadata.
+It never runs prepare/start, rewrites generated runtime files, stops a service,
+or selects new user entries during staging. The existing sandbox keeps running.
+
+Stage every host sharing an NFS Home before installing the shared startup drop-in.
+All those hosts must have the same release/interpreter paths on genuinely local
+storage. At the next main-service start/restart or host boot, the prepared plan
+activates. It checks profile/source hashes, retains the exact parent/exit, handles
+only registered owned capacity-hotfix components during that restart window,
+starts the candidate, checks exit readiness and selects normal entries. It does
+not pull floating Git branches or download an image at boot. Edited profiles must
+be restaged rather than silently overwritten.
+
+After activation, `sbc restart` restarts the main service through this selector.
+A plain Docker container restart does not rebuild Compose or select a release;
+use the main service restart for the prepared upgrade. `sbc start`/shell/status
+continue to use the selected runtime profile. Staging itself is not authorization
+to interrupt work now; activation runs only on the subsequent explicit main start.
+
+Shared unit and entry files refer to `configs/runtime.json`, which is local to
+each host. The controller's immutable source version can be common while one host
+still runs the previous profile until its approved restart. Shared SSH units read
+host-specific bootstrap aliases from that local profile, not from a value embedded
+by whichever NFS host last wrote the unit. `sbc status` reports actual runtime
+release; a selector entry's `release_id=host-local-runtime` is not a fixed revision.

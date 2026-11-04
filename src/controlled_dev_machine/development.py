@@ -50,7 +50,7 @@ def load_config(path: Path) -> dict:
                 "user", "uid", "gid", "project", "docker_context", "python", "uid_tools",
                 "target_image", "gateway_image", "mapper_image", "identity_profile", "mounts", "exit"}
     optional = {"node_bin", "conda_root", "conda_env", "gpu", "extra_gpu_libraries", "trust_overlays",
-                "ssh_files", "ssh_extra_roots", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases", "external_mounts", "web_sessions", "dns_sessions", "claude_credentials_path"}
+                "ssh_files", "ssh_extra_roots", "ssh_host_alias", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases", "external_mounts", "web_sessions", "dns_sessions", "claude_credentials_path"}
     if not isinstance(raw, dict) or set(raw) - required - optional or required - set(raw):
         raise ValueError("deployment configuration fields are missing or unknown")
     if raw["schema_version"] != 2:
@@ -70,6 +70,8 @@ def load_config(path: Path) -> dict:
         raise ValueError("invalid release identifier")
     if raw.get("gpu", "all") not in ("all", "none"):
         raise ValueError("gpu must be all or none")
+    if 'ssh_host_alias' in raw and (not isinstance(raw['ssh_host_alias'], str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', raw['ssh_host_alias'])):
+        raise ValueError('invalid SSH host bootstrap alias')
     if not isinstance(raw["mounts"], list):
         raise ValueError("mounts must be an explicit list")
     seen = set()
@@ -508,7 +510,7 @@ esac
             write_file(self.state / "config" / name, '. "$HOME/.bashrc"\n', 0o644)
         from .ssh_client_state import SSHClientState
         SSHClientState(self.home / ".ssh", self.apps / "ssh", self.target_home,
-                       tuple(Path(x) for x in c.get("ssh_extra_roots", []))).refresh()
+                       tuple(Path(x) for x in c.get("ssh_extra_roots", [])), host_alias=c.get('ssh_host_alias')).refresh()
         write_file(self.state / "machine-id", p["machine_id"] + "\n", 0o444)
         fleet = self.state / "ssh/fleet-identity"
         for name, value in {"profile.json": json.dumps(p), "hostname": p["hostname"], "boot-id": p["boot_id"],
@@ -522,7 +524,12 @@ esac
                     path.chmod(0o600)
                 path.write_bytes(data)
             path.chmod(0o444)
-        atomic_json(self.state / "config/sandbox.json", {"release": c["release_id"], "config_sha256": self.config_sha}, 0o444)
+        sandbox = {"release": c["release_id"], "config_sha256": self.config_sha}
+        if c.get('ssh_host_alias'):
+            sandbox.update(ssh_host_alias=c['ssh_host_alias'], ssh_host_python=self.python,
+                           ssh_host_launcher=str(self.release / 'bin/ssh-native-host'),
+                           ssh_host_audit=str(self.state / 'audit/ssh/native-sessions.jsonl'))
+        atomic_json(self.state / "config/sandbox.json", sandbox, 0o444)
         exit_config = dict(c["exit"], exit_lease=str(self.state / "exit-control/lease.json"),
             readiness_path=str(self.state / "readiness.json"), required_config_sha256=self.config_sha)
         atomic_json(self.state / "config/exit-monitor.json", exit_config)
@@ -544,7 +551,22 @@ esac
         self.compose("config", "--quiet")
 
     def controller_args(self, command):
-        return [self.python, "-I", str(self.release / "bin/development-sandbox"), "--config", str(self.config_path), command]
+        selection = self.controller_selection()
+        return [self.python, "-I", str(selection[0] / "bin/development-sandbox"), "--config", str(selection[1]), command]
+
+    def controller_selection(self):
+        """A shared Home selects host-local state, never another node's release."""
+        pointer = self.private / 'startup/controller.json'
+        if not pointer.exists():
+            return self.release, self.config_path
+        if pointer.is_symlink() or pointer.stat().st_uid != os.getuid() or pointer.stat().st_mode & 0o022:
+            raise RuntimeError('unsafe host-local controller selection')
+        data = json.loads(pointer.read_text())
+        release = absolute(data['controller_release'], 'controller release')
+        config = absolute(data['runtime_config'], 'runtime profile')
+        if release.parent != self.private / 'releases' or config != self.private / 'configs/runtime.json':
+            raise RuntimeError('controller selection escapes private release/profile paths')
+        return release, config
 
     def install_units(self):
         q = lambda args: shlex.join([str(x) for x in args]).replace("%", "%%")
@@ -554,6 +576,12 @@ esac
                "--client-directory", str(self.apps / "ssh"), "--client-home", str(self.target_home)]
         for root in self.config.get("ssh_extra_roots", []):
             ssh += ["--extra-root", root]
+        if self.config.get('ssh_host_alias'):
+            ssh += ['--host-alias', self.config['ssh_host_alias']]
+        if (self.private / 'startup/controller.json').exists():
+            release, config = self.controller_selection()
+            ssh = [self.python, '-I', str(release / 'src/controlled_dev_machine/ssh_alias_bridge.py'),
+                   'serve', '--deployment-config', str(config)]
         units = {
             self.project + ".service": f'[Unit]\nDescription=Versioned development sandbox\nRequires=docker.service\nWants={self.project}-ssh.service\nAfter=docker.service {self.project}-ssh.service\nPartOf=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart={q(self.controller_args("start"))}\nTimeoutStartSec=240\nRestart=on-failure\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n',
             self.project + "-ssh.service": f'[Unit]\nDescription=Configured SSH aliases and fixed agent for sandbox\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={q(ssh)}\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n',
@@ -718,9 +746,13 @@ esac
             raise RuntimeError("refusing to select an unverified or mismatched running release")
         command = shlex.join(self.controller_args("")[:-1])
         script = '#!/bin/sh\nexec ' + command + ' "$@"\n'
+        selected_release, selected_config = self.controller_selection()
+        dynamic = selected_config != self.config_path
         entry = {"backend": "rootless-development", "uid": os.getuid(), "gid": os.getgid(), "home": str(self.home),
-            "python": self.python, "controller": str(self.release / "bin/development-sandbox"),
-            "config": str(self.config_path), "release_id": self.config["release_id"]}
+            "python": self.python, "controller": str(selected_release / "bin/development-sandbox"),
+            "config": str(selected_config), "release_id": 'host-local-runtime' if dynamic else self.config["release_id"]}
+        if dynamic:
+            entry['release_id_source'] = 'sbc status: actual_release; host-local profile: release_id'
         atomic_json(self.home / ".config/controlled-dev-machine/entry.json", entry)
         install_entry(self.home / ".local/bin/sbc", script)
         host_guard = '#!/bin/sh\n# Enter the configured sandbox; never run the vendor binary on the host.\nexec ' + shlex.quote(str(self.home / ".local/bin/sbc")) + ' claude "$@"\n'
@@ -735,6 +767,8 @@ def main(argv=None):
     parser.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     app = DevelopmentSandbox(args.config)
+    if args.command == 'restart':
+        return app.run(['systemctl', '--user', 'restart', app.project + '.service'], check=False, capture=False).returncode
     if args.command in ("prepare", "start", "recover", "install-entries", "install-units", "stop"):
         with app.lock():
             if args.command == "prepare":

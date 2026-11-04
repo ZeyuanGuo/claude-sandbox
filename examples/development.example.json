@@ -11,6 +11,7 @@
   "extra_groups": [],
   "project": "cdm-development",
   "docker_context": "rootless",
+  "ssh_host_alias": "this-host",
   "python": "/srv/sbc/alice/controller-env/bin/python",
   "uid_tools": "/srv/sbc/alice/tools/uid",
   "target_image": "sha256:REPLACE_WITH_BUILT_TARGET_IMAGE_ID",

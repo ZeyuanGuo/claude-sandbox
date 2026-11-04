@@ -4,6 +4,11 @@ FROM ${BASE_IMAGE}
 USER root
 COPY bin/claude-in-sandbox /opt/sbc/bin/claude
 COPY bin/sbc-in-sandbox /opt/sbc/bin/sbc
+COPY bin/ssh-in-sandbox /opt/sbc/bin/ssh
+RUN mkdir -p /opt/sbc/libexec \
+    && if [ ! -x /opt/sbc/libexec/ssh ]; then cp -p /usr/bin/ssh /opt/sbc/libexec/ssh; fi \
+    && chmod 0755 /opt/sbc/bin/ssh /opt/sbc/libexec/ssh \
+    && ln -sf /opt/sbc/bin/ssh /usr/bin/ssh
 RUN chmod 0755 /opt/sbc/bin/claude /opt/sbc/bin/sbc \
     && rm -f /usr/local/bin/claude \
     && ln -s /opt/sbc/bin/claude /usr/local/bin/claude
