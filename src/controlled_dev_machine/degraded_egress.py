@@ -14,6 +14,7 @@ import socket
 import socketserver
 import threading
 import time
+import uuid
 
 _MAX_HEADER = 16384
 _MAX_BUFFER = 65536
@@ -33,6 +34,9 @@ class RelayConfig:
     # Active Claude/SSE streams and pooled HTTP connections can last hours.
     # Memory, worker count and idle time remain bounded without a hard age cap.
     session_timeout: float | None = None
+    # New connections always require a fresh lease. Existing tunnels retain
+    # their admitted route through a bounded period of probe uncertainty.
+    established_grace_seconds: float = 300.0
     max_sessions: int = 64
     test_mode: bool = False
     fixture_targets: tuple[tuple[str, int], ...] = ()
@@ -62,6 +66,9 @@ class RelayConfig:
         if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
                for value in timeouts):
             raise ValueError("timeouts must be finite positive numbers")
+        if (isinstance(self.established_grace_seconds, bool) or not isinstance(self.established_grace_seconds, (int, float))
+                or not math.isfinite(self.established_grace_seconds) or not 0 <= self.established_grace_seconds <= 900):
+            raise ValueError("established_grace_seconds must be between 0 and 900 seconds")
         if type(self.max_sessions) is not int or not 1 <= self.max_sessions <= 256:
             raise ValueError("max_sessions must be between 1 and 256")
         if self.fixture_targets and not self.test_mode:
@@ -74,10 +81,10 @@ class RelayConfig:
     def from_mapping(cls, mapping: dict, *, audit_path: Path):
         allowed = {"parent_host", "parent_port", "upstream_host", "upstream_port",
                    "trusted_dns_ips", "trusted_gateway_ips", "header_timeout",
-                   "idle_timeout", "session_timeout", "max_sessions", "fixture_targets", "expected_exit", "exit_lease"}
+                   "idle_timeout", "session_timeout", "established_grace_seconds", "max_sessions", "fixture_targets", "expected_exit", "exit_lease"}
         if not isinstance(mapping, dict) or set(mapping) - allowed:
             raise ValueError("unknown or invalid relay configuration")
-        values = {key: mapping[key] for key in ("header_timeout", "idle_timeout", "session_timeout", "max_sessions") if key in mapping}
+        values = {key: mapping[key] for key in ("header_timeout", "idle_timeout", "session_timeout", "established_grace_seconds", "max_sessions") if key in mapping}
         for old, new in (("parent_host", "upstream_host"), ("parent_port", "upstream_port")):
             if old in mapping and new in mapping:
                 raise ValueError("ambiguous parent configuration")
@@ -195,30 +202,50 @@ def _check_parent_response(frame):
 
 def exit_lease_valid(config: RelayConfig, *, newer_than: float = 0.0) -> bool:
     """A short, same-parent/same-boot lease gates both new and active streams."""
+    return exit_lease_state(config, newer_than=newer_than) == "valid"
+
+
+def exit_lease_state(config: RelayConfig, *, newer_than: float = 0.0) -> str:
+    """Distinguish uncertainty from a confirmed violation of admitted routing.
+
+    New connections accept only "valid". Existing connections may tolerate an
+    intact probe failure or expiry for their separate bounded grace period.
+    Wrong identity, broken metadata and readiness failure are hard revocations.
+    """
     if config.exit_lease is None:
-        return True
+        return "valid"
     try:
         raw = config.exit_lease.read_text()
         if len(raw) > 4096:
-            return False
+            return "revoked"
         value = json.loads(raw)
         checked, expires = value["checked_monotonic"], value["expires_monotonic"]
         now = time.monotonic()
-        return (value["schema_version"] == 1 and value["ok"] is True
+        identity_ok = (type(value["schema_version"]) is int and value["schema_version"] == 1
                 and value["expected_exit"] == config.expected_exit
-                and value["observed_exit"] == config.expected_exit
                 and value["parent_host"] == config.upstream_host
                 and value["parent_port"] == config.upstream_port
                 and value["boot_id"] == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
                 and type(checked) in (float, int) and type(expires) in (float, int)
                 and math.isfinite(checked) and math.isfinite(expires)
-                and newer_than <= checked <= now < expires
+                and newer_than <= checked <= now
                 and 0 < expires - checked <= 15.0)
+        if not identity_ok:
+            return "revoked"
+        if value["ok"] is True and value["observed_exit"] == config.expected_exit:
+            return "valid" if now < expires else "expired"
+        probes = value.get("probes")
+        if (value["ok"] is False and value.get("observed_exit") is None
+                and value.get("reason") == "probe-failed" and isinstance(probes, list) and probes
+                and all(isinstance(p, dict) and p.get("observed") in (None, config.expected_exit)
+                        for p in probes)):
+            return "probe-failed"
+        return "revoked"
     except (OSError, ValueError, KeyError, TypeError):
-        return False
+        return "revoked"
 
 
-def _relay(client, parent, config, audit, lease_started=0.0):
+def _relay(client, parent, config, audit, lease_started=0.0, audit_context=None):
     client.setblocking(False)
     parent.setblocking(False)
     other = {client: parent, parent: client}
@@ -226,11 +253,41 @@ def _relay(client, parent, config, audit, lease_started=0.0):
     ended = set()
     closed_writes = set()
     started = last_activity = time.monotonic()
+    unverified_at = None
+    last_verified_at = started
+    context = audit_context or {}
+
+    def can_forward_existing():
+        if audit.failed:
+            return False
+        value = exit_lease_state(config, newer_than=lease_started)
+        return value != "revoked" and (value == "valid" or
+            time.monotonic() - last_verified_at < config.established_grace_seconds)
+
     while True:
         if audit.failed:
             return "audit-unavailable"
-        if not exit_lease_valid(config, newer_than=lease_started):
+        state = exit_lease_state(config, newer_than=lease_started)
+        now = time.monotonic()
+        if state == "valid" and unverified_at is not None and not exit_lease_valid(config, newer_than=unverified_at):
+            # A pre-failure lease cannot reset the uncertainty grace clock.
+            state = "awaiting-fresh-verification"
+        if state == "revoked" or (state != "valid" and not config.established_grace_seconds):
             return "exit-lease-revoked"
+        if state == "valid":
+            last_verified_at = now
+            if unverified_at is not None:
+                audit.write(**context, result="verification-recovered", reason="exit-lease-verified",
+                            uncertain_seconds=round(now - unverified_at, 3))
+                lease_started = max(lease_started, unverified_at)
+                unverified_at = None
+        else:
+            if now - last_verified_at >= config.established_grace_seconds:
+                return "exit-verification-grace-expired"
+            if unverified_at is None:
+                unverified_at = now
+                audit.write(**context, result="retained", reason="exit-lease-" + state,
+                            established_grace_seconds=config.established_grace_seconds)
         for source in ended:
             destination = other[source]
             if not buffers[destination] and destination not in closed_writes:
@@ -251,6 +308,8 @@ def _relay(client, parent, config, audit, lease_started=0.0):
         writers = [destination for destination in other if buffers[destination]]
         ready_read, ready_write, _ = select.select(readers, writers, [], min(remaining, 0.1))
         for destination in ready_write:
+            if not can_forward_existing():
+                break
             try:
                 sent = destination.send(buffers[destination])
             except BlockingIOError:
@@ -260,6 +319,8 @@ def _relay(client, parent, config, audit, lease_started=0.0):
             del buffers[destination][:sent]
             last_activity = time.monotonic()
         for source in ready_read:
+            if not can_forward_existing():
+                break
             try:
                 piece = source.recv(_MAX_BUFFER - len(buffers[other[source]]))
             except BlockingIOError:
@@ -317,17 +378,24 @@ class _Handler(socketserver.BaseRequestHandler):
             family = socket.AF_INET6 if parent_address.version == 6 else socket.AF_INET
             with socket.socket(family, socket.SOCK_STREAM) as parent:
                 parent.settimeout(config.header_timeout)
+                if not exit_lease_valid(config, newer_than=self.server.lease_started):
+                    raise OSError("exit-lease-invalid")
                 parent.connect((str(parent_address), config.upstream_port))
+                if not exit_lease_valid(config, newer_than=self.server.lease_started):
+                    raise OSError("exit-lease-invalid")
                 parent.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n".encode("ascii"))
                 response = _header(parent, config.header_timeout)
                 _check_parent_response(response)
+                if not exit_lease_valid(config, newer_than=self.server.lease_started):
+                    raise OSError("exit-lease-invalid")
                 self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 established = True
-                reason = _relay(self.request, parent, config, self.server.audit, self.server.lease_started)
+                reason = _relay(self.request, parent, config, self.server.audit, self.server.lease_started,
+                                {"source": source, "target": target, "stream_id": uuid.uuid4().hex})
         except (OSError, ValueError) as exc:
             reason = str(exc)
             if not established:
-                _respond(self.request, 502)
+                _respond(self.request, 503 if reason == "exit-lease-invalid" else 502)
         if established:
             try:
                 self.request.shutdown(socket.SHUT_RDWR)

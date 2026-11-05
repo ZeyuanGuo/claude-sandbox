@@ -50,7 +50,7 @@ def load_config(path: Path) -> dict:
                 "user", "uid", "gid", "project", "docker_context", "python", "uid_tools",
                 "target_image", "gateway_image", "mapper_image", "identity_profile", "mounts", "exit"}
     optional = {"node_bin", "conda_root", "conda_env", "gpu", "extra_gpu_libraries", "trust_overlays",
-                "ssh_files", "ssh_extra_roots", "ssh_host_alias", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases", "external_mounts", "web_sessions", "dns_sessions", "claude_credentials_path"}
+                "ssh_files", "ssh_extra_roots", "ssh_host_alias", "tmp_compat_path", "network_names", "network_addresses", "extra_groups", "retired_units", "interactive_exit_probe_url", "home_aliases", "external_mounts", "web_sessions", "dns_sessions", "egress_established_grace_seconds", "claude_credentials_path"}
     if not isinstance(raw, dict) or set(raw) - required - optional or required - set(raw):
         raise ValueError("deployment configuration fields are missing or unknown")
     if raw["schema_version"] != 2:
@@ -72,6 +72,8 @@ def load_config(path: Path) -> dict:
         raise ValueError("gpu must be all or none")
     if 'ssh_host_alias' in raw and (not isinstance(raw['ssh_host_alias'], str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', raw['ssh_host_alias'])):
         raise ValueError('invalid SSH host bootstrap alias')
+    from .degraded_egress import RelayConfig
+    RelayConfig(audit_path=Path('/unused'), established_grace_seconds=raw.get('egress_established_grace_seconds', 300))
     if not isinstance(raw["mounts"], list):
         raise ValueError("mounts must be an explicit list")
     seen = set()
@@ -539,7 +541,8 @@ esac
                 "expected_exit": c["exit"]["expected_exit"], "exit_lease": "/run/cdm-exit/lease.json",
                 "trusted_gateway_ips": [a["gateway_upstream"]] if role == "web" else [],
                 "trusted_dns_ips": [a["dns_upstream"]] if role == "dns" else [],
-                "max_sessions": c.get("web_sessions", 256) if role == "web" else c.get("dns_sessions", 16)}
+                "max_sessions": c.get("web_sessions", 256) if role == "web" else c.get("dns_sessions", 16),
+                "established_grace_seconds": c.get("egress_established_grace_seconds", 300)}
             atomic_json(self.state / "config" / ("relay-" + role + ".json"), relay)
         document = self.render()
         write_file(self.compose_path, yaml.safe_dump(document, sort_keys=False))

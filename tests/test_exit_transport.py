@@ -173,7 +173,8 @@ def test_only_configured_sources_and_host_loopback_are_allowed(config, source):
 
 
 @pytest.mark.parametrize("reason", ["revoked", "expired", "monitor-error"])
-def test_active_connection_is_closed_when_lease_becomes_invalid(config, reason):
+def test_explicit_zero_grace_closes_when_lease_becomes_invalid(config, reason):
+    config = replace(config, established_grace_seconds=0)
     with TransportServer(config, ("127.0.0.1", 0)) as server:
         write_lease(config)
         with running(server), connect(server) as client:
@@ -242,3 +243,23 @@ def test_monitor_publishes_success_mismatch_or_exception(config, observed, raise
     assert record["ok"] is (not raises and observed == config.expected_exit)
     assert exit_lease_valid(config) is record["ok"]
     assert json.loads(config.exit_lease.read_text())["ok"] is record["ok"]
+
+
+def test_failed_probe_keeps_old_stream_but_rejects_a_new_connection(config, parent):
+    with TransportServer(config, ("127.0.0.1", 0)) as server:
+        write_lease(config)
+        with running(server), connect(server) as admitted:
+            admitted.sendall(b"before")
+            assert receive_exact(admitted, 6) == b"before"
+            write_lease(config, ok=False, observed_exit=None, reason="probe-failed",
+                        probes=[{"ok": False, "error": "curl-exit-28"}])
+            admitted.sendall(bytes(range(256)))
+            assert receive_exact(admitted, 256) == bytes(range(256))
+            with connect(server) as rejected:
+                assert b"503 Service Unavailable" in rejected.recv(4096)
+            assert parent.connections == 1
+            write_lease(config)
+            with connect(server) as accepted:
+                accepted.sendall(b"recovered")
+                assert receive_exact(accepted, 9) == b"recovered"
+            assert parent.connections == 2

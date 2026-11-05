@@ -38,8 +38,11 @@ def refresh(config, *, probe=observe):
     try:
         record["observed_exit"] = probe(config)
         record["ok"] = record["observed_exit"] == config["expected_exit"]
+        record['reason'] = 'all-probes-matched' if record['ok'] else 'exit-mismatch'
+        record['probes'] = [{'ok': record['ok'], 'observed': record['observed_exit']}]
     except Exception as error:
-        record.update(ok=False, observed_exit=None, error=type(error).__name__)
+        record.update(ok=False, observed_exit=None, error=type(error).__name__, reason='probe-failed',
+                      probes=[{'ok': False, 'error': type(error).__name__}])
     record["checked_monotonic"] = time.monotonic()
     record["expires_monotonic"] = record["checked_monotonic"] + 15
     path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)

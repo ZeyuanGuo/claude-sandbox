@@ -214,3 +214,26 @@ still runs the previous profile until its approved restart. Shared SSH units rea
 host-specific bootstrap aliases from that local profile, not from a value embedded
 by whichever NFS host last wrote the unit. `sbc status` reports actual runtime
 release; a selector entry's `release_id=host-local-runtime` is not a fixed revision.
+
+### Preserve established streams through probe uncertainty
+
+`egress_established_grace_seconds` defaults to 300 and may be set from 0 to 900.
+New connections always require the existing fresh exact-exit lease. An admitted
+connection retains its current route through an intact probe failure or expiry
+for the separate established grace. Repeated failures cannot extend that grace;
+recovery requires new verification after the failure. Wrong identity, parent/boot
+changes, broken/missing metadata, readiness and audit failures close immediately.
+This is an explicit change to established-stream handling, not a longer or forged
+admission lease. Short requests can finish; active long responses are not cut
+because one unrelated exit probe timed out.
+
+For a live instance that cannot restart, install the versioned source and a
+matching immutable gateway image, then use its `bin/development-egress-handoff`
+with `--config CURRENT_PROFILE --image sha256:IMAGE --generation YYYYMMDD`.
+The command performs preflight and configured IP checks, backs up namespace rules,
+and directs only new connections to the new generation. It never restarts an
+existing component. Existing flows remain on their original generation until
+they finish, so a previously broken response is not resurrected. Read every
+registered generation's `audit_paths` as well as the original egress audits.
+At the next approved main restart, registered generations are retired and the
+normal topology uses the same connection policy.
