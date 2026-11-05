@@ -162,7 +162,8 @@ def handoff(app, image, generation, source_release):
                 return run(docker + ['exec', old[role]['Id'], 'python3', '-c', CONNECT, address, target], timeout=15).stdout.strip()
             for attempt in range(30):
                 try:
-                    if '403' in connect('gateway', available[0], '[2606:4700:4700::1111]:443'):
+                    if ('403' in connect('gateway', available[0], '[2606:4700:4700::1111]:443')
+                            and '200' in connect('dns', available[1], '1.1.1.1:443')):
                         break
                 except Exception:
                     pass
