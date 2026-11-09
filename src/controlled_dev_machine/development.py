@@ -523,6 +523,8 @@ class DevelopmentSandbox:
         self.run(["systemctl", "--user", "restart", self.project + "-ssh.service"])
         changed = self.mapper(self.home, "uid-home") | self.mapper(self.apps, "uid-app")
         self.compose("up", "-d", "egress", "dns", "gateway")
+        from .handoff_routes import reconcile_active_handoffs
+        reconcile_active_handoffs(self)
         atomic_json(self.state / "readiness.json", {"ok": True, "config_sha256": self.config_sha, "phase": "network-ready"})
         lease = self.state / "exit-control/lease.json"
         value = refresh(self.config["exit"], publish=lambda value: atomic_json(lease, value))
@@ -562,6 +564,8 @@ class DevelopmentSandbox:
         if labels.get("org.controlled-dev-machine.config-sha256") != self.config_sha:
             atomic_json(self.state / "readiness.json", {"ok": False, "config_sha256": self.config_sha, "reason": "runtime configuration drift"})
             return False
+        from .handoff_routes import reconcile_active_handoffs
+        reconcile_active_handoffs(self)
         atomic_json(self.state / "readiness.json", {"ok": True, "config_sha256": self.config_sha, "phase": "ready"})
         return True
 
