@@ -119,21 +119,48 @@ def test_shared_credentials_keep_history_local_and_both_locks_shared(tmp_path):
         load_config(path)
 
 
-def test_first_failed_probe_revokes_before_other_probe_finishes():
+@pytest.mark.parametrize("first", ["match", "timeout", "wrong"])
+@pytest.mark.parametrize("second", ["match", "timeout", "wrong"])
+def test_probe_or_policy_and_wrong_exit_precedence(first, second):
+    def probe(config, endpoint):
+        kind = first if endpoint.endswith("one.example/ip") else second
+        if kind == "timeout":
+            return {"ok": False, "error": "curl-exit-28"}
+        observed = config["expected_exit"] if kind == "match" else "203.0.113.99"
+        return {"ok": kind == "match", "observed": observed}
+    published = []
+    value = refresh(exit_config(), boot_id="test", probe_fn=probe, publish=published.append)
+    expected = "match" in (first, second) and "wrong" not in (first, second)
+    assert value["ok"] is expected
+    assert value["probe_policy"] == "any-match"
+    assert all(v["ok"] is expected for v in published)
+    assert len(value["probes"]) == 2
+
+
+def test_wrong_exit_revokes_before_slow_matching_probe_finishes():
     revoked = threading.Event()
     def probe(config, endpoint):
         if endpoint.endswith("one.example/ip"):
+            return {"ok": False, "observed": "203.0.113.99"}
+        assert revoked.wait(1)
+        return {"ok": True, "observed": config["expected_exit"]}
+    def publish(value):
+        assert not value["ok"] and value["reason"] == "exit-mismatch"
+        revoked.set()
+    assert not refresh(exit_config(), boot_id="test", probe_fn=probe, publish=publish)["ok"]
+
+
+def test_failed_probe_never_publishes_transient_failure_before_matching_sibling():
+    finished = threading.Event()
+    def probe(config, endpoint):
+        if endpoint.endswith("one.example/ip"):
+            finished.set()
             return {"ok": False, "error": "timeout"}
-        assert revoked.wait(1), "failure must publish before waiting for the slow successful probe"
+        assert finished.wait(1)
         return {"ok": True, "observed": config["expected_exit"]}
     published = []
-    def publish(value):
-        published.append(value)
-        if not value["ok"]:
-            revoked.set()
-    value = refresh(exit_config(), boot_id="test", probe_fn=probe, publish=publish)
-    assert not value["ok"]
-    assert published and all(not record["ok"] for record in published)
+    value = refresh(exit_config(), boot_id="test", probe_fn=probe, publish=published.append)
+    assert value["ok"] and all(v["ok"] for v in published)
 
 
 def test_missing_runtime_readiness_denies_without_any_probe(tmp_path):

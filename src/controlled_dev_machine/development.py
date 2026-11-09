@@ -686,6 +686,8 @@ esac
         for source, part in self.mapper_sources():
             changed = self.mapper(source, part) or changed
         self.compose("up", "-d", "egress", "dns", "gateway")
+        from .handoff_routes import reconcile_active_handoffs
+        reconcile_active_handoffs(self)
         atomic_json(self.state / "readiness.json", {"ok": True, "config_sha256": self.config_sha, "phase": "network-ready"})
         lease = self.state / "exit-control/lease.json"
         value = refresh(self.config["exit"], publish=lambda value: atomic_json(lease, value))
@@ -727,6 +729,8 @@ esac
         if labels.get("org.controlled-dev-machine.config-sha256") != self.config_sha:
             atomic_json(self.state / "readiness.json", {"ok": False, "config_sha256": self.config_sha, "reason": "runtime configuration drift"})
             return False
+        from .handoff_routes import reconcile_active_handoffs
+        reconcile_active_handoffs(self)
         atomic_json(self.state / "readiness.json", {"ok": True, "config_sha256": self.config_sha, "phase": "ready"})
         return True
 

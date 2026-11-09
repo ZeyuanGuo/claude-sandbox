@@ -1,4 +1,4 @@
-"""Configuration-driven exact-exit verification; any failed probe revokes access."""
+"""Configuration-driven exact-exit verification; one matching probe suffices; wrong exits revoke access."""
 from __future__ import annotations
 
 import concurrent.futures
@@ -50,7 +50,8 @@ def probe(config: dict, endpoint: str) -> dict:
         capture_output=True, text=True, timeout=config["probe_timeout"] + 2,
     )
     if result.returncode:
-        return {"endpoint": endpoint, "ok": False, "error": f"curl-exit-{result.returncode}"}
+        return {"endpoint": endpoint, "ok": False, "error": f"curl-exit-{result.returncode}",
+                "seconds": round(time.monotonic() - started, 3)}
     try:
         text = result.stdout.strip()
         if len(text) > 4096:
@@ -90,7 +91,8 @@ def refresh(config: dict, *, probe_fn=probe, publish=None, boot_id: str | None =
     if boot_id is None:
         boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     results = []
-    failed = False
+    matched = False
+    wrong_exit = False
     round_id = uuid.uuid4().hex
 
     def record(ok: bool) -> dict:
@@ -100,7 +102,9 @@ def refresh(config: dict, *, probe_fn=probe, publish=None, boot_id: str | None =
                 "observed_exit": config["expected_exit"] if ok else None, "boot_id": boot_id,
                 "checked_monotonic": now, "expires_monotonic": now + config["lease_seconds"],
                 "checked_at": datetime.now(timezone.utc).isoformat(), "round_id": round_id,
-                "reason": "all-probes-matched" if ok else "probe-failed", "probes": list(results)}
+                "probe_policy": "any-match",
+                "reason": "any-probe-matched" if ok else ("exit-mismatch" if wrong_exit else "probe-failed"),
+                "probes": list(results)}
 
     if config.get("readiness_path"):
         try:
@@ -122,12 +126,16 @@ def refresh(config: dict, *, probe_fn=probe, publish=None, boot_id: str | None =
                 result = {"endpoint": pending[future], "ok": False, "error": type(error).__name__}
             valid = result.get("ok") is True and result.get("observed") == config["expected_exit"]
             results.append(result)
-            if not valid:
-                failed = True
-                # Invalidate as soon as a failure completes, before waiting for another probe.
+            matched = matched or valid
+            if result.get("observed") not in (None, config["expected_exit"]):
+                wrong_exit = True
+                # A confirmed mismatch overrides every successful sibling immediately.
                 if publish is not None:
                     publish(record(False))
-    final = record(not failed and len(results) == len(config["probe_urls"]))
+            # A timeout is uncertainty: wait for siblings before deciding this round.
+            # Publish success only after the round settles, so a slow mismatch cannot
+            # briefly issue a valid lease from the same round.
+    final = record(matched and not wrong_exit)
     if publish is not None:
         publish(final)
     return final
@@ -147,7 +155,7 @@ def main(argv=None) -> int:
         except Exception:
             lease.unlink(missing_ok=True)
             raise
-        print(json.dumps({"ok": value["ok"], "reason": value["reason"], "expected_exit": value["expected_exit"]}), flush=True)
+        print(json.dumps(value, sort_keys=True), flush=True)
         if args.once:
             return 0 if value["ok"] else 1
         time.sleep(config["interval_seconds"])
