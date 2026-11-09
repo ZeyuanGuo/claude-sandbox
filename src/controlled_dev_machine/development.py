@@ -253,11 +253,31 @@ class DevelopmentSandbox:
 
         return text, exports
 
+    def gateway_image(self):
+        """Allow a reviewed gateway-only release without changing target identity."""
+        path = self.state / "gateway-release.json"
+        if not path.exists():
+            return self.config["gateway_image"]
+        stat = path.lstat()
+        if path.is_symlink() or stat.st_uid != os.getuid() or stat.st_mode & 0o077:
+            raise RuntimeError("unsafe gateway release selection")
+        selection = json.loads(path.read_text())
+        if selection.get("base_config_sha256") != self.config_sha:
+            raise RuntimeError("gateway release does not match the runtime profile")
+        image = selection.get("image", "")
+        commit = selection.get("source_commit", "")
+        if not re.fullmatch(r"sha256:[a-f0-9]{64}", image) or not re.fullmatch(r"[a-f0-9]{40}", commit):
+            raise RuntimeError("gateway release must pin an image and source commit")
+        info = json.loads(self.run(self.docker + ["image", "inspect", image]).stdout)[0]
+        if info.get("Id") != image or (info.get("Config", {}).get("Labels") or {}).get("cdm.source_digest") != commit:
+            raise RuntimeError("gateway image does not match the approved source")
+        return image
+
     def render(self):
         c, p = self.config, self.identity
         policy = self.release / "policies/daily/0001-public-web.yaml"
         document = build_compose(root=self.release, runtime=self.apps, state=self.state,
-            target_image=c["target_image"], gateway_image=c["gateway_image"], policy=policy,
+            target_image=c["target_image"], gateway_image=self.gateway_image(), policy=policy,
             policy_digest="raw:" + hashlib.sha256(policy.read_bytes()).hexdigest(),
             upstream_host=c["exit"]["parent_host"], upstream_port=str(c["exit"]["parent_port"]), allow_public_dns=True)
         a = self.network_addresses()
@@ -428,7 +448,7 @@ class DevelopmentSandbox:
         self.compose("config", "--quiet")
 
     def controller_args(self, command):
-        return [self.python, "-I", str(self.release / "bin/development-sandbox"), "--config", str(self.config_path), command]
+        return [self.python, "-I", str(Path(__file__).resolve().parents[2] / "bin/development-sandbox"), "--config", str(self.config_path), command]
 
     def install_units(self):
         q = lambda args: shlex.join([str(x) for x in args]).replace("%", "%%")
@@ -585,7 +605,7 @@ class DevelopmentSandbox:
         command = shlex.join(self.controller_args("")[:-1])
         script = '#!/bin/sh\nexec ' + command + ' "$@"\n'
         entry = {"backend": "rootless-development", "uid": os.getuid(), "gid": os.getgid(), "home": str(self.home),
-            "python": self.python, "controller": str(self.release / "bin/development-sandbox"),
+            "python": self.python, "controller": str(Path(__file__).resolve().parents[2] / "bin/development-sandbox"),
             "config": str(self.config_path), "release_id": self.config["release_id"]}
         atomic_json(self.home / ".config/controlled-dev-machine/entry.json", entry)
         install_entry(self.home / ".local/bin/sbc", script)
