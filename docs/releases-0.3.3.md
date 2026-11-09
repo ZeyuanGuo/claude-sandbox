@@ -27,3 +27,10 @@ and future startup selection as well. Target images, application state and the
 published proxy subscription do not need rebuilding for these changes. A legacy
 controller backport carries identical probe and reconciliation modules for hosts
 whose main runtime upgrade remains staged.
+
+Mapper health checks now execute inside the existing owned mapper container.
+Repeated temporary container creation could exhaust the host user's session
+keyring quota and falsely close network admission despite healthy FUSE mounts.
+The check still validates the daemon namespace, mount identity and mapped owner;
+its actual failure status is propagated. Controllers use the helper from their
+own source release so a controller-only update also updates this health path.

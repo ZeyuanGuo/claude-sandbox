@@ -474,7 +474,7 @@ class DevelopmentSandbox:
         from . import rootless_uid_mount as uid_module
         c = self.config
         directory, name = self.private / part, self.project + "-" + part
-        command = [self.python, "-I", str(self.release / "src/controlled_dev_machine/rootless_uid_mount.py")]
+        command = [self.python, "-I", str(Path(__file__).with_name("rootless_uid_mount.py"))]
         options = ["--source", str(source), "--view", str(directory / "view"), "--state", str(directory),
                    "--tools", c["uid_tools"], "--image", c["mapper_image"], "--name", name, "--uid", str(c["uid"]), "--gid", str(c["gid"])]
         if self.run(command + ["status"] + options, check=False).returncode == 0:
@@ -550,7 +550,7 @@ class DevelopmentSandbox:
         if current.returncode or not json.loads(current.stdout)[0]["State"]["Running"]:
             return False
         for part in ("uid-home", "uid-app"):
-            args = [self.python, "-I", str(self.release / "src/controlled_dev_machine/rootless_uid_mount.py"), "status",
+            args = [self.python, "-I", str(Path(__file__).with_name("rootless_uid_mount.py")), "status",
                     "--source", str(self.home if part == "uid-home" else self.apps), "--view", str(self.private / part / "view"),
                     "--state", str(self.private / part), "--tools", self.config["uid_tools"], "--image", self.config["mapper_image"], "--name", self.project + "-" + part,
                     "--uid", str(self.config["uid"]), "--gid", str(self.config["gid"])]
