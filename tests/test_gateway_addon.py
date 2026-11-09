@@ -4,6 +4,8 @@ import asyncio
 import importlib.util
 import sys
 import threading
+import socket
+import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -54,6 +56,59 @@ def _flow(
 
 def _verify(addon, flow, host: str):
     return asyncio.run(addon._verify_original_destination(flow, host))
+
+
+def test_degraded_dns_waits_for_recovery_then_requires_a_lease(monkeypatch):
+    addon = _load_addon(monkeypatch)
+    addon.dns_recovery_timeout = 3
+    calls = []
+    def resolve(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise socket.gaierror(socket.EAI_AGAIN, "temporary failure")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(addon, "_dns_lease", lambda *args: "b" * 32)
+    flow = _flow(object())
+    assert asyncio.run(addon._resolve_degraded_destination(flow, "api.example.com")) is None
+    assert len(calls) == 2
+    assert flow.metadata["cdm_dns_lease_id"] == "b" * 32
+    assert flow.metadata["cdm_pinned_destination"] == "93.184.216.34"
+    assert addon.pending_dns_recoveries == 0
+
+
+def test_degraded_dns_recovery_has_a_bounded_deadline(monkeypatch):
+    addon = _load_addon(monkeypatch)
+    addon.dns_recovery_timeout = .03
+    def fail(*args):
+        raise socket.gaierror(socket.EAI_AGAIN, "temporary failure")
+    monkeypatch.setattr(socket, "getaddrinfo", fail)
+    flow = _flow(object())
+    started = time.monotonic()
+    assert asyncio.run(addon._resolve_degraded_destination(flow, "api.example.com")) == "controlled DNS resolution failed"
+    assert time.monotonic() - started < .5
+    assert "cdm_pinned_destination" not in flow.metadata
+    assert addon.pending_dns_recoveries == 0
+
+
+@pytest.mark.parametrize("address", ["127.0.0.1", "93.184.216.34"])
+def test_degraded_dns_never_dispatches_without_a_public_lease(monkeypatch, address):
+    addon = _load_addon(monkeypatch)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))])
+    monkeypatch.setattr(addon, "_dns_lease", lambda *args: None)
+    flow = _flow(object())
+    assert asyncio.run(addon._resolve_degraded_destination(flow, "api.example.com")) == "controlled DNS did not grant a public destination lease"
+    assert "cdm_pinned_destination" not in flow.metadata
+
+
+def test_degraded_dns_caps_recovery_waiters(monkeypatch):
+    addon = _load_addon(monkeypatch)
+    addon.pending_dns_recoveries = 32
+    def fail(*args):
+        raise socket.gaierror(socket.EAI_AGAIN, "temporary failure")
+    monkeypatch.setattr(socket, "getaddrinfo", fail)
+    assert asyncio.run(addon._resolve_degraded_destination(_flow(object()), "api.example.com")) == "controlled DNS resolution failed"
+    assert addon.pending_dns_recoveries == 32
 
 
 def test_addon_reuses_client_binding_after_upstream_reconnect_and_ttl_expiry(monkeypatch) -> None:

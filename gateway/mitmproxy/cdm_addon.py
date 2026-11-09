@@ -38,6 +38,10 @@ class ControlledReviewAddon:
         self.review_store = RequestStore(Path(os.environ["CDM_REVIEW_DIR"]))
         self.review_ttl = int(os.environ.get("CDM_REVIEW_TTL_SECONDS", "300"))
         self.poll_interval = float(os.environ.get("CDM_REVIEW_POLL_SECONDS", "0.25"))
+        self.dns_recovery_timeout = float(os.environ.get("CDM_DNS_RECOVERY_SECONDS", "20"))
+        if not 0 <= self.dns_recovery_timeout <= 30:
+            raise ValueError("CDM_DNS_RECOVERY_SECONDS must be between 0 and 30")
+        self.pending_dns_recoveries = 0
         self.audit_fault: str | None = None
         self.audit_storage_fault: str | None = None
         self.canary_address = ipaddress.ip_address(os.environ["CDM_CANARY_ADDRESS"])
@@ -194,14 +198,16 @@ class ControlledReviewAddon:
             return
         if destination_error is not None:
             if destination_error == "controlled DNS resolution failed":
-                # A resolver timeout is a transient network condition, not a verdict
-                # about the request. Abort the flow so the client sees a reset and
-                # retries, instead of an HTTP error it may treat as authoritative.
-                ctx.log.warn("controlled DNS resolution failed; aborting flow as transient")
-                flow.kill()
+                ctx.log.warn("controlled DNS recovery window exhausted")
+                flow.response = http.Response.make(503, b"Controlled DNS temporarily unavailable; retry shortly.\n",
+                    {"Content-Type": "text/plain", "Retry-After": "2", "Cache-Control": "no-store"})
                 return
             flow.response = _blocked("invalid-destination", destination_error)
             return
+        if flow.metadata.get("cdm_dns_recovery_attempts"):
+            policy = self._verified_policy_or_block(flow)
+            if policy is None:
+                return
         view = HttpRequestView(
             scheme=request.scheme,
             host=logical_host,
@@ -421,13 +427,34 @@ class ControlledReviewAddon:
     async def _resolve_degraded_destination(self, flow: http.HTTPFlow, hostname: str) -> str | None:
         # The gateway's only resolver is the audited DNS container. The parent
         # receives a leased IP, not a name it could independently re-resolve.
+        deadline = time.monotonic() + self.dns_recovery_timeout
+        recovering = False
+        attempts = 0
         try:
-            records = await asyncio.wait_for(
-                asyncio.to_thread(socket.getaddrinfo, hostname, flow.request.port,
-                                  socket.AF_INET, socket.SOCK_STREAM), timeout=10,
-            )
-        except (OSError, asyncio.TimeoutError):
-            return "controlled DNS resolution failed"
+            while True:
+                attempts += 1
+                remaining = deadline - time.monotonic()
+                try:
+                    records = await asyncio.wait_for(
+                        asyncio.to_thread(socket.getaddrinfo, hostname, flow.request.port,
+                                          socket.AF_INET, socket.SOCK_STREAM),
+                        timeout=10 if self.dns_recovery_timeout == 0 else min(10, max(0.001, remaining)),
+                    )
+                    break
+                except (OSError, asyncio.TimeoutError):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or (not recovering and self.pending_dns_recoveries >= 32):
+                        return "controlled DNS resolution failed"
+                    if not recovering:
+                        self.pending_dns_recoveries += 1
+                        recovering = True
+                    await asyncio.sleep(min(1, remaining))
+                    if time.monotonic() >= deadline:
+                        return "controlled DNS resolution failed"
+        finally:
+            if recovering:
+                self.pending_dns_recoveries -= 1
+                flow.metadata["cdm_dns_recovery_attempts"] = attempts
         for record in records:
             address = record[4][0]
             if not _is_public_address(ipaddress.ip_address(address)):
