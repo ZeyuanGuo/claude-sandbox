@@ -267,15 +267,22 @@ def helper_command(action: str, *, source: Path, view: Path, state: Path, tools:
         raise ValueError("invalid privileged mapper action")
     if bool(ssh_source) != bool(ssh_shadow):
         raise ValueError("SSH source and shadow must be configured together")
-    command = ["docker", "run", "--rm", "--pull=never", "--network=none", "--pid=host",
-               "--user=0:0", "--read-only", "--cap-drop=ALL", "--cap-add=SYS_ADMIN",
-               "--cap-add=SYS_PTRACE", "--cap-add=SYS_CHROOT", "--cap-add=DAC_OVERRIDE",
-               "--cap-add=CHOWN", "--cap-add=FOWNER", "--security-opt=no-new-privileges:true", "--device=/dev/fuse",
-               "--entrypoint=nsenter"]
+    if action == "check":
+        # Reuse the verified mapper namespace: creating a container on every
+        # health tick consumes session keyrings and can exhaust the host UID quota.
+        command = ["docker", "exec", "--user=0:0", name, "nsenter"]
+    else:
+        command = ["docker", "run", "--rm", "--pull=never", "--network=none", "--pid=host",
+                   "--user=0:0", "--read-only", "--cap-drop=ALL", "--cap-add=SYS_ADMIN",
+                   "--cap-add=SYS_PTRACE", "--cap-add=SYS_CHROOT", "--cap-add=DAC_OVERRIDE",
+                   "--cap-add=CHOWN", "--cap-add=FOWNER", "--security-opt=no-new-privileges:true", "--device=/dev/fuse",
+                   "--entrypoint=nsenter"]
     if action == "mapper":
         command.extend(["--name", name])
     script = module or Path(__file__).absolute()
-    command.extend([image, "-t", str(daemon_pid), "-m", "--", "/usr/bin/python3", "-I", "-c",
+    if action != "check":
+        command.append(image)
+    command.extend(["-t", str(daemon_pid), "-m", "--", "/usr/bin/python3", "-I", "-c",
                     "import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; "
                     "runpy.run_path(sys.argv[0],run_name='__main__')", str(script.parent.parent), str(script), action,
                     "--source", str(source), "--view", str(view), "--state", str(state),
