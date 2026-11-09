@@ -71,6 +71,7 @@ def atomic_json(path: Path, value: dict, mode: int = 0o600) -> None:
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
         with os.fdopen(fd, "w") as stream:
+            os.fchmod(stream.fileno(), mode)
             json.dump(value, stream, sort_keys=True)
             stream.write("\n")
             stream.flush()
