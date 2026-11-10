@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Expose the sandbox's persistent base Home through a host-owned shortcut.
+
+Extra bind mounts remain separate. A saved mount map gives their actual host
+locations; this shortcut is not an export of the merged container filesystem.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument('--config', type=Path, required=True)
+a = p.parse_args()
+c = json.loads(a.config.read_text())
+home = Path(c['host_home'])
+private = Path(c['private_root'])
+source = private / 'apps/home'
+alias = home / 'sandbox-home'
+if not source.is_dir() or source.stat().st_uid != os.getuid() or home.stat().st_uid != os.getuid():
+    raise SystemExit('Home/source must exist and belong to the invoking host user')
+if alias.is_symlink():
+    if os.readlink(alias) != str(source):
+        raise SystemExit('sandbox-home already points elsewhere; preserving it')
+elif alias.exists():
+    raise SystemExit('sandbox-home already exists; preserving it')
+else:
+    alias.symlink_to(source, target_is_directory=True)
+# Inspect the active mounts rather than inferring that every Home child shares
+# the base directory. Only mount paths are stored, never file contents.
+info = json.loads(subprocess.check_output(['docker', '--context', c['docker_context'],
+                  'inspect', c['project'] + '-target-1'], text=True))[0]
+rows = []
+for mount in info['Mounts']:
+    dest = Path(mount['Destination'])
+    try:
+        dest.relative_to(Path(c['target_home']))
+    except ValueError:
+        continue
+    actual = mount['Source']
+    for view, backing in [(private/'uid-home/view', home), (private/'uid-app/view', private/'apps')]:
+        try:
+            actual = str(backing / Path(actual).relative_to(view))
+            break
+        except ValueError:
+            pass
+    rows.append({'sandbox_path': str(dest), 'host_path': actual, 'writable_in_sandbox': mount['RW']})
+record = {'alias': str(alias), 'base_home': str(source), 'target_home': c['target_home'],
+          'scope': 'persistent base Home; additional bind mounts are listed separately', 'mounts': rows}
+path = private / 'control/host-home-link.json'
+tmp = path.with_name(path.name + '.tmp-' + str(os.getpid()))
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, 'w') as f:
+    json.dump(record, f, indent=2)
+tmp.replace(path)
+print(json.dumps({'alias': str(alias), 'source': str(source), 'mount_map': str(path),
+                  'container_id': info['Id']}, ensure_ascii=False))
