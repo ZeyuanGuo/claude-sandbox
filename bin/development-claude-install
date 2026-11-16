@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Audit or migrate a deployed development sandbox to its existing native Claude."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import tempfile
+import uuid
+
+
+PACKAGE = "@anthropic-ai/claude-code"
+
+
+def owner(path):
+    if path.is_symlink() or path.stat().st_uid != os.getuid():
+        raise ValueError(f"unexpected owner or symlink: {path}")
+
+
+def migrate(config_file, apply):
+    c = json.loads(config_file.read_bytes())
+    host = Path(c["host_home"])
+    if host != Path.home():
+        raise ValueError("configuration belongs to a different host account")
+    private = Path(c["private_root"])
+    for p in (private, private / "apps"):
+        owner(p)
+    target = c["project"] + "-target-1"
+    info = json.loads(subprocess.check_output(
+        ["docker", "--context", c["docker_context"], "inspect", target],
+        text=True, timeout=18))[0]
+    env = dict(s.split("=", 1) for s in info["Config"]["Env"])
+    home = Path(c["target_home"])
+
+    def backing(dest, writable=False):
+        matches = [(Path(m["Destination"]), m) for m in info["Mounts"]
+                   if dest.is_relative_to(Path(m["Destination"]))]
+        dest_root, mount = max(matches, key=lambda row: len(row[0].parts))
+        if writable and not mount["RW"]:
+            raise ValueError(f"expected writable mount at {dest_root}")
+        source = Path(mount["Source"]) / dest.relative_to(dest_root)
+        for view, real in [(private/"uid-home/view", host),
+                           (private/"uid-app/view", private/"apps")]:
+            if source.is_relative_to(view):
+                return real / source.relative_to(view)
+        raise ValueError(f"unrecognized backing mount for {dest}")
+
+    cli = home / ".local/bin/claude"
+    link = backing(cli)
+    if not link.is_symlink():
+        raise ValueError("native installation must have a versioned executable link")
+    raw = Path(os.readlink(link))
+    native = Path(os.path.normpath(raw if raw.is_absolute() else cli.parent / raw))
+    if native.parent != home / ".local/share/claude/versions":
+        raise ValueError("native link does not point to the version store")
+    elf = backing(native)
+    if not elf.is_relative_to(private / "apps/home"):
+        raise ValueError("native version store is outside persistent sandbox Home")
+    owner(elf)
+    with elf.open("rb") as stream:
+        if stream.read(4) != b"\x7fELF" or not elf.stat().st_mode & stat.S_IXUSR:
+            raise ValueError("native target is not an executable ELF binary")
+
+    metadata = backing(Path(env.get("CLAUDE_CONFIG_DIR", str(home/".claude"))) / ".claude.json", writable=True)
+    if not metadata.is_relative_to(private / "apps/.claude"):
+        raise ValueError("unexpected Claude configuration path")
+    owner(metadata)
+    before = metadata.read_bytes()
+    value = json.loads(before)
+    old_method = value.get("installMethod")
+    if old_method not in (None, "unknown", "local", "global", "native"):
+        raise ValueError("unrecognized install method; inspect manually")
+
+    nvm = backing(home / ".nvm")
+    packages = []
+    for node in sorted((nvm / "versions/node").glob("v*")):
+        if not re.fullmatch(r"v\d+\.\d+\.\d+", node.name):
+            continue
+        package = node / "lib/node_modules/@anthropic-ai/claude-code"
+        if not package.exists() and not package.is_symlink():
+            continue
+        for p in (node, package.parent.parent, package.parent, package):
+            owner(p)
+        descriptor = json.loads((package/"package.json").read_bytes())
+        if descriptor.get("name") != PACKAGE:
+            raise ValueError(f"unexpected package metadata in {package}")
+        entry = node/"bin/claude"
+        if not entry.is_file() or entry.is_symlink():
+            raise ValueError(f"expected existing sandbox guard at {entry}")
+        with entry.open("rb") as stream:
+            head = stream.read(2048)
+        if b"configured sandbox" not in head and b"configured development sandbox" not in head and b"/opt/sbc/bin/claude" not in head:
+            raise ValueError(f"unrecognized guard at {entry}")
+        packages.append((package, descriptor.get("version")))
+    plan = {"native_version":native.name, "install_method":old_method,
+            "npm_packages":[{"path":str(p),"version":v} for p,v in packages],
+            "container_id":info["Id"]}
+    if not apply or (not packages and old_method=="native"):
+        return plan
+
+    token = uuid.uuid4().hex
+    receipts = []
+    try:
+        for package, _ in packages:
+            # Keep recovery on the same filesystem and outside npm's search path.
+            retirement = package.parents[2] / (".claude-npm-retired-" + token)
+            retirement.mkdir(mode=0o700)
+            backup = retirement / "claude-code"
+            package.rename(backup)
+            receipts.append((package, backup))
+        if old_method != "native":
+            backup_dir = private / "backups" / ("claude-native-" + token)
+            backup_dir.mkdir(mode=0o700)
+            saved = backup_dir / ".claude.json"
+            saved.write_bytes(before)
+            saved.chmod(0o600)
+            value["installMethod"] = "native"
+            with tempfile.NamedTemporaryFile(dir=metadata.parent, delete=False) as f:
+                tmp = Path(f.name)
+                f.write((json.dumps(value, indent=2, ensure_ascii=False)+"\n").encode())
+                f.flush()
+                os.fchmod(f.fileno(), stat.S_IMODE(metadata.stat().st_mode))
+                os.fsync(f.fileno())
+            try:
+                if before != metadata.read_bytes():
+                    raise ValueError("Claude updated its state during migration; run again")
+                os.replace(tmp, metadata)
+            finally:
+                tmp.unlink(missing_ok=True)
+            plan["metadata_backup"] = str(saved)
+    except BaseException:
+        for package, backup in reversed(receipts):
+            if not package.exists():
+                backup.rename(package)
+        raise
+    plan["retired"] = [str(x[1]) for x in receipts]
+    plan["install_method_after"] = "native"
+    return plan
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--apply", action="store_true", help="apply the audited migration")
+    args = parser.parse_args()
+    print(json.dumps(migrate(args.config, args.apply), indent=2))

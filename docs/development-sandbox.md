@@ -77,3 +77,19 @@ The boot service waits for the parent proxy, retries failures after 20 seconds
 when both are queued. The controller still restores registered relay routes
 and validates the exact configured exit before starting the target. An
 unverified exit keeps egress closed.
+
+### Claude Code installation consistency
+
+Use the versioned native executable inside the sandbox. The host and NVM
+launchers enforce sandbox entry and must stay in place. A legacy npm package
+can remain discoverable even when its launcher is a sandbox guard.
+
+After sandbox provisioning, migration, or changes to the shared NVM tree,
+run `bin/development-claude-install --config /path/to/profile.json` on each
+sandbox host. Review the audit, then repeat with `--apply` to retire the old
+NVM package and reconcile the sandbox's install-method metadata. Retired
+packages and the previous metadata are backed up. The command derives paths
+from the deployed container and refuses unrecognized install layouts.
+A shared host Home needs package cleanup once, but each sandbox has separate
+Claude metadata and must be audited individually. No container restart or
+native version change is needed.
