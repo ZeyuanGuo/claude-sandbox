@@ -108,7 +108,15 @@ def migrate(config_file, apply):
             retirement = package.parents[2] / (".claude-npm-retired-" + token)
             retirement.mkdir(mode=0o700)
             backup = retirement / "claude-code"
-            package.rename(backup)
+            try:
+                package.rename(backup)
+            except FileNotFoundError:
+                # Another host may already have retired the shared NVM package,
+                # even if this host enumerated a cached NFS directory entry.
+                retirement.rmdir()
+                if os.path.lexists(package):
+                    raise
+                continue
             receipts.append((package, backup))
         if old_method != "native":
             backup_dir = private / "backups" / ("claude-native-" + token)
