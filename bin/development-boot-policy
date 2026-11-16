@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Install the host-owned systemd boot policy without restarting the sandbox."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import tempfile
+import time
+
+
+def install(cli, config_path, parent_unit):
+    config = json.loads(config_path.read_bytes())
+    private = Path(config["private_root"])
+    if not config_path.is_absolute() or not cli.is_absolute() or not cli.is_file():
+        raise ValueError("absolute config and controller paths are required")
+    if Path(config["host_home"]) != Path.home():
+        raise ValueError("configuration belongs to a different host account")
+    project = config["project"]
+    if not project.replace("-", "").isalnum() or not parent_unit.endswith(".service") or not parent_unit.removesuffix(".service").replace("-", "").isalnum():
+        raise ValueError("invalid systemd unit name")
+    selection = json.loads((private / "control/gateway-release.json").read_bytes())
+    if selection["base_config_sha256"] != hashlib.sha256(config_path.read_bytes()).hexdigest():
+        raise ValueError("the selected profile does not match the pinned gateway")
+
+    unit_dir = Path.home() / ".config/systemd/user"
+    main = unit_dir / (project + ".service")
+    health = unit_dir / (project + "-health.service")
+    if not main.is_file() or not health.is_file():
+        raise ValueError("install the sandbox units before installing the boot policy")
+    command = shlex.join([config["python"], "-I", str(cli), "--config", str(config_path), "start"])
+    files = {
+        main.parent / (main.name + ".d/zz-boot-recovery.conf"): f"""[Unit]
+# Wait for the fixed parent proxy service before checking the exit.
+Wants={parent_unit}
+After={parent_unit}
+StartLimitIntervalSec=300s
+StartLimitBurst=4
+
+[Service]
+# Keep the verified runtime and its pinned gateway; the upgrade remains staged.
+ExecStart=
+ExecStart={command}
+TimeoutStartSec=300s
+Restart=on-failure
+RestartSec=20s
+""",
+        health.parent / (health.name + ".d/zz-boot-order.conf"): f"""[Unit]
+# On boot the timer may fire while Docker is still starting. Let startup take
+# the shared lifecycle lock first when both services have jobs queued.
+After={main.name}
+""",
+    }
+    for path in files:
+        if path.is_symlink():
+            raise ValueError(f"refusing to replace {path}")
+    old = {p: p.read_bytes() if p.exists() else None for p in files}
+
+    def replace(path, data):
+        path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as out:
+            tmp = Path(out.name)
+            out.write(data)
+        try:
+            tmp.chmod(0o644)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    if any(old[path] != data.encode() for path, data in files.items()):
+        backup = private / "backups" / f"boot-policy-{time.time_ns()}"
+        backup.mkdir(mode=0o700)
+        for path in files:
+            if path.exists():
+                shutil.copy2(path, backup / path.name)
+        try:
+            for path, data in files.items():
+                replace(path, data.encode())
+            subprocess.run(["systemd-analyze", "--user", "verify", str(main), str(health)], check=True)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        except BaseException:
+            for path, data in old.items():
+                if data is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    replace(path, data)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+            raise
+        print(f"Installed boot policy; previous overrides backed up to {backup}")
+    else:
+        print("Boot policy matches the installed overrides")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--controller", type=Path, required=True)
+    parser.add_argument("--parent-unit", required=True)
+    args = parser.parse_args()
+    install(args.controller, args.config, args.parent_unit)

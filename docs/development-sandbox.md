@@ -51,3 +51,29 @@ Python 的 `SSL_CERT_FILE` 和 `REQUESTS_CA_BUNDLE` 默认指向系统 CA 包 `/
 本机 rootful 部署使用原 nftables、PCAP、eBPF 和网络 watchdog；已有 rootless 部署保留其原设备映射和 UID 映射机制，不宣称与 rootful 拥有完全相同的宿主审计权限。生命周期操作只影响本任务登记的资源，不能重启共享 dockerd 或其他用户作业。
 
 验收至少覆盖：正式入口与真实工具调用、双向文件共享、Claude 独立状态、Codex 共享认证、逐卡 CUDA 实算、SSH 宿主对照、出口偏差闭锁、原网络门禁、重建后身份/数据持久和审计存活。全局零包门禁应在无并行业务的受控窗口执行；若有失败，保留原 PCAP 并先分型，不能放宽判据来获得通过。
+
+### Boot recovery for a host with a pinned gateway
+
+After installing the host's sandbox units, install the boot policy from the
+version-controlled repository. Pass the current verified profile and its
+installed controller rather than a staged upgrade:
+
+```sh
+bin/development-boot-policy \
+  --config /path/to/current-host-profile.json \
+  --controller /path/to/release/bin/development-sandbox \
+  --parent-unit fixed-parent.service
+```
+
+The installer requires the pinned gateway's profile hash to match. It installs
+persistent user systemd overrides, checks their syntax, and reloads the unit
+definitions without restarting the sandbox. Normal unit regeneration leaves
+the overrides in place. Repeat the command when provisioning a host or moving
+its verified boot profile to a new release. Review or remove the boot override
+as part of promoting a staged profile.
+
+The boot service waits for the parent proxy, retries failures after 20 seconds
+(subject to the systemd rate limit), and orders the health check after startup
+when both are queued. The controller still restores registered relay routes
+and validates the exact configured exit before starting the target. An
+unverified exit keeps egress closed.
